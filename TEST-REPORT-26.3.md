@@ -437,3 +437,206 @@ fallback behaviour when the teleport does not happen. The real
   kicks it first ("Invalid move player packet"); it reconnects in 10s
   and carries on. Same recovery as v6.
 - Enchanting, villager trading, horse/boat riding still out of scope.
+
+## v8 appendix (2026-11-07) — bed/spawn, permanent home, grave, pickup, store, evade, lava, French home messages
+
+Test server: local Paper 26.3 build 244, port 25569, same harness as v7
+(owner-bot.js runs 21-30). All v8 runs use the fixed bot.js in segs-v8/.
+
+### Run 21 — bed (flawed setup) + grave recovery PROVEN
+- Bed at (-120,70,185): "cant sleep in that bed right now" — the bed was
+  floating ~4 blocks above the real ground (y≈66 there), so the
+  pathfinder correctly refused it. Test-setup bug, not a bot bug.
+- Grave recovery PROVEN: Segs died at (-130,66,180); a chest (fake grave)
+  with bread + sword was placed there; Segs respawned, walked ~11 blocks
+  including a 4-block height change, opened the chest, took everything,
+  said "got my stuff back from my grave". Stats graves: 1.
+- Bread-count note: the chest merge used the OLD NBT format
+  (`Count:5b`); 26.3 silently ignores it and stores count 1. The NEW
+  format (`count:5`, lowercase int) is the correct one — proven by the
+  run 25 merge test (see below). Not a bot bug.
+
+### Run 21b — bed/spawn PROVEN, grave fallback (bug found)
+- Bed on flat ground (-126,70,162): "ok, this bed is my spawn now — if i
+  die ill come back here". After /kill, Segs respawned at (-124.5,70,163.5)
+  — beside the bed, not at world spawn (-144,71,160). Bed = spawn PROVEN.
+- Grave: Segs said "opened my grave — check if my stuff is back" and its
+  inventory did not grow (slots 3 -> 3). Root cause found by reading the
+  region file: the chest STILL held 5 bread + 1 sword (new NBT format,
+  so the merge had worked). The old code used activateBlock + sleep 800ms
+  + bot.currentWindow and silently found no window. FIXED: recoverGrave
+  now uses bot.openChest (waits for the window, same API as v6's
+  checkChestFor) with a shift+right-click fallback, and counts items
+  actually taken instead of trusting slot counts.
+
+### Run 22 — permanent home + store PROVEN, pickup bug found
+- "ok, this is my permanent home now" (chests: 2 found). "Segs keep
+  these items at your base" → "stored in my room: 1x bread, 1x potato,
+  4x carrot"; inventory after = iron_sword only (tools kept). PROVEN.
+- Pickup BUG: "Segs pick up the carrot" → "couldnt reach any carrot";
+  "pick up the items" collected only the carrot. Cause: pickup walked
+  with gotoPos (GoalNear range 2) and stopped up to 2 blocks short of
+  the item — outside the ~1-block pickup radius. FIXED: pickup is now a
+  round-based loop (max 6 rounds, re-scans each round, walks to range 1
+  with a 15s timeout per round).
+
+### Run 25 — pickup fix PROVEN + NBT merge format settled
+- "Segs pick up the diamond" → "picked up: 4x diamond, 3x bread,
+  4x carrot" (it collects everything nearby, not just the named item —
+  item entities whose dropped-item name can't be read count as matches;
+  honest caveat, not a failure). Final inventory exact. PROVEN.
+- Merge-format test (two chests, /save-all, region-file NBT read):
+  new format `count:5` → bread x5 stored; old format `Count:5b` →
+  bread x1 (silently ignored). 26.3 uses the new format.
+
+### Run 21 (retest) — grave fix PROVEN
+- Same setup as 21b with the openChest fix: "got my stuff back from my
+  grave (6 items)", log "window opened=true, took 6 item(s)",
+  inventory slots 1 -> 3. PROVEN. (Stray ground drops from the death
+  itself are NOT part of the grave — on the real server SimpleGraves
+  puts everything in the grave; the test server has no plugin, so a
+  few dropped stacks stayed on the ground.)
+
+### Run 23 — enemy check PROVEN, evade FAILED (walk too slow), owner-bot died
+- "Segs check for enemies" → "i can see: zombie 19 blocks away". PROVEN.
+- Evade FAILED: Segs fled at walk speed (4.3 m/s vs zombie 4.6 m/s),
+  the zombie caught it at 0 blocks and killed it. Test-setup flaw too:
+  the owner-bot stood 4 blocks from the summoned zombie and was slain,
+  then kicked on respawn (the known Paper death-kick). Lava half of
+  run 23 never ran (owner died first).
+- FIX 1 (sprint): flee 15 blocks + forced sprint. Retested as run 27.
+
+### Run 24 — sethome / home / daytime bed PROVEN
+- Daytime bed: "its daytime, i cant sleep yet — ill sleep in this bed
+  tonight and set my spawn then". At night the watchdog slept in the
+  pending bed on its own: "slept in my bed — this is my spawn now".
+  PROVEN.
+- "Segs sethome a" twice → "ok, set home a on the server" both times;
+  the test server's "Unknown or incomplete command" reply was correctly
+  NOT treated as a refusal. "Segs list homes" → "my server homes:
+  mine, a". PROVEN (matcher only).
+- "Segs go to a" → "going to a" → "couldnt teleport there, walking
+  instead" → "i dont know where a is" (no brain base for 'a' — honest
+  fallback). The /home warmup stillness itself is code-only here (no
+  HomePlugin on the test server); the real proof is on youniga.
+
+### Run 26 — lava INCONCLUSIVE (valley terrain, my setup)
+- The "flat" ground at (-110,200) is actually a valley (y≈63). The
+  lava strip was placed at y=70, floating 7 blocks above the ground,
+  and Segs could not reach lavatest ("i cant reach there"). No lava
+  routing was tested. Retested as run 30 on verified flat ground.
+
+### Run 27 — evade sprint fix FAILED (one-shot goal stops, then NaN)
+- Segs sprinted to a point 15 blocks away, STOPPED there (goal
+  reached), and the zombie walked to where it stopped and killed it.
+  Worse: the flee/evade intervals kept firing while Segs was
+  disconnected (stale state), and a lookAt with a bad target poisoned
+  Segs' yaw with NaN — the server then kicked it repeatedly ("Invalid
+  move player packet", "moved too quickly") and Segs died at
+  "NaN, 69, NaN".
+- FIX 2 (continuous flee): the flee is now a loop that re-steers
+  directly away from the nearest hostile every 250ms (forward +
+  sprint) and only stops when nothing hostile is within 12 blocks.
+  Hardened: a `connected` flag stops all loops while disconnected; the
+  away vector is guarded against zero/NaN (falls back to Segs' facing
+  direction) and forced horizontal; sprint-only, no held jump (the
+  bunny-hopping tripped Paper's "moved too quickly") with a jump pulse
+  only when stuck. Retested as run 29.
+
+### Run 28 — French sethome PROVEN, lava still unproven, test bed burned
+- French refusal (owner said the real server text in chat 1s after
+  /sethome b): Segs replied "the server wouldnt set home b — the
+  server said: <OrewaSegs> Vous n'avez pas la permission d'ajouter un
+  autre home !" and "my server homes: mine, a" (b NOT recorded). PROVEN.
+- Lava: Segs arrived at lavatest but then died — "Segs tried to swim in
+  lava". The strip at (-130,70,171..179) flowed down the valley slope
+  onto Segs' position. Test-setup flaw again (valley + flowing lava),
+  not a routing failure. Side effect: the flow burned the test bed at
+  (-130,70,170), so run 30 re-places it.
+- French messages (screenshots 2026-11-07, server speaks French, not
+  Spanish as first guessed): refusal "Vous n'avez pas la permission
+  d'ajouter un autre home !"; /home "Début de la téléportation vers le
+  home : a", "Téléportation dans : 3", "Téléportation annulée car vous
+  avez bougé." Segs now matches the refusal and listens for the warmup
+  start/cancel messages (pendingHome).
+
+### Run 29 — flee loop FAILED again (flee stops silently, zombie wins)
+- Segs died 3 times to the same zombie. The flee loop kept starting
+  ("fleeing zombie at 4 blocks") and stopping within 5s without logging
+  why, so Segs stood still while the zombie closed in. The grave system
+  kept working through it ("got my stuff back from my grave (5 items)").
+- The server log showed repeated "Invalid move player packet" kicks
+  (the known Paper death-kick) and "moved too quickly" warnings.
+- FIX: debug logging on every flee stop path, so the next run says WHY
+  it stopped instead of dying silently.
+
+### Run 30 — bed restore PROVEN, lava routing FAILED (pathfinder stuck)
+- Bed re-placed and re-set: "ok, this bed is my spawn now". PROVEN.
+- Lava strip on the farm ground: "going to lavaflat" → direct goto
+  timed out (25s) → staged retry stage 1/2 timed out (20s) → "i cant
+  reach there". Segs moved 1 block in 45s and never touched lava
+  (hp 20/20 — the avoidance kept it safe, but it found no detour).
+  The strip's lava had flowed into the ground dips, widening the
+  barrier, and the staged waypoints likely landed in the lava zone.
+  Retested as run 32 with magma first (no flow) to isolate routing
+  from flowing lava.
+
+### Run 31 / 31b — ROOT CAUSE FOUND: Vec3.multiply(scalar) is NaN
+- The debug logging caught it: every flee stopped with "bad target",
+  and the value log showed a PERFECT away vector (0.7071, 0, -0.7071)
+  and valid positions — yet the target was NaN. Cause: in the `vec3`
+  package, `.multiply()` is component-wise Vec3 multiplication, NOT a
+  scalar multiply — `.multiply(10)` computes `x * undefined` = NaN.
+  The scalar method is `.scale(10)`. Verified in node:
+  `multiply(10)` → `(NaN, NaN, NaN)`, `scale(10)` → `(7.071, 0, -7.071)`.
+- This bug was in the flee code since run 23 (every "sprint flee" had a
+  NaN goal, so Segs never actually fled) AND in the v2-era low-health
+  flee (line 524, `.multiply(6)` — silently swallowed by try/catch, so
+  it never worked either). FIXED in both places to `.scale()`.
+- Retested as run 31 (flee) and run 32 (routing).
+
+### Run 31 — flee loop PROVEN (outran the zombie)
+- With the `.scale()` fix the flee actually runs: Segs fled from
+  (-145,165) to (-163,191), ~30 blocks, and the loop stopped with
+  "clear, no hostile within 12" — it outran the zombie. PROVEN.
+- Honest limit: Segs still died later in the run — it fled into dark
+  unlit valley at night at 5hp and met a SECOND zombie. Fleeing
+  outruns one mob; it does not make Segs safe alone at night in the
+  open. (Fight-back when cornered is the natural next step, offered
+  to Tash with the v8 delivery.)
+
+### Run 32 / 33 / 34 / 35 / 36 — lava/magma routing NOT proven
+- Run 32 (magma then lava strip on the farm ground): both legs "i cant
+  reach there". Run 33 (same walk, NO strip): STILL "i cant reach
+  there" — the strip was not the problem. Run 34 (start west of the
+  dip, lava strip): "goal was changed" twice (flowing lava near the
+  path makes the pathfinder replan/cancel the goto) and Segs died
+  when the lava flowed onto the spot it was stuck on ("tried to swim
+  in lava"). Run 35 (flat stone platform + magma strip): Segs walked
+  to the strip's edge (-151,160) and stopped — no detour found.
+  Run 36 (same walk, strip removed): STILL timed out on 8 blocks.
+- Conclusion: the routing failure is NOT the lava or the magma. The
+  pathfinder in this fork times out on 8-20 block walks in this test
+  world's rough terrain (dips, valley edges) — the same honest limit
+  documented in v7 for long wild walks. The platform fill likely did
+  nothing (natural ground there is already y=70, so stone at y=69
+  was buried). What IS proven: Segs never walks into lava/magma
+  (hp 20/20 in every lava run, it stops at the edge) — the avoidance
+  config (blocksToAvoid: lava, fire, magma, cactus, sweet berry bush)
+  is correct and active; the detour around a strip is what the
+  simulation could not demonstrate. On the real server Segs mostly
+  teleports, and Tash's base is built/flat ground, so ground detours
+  matter less there — but this stays honestly unproven until the
+  real-server test.
+
+### What is still NOT proven (v8)
+- The real youniga.deployd.sh server — Tash must test it (unchanged).
+- SimpleGraves' real grave block type + shift+right-click take-all
+  (tests used a plain chest; the code also tries openChest first).
+- The exact /home warmup teleport on HomePlugin (no plugin on the
+  test server) and the real French messages arriving as system chat
+  (simulated via owner chat in run 28 — the matcher is proven, the
+  delivery channel on the real server is not).
+- Long wild cross-country walks (unchanged from v7).
+- Lava/magma routing around a strip (see runs 32-36 above) and the
+  /home warmup teleport on real HomePlugin.

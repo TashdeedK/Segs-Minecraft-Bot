@@ -1,4 +1,6 @@
-// Segs - free Mineflayer bot, v2 - natural talk, no ! needed
+// Segs - free Mineflayer bot, v8 - bed spawn, permanent home, grave recovery,
+//   pickup + store items, enemy evade, hunger-dependent sprint, danger avoidance
+//   (v7: /tpa + /sethome /home, command queue, honest walks, goto timeout)
 // Node 22+ : npm install, then edit config.json, then node bot.js
 // Talk like this (only OrewaSegs can command it):
 //   "Segs tp to me" / "Segs come here" / "Segs follow me"
@@ -217,7 +219,7 @@ function aliasItem (name) {
 // "Segs this is the smoker" / "Segs this is the furnace" — Segs stores the
 // block + position, then USES it on its own when it needs food or smelting.
 // Landmark types: farm (with a crop), chest, furnace, smoker, bed, table.
-let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {}, landmarks: {}, serverHomes: [] }
+let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {}, landmarks: {}, serverHomes: [], permanentHome: null, spawnBed: null, pendingSpawnBed: null, roomChests: [], lastGrave: null }
 try {
   if (fs.existsSync('./brain.json')) brain = { ...brain, ...JSON.parse(fs.readFileSync('./brain.json', 'utf8')) }
 } catch (e) {}
@@ -231,6 +233,19 @@ if (!brain.deaths) brain.deaths = []
 if (!brain.found) brain.found = {}
 if (!brain.landmarks) brain.landmarks = {}
 if (!brain.serverHomes) brain.serverHomes = []
+if (!('permanentHome' in brain)) brain.permanentHome = null
+if (!('spawnBed' in brain)) brain.spawnBed = null
+if (!('pendingSpawnBed' in brain)) brain.pendingSpawnBed = null
+if (!brain.roomChests) brain.roomChests = []
+if (!('lastGrave' in brain)) brain.lastGrave = null
+let lastSetHome = null // name of the most recent /sethome, so the permanent home can link to it
+let pendingSethome = null // { name, at } — waiting for the server's reply to /sethome
+let pendingHome = null // { name, at, started, cancelled } — waiting for the /home warmup messages
+let connected = false // true only while actually on the server; loops must not run on stale state
+let pathMovements = null // the Movements object, so sprint + danger-avoid can be tuned live
+let lastEvadeSay = 0
+let lastEvadeAt = 0
+let recoveringGrave = false
 function saveBrain () { try { fs.writeFileSync('./brain.json', JSON.stringify(brain, null, 2)) } catch (e) {} }
 // Save the last ACTION task (not questions like "what time is it") so "do it again" works.
 // (Simulation run 2 found this bug: lastTask was only saved for unknown commands,
@@ -327,6 +342,7 @@ function createBot () {
   } catch (e) { log('autoEat setup: ' + e.message) }
 
   bot.once('spawn', async () => {
+    connected = true
     log('Spawned at ' + bot.entity.position)
     loggedIn = false
     loginTried = false
@@ -336,11 +352,31 @@ function createBot () {
       movements.allowParkour = false
       movements.canDig = true
       movements.allow1by1towers = false
+      // v8: danger blocks. Lava + fire are already in the default
+      // blocksToAvoid; add magma blocks (burn feet) and cactus (thorns).
+      // Water stays allowed — Segs can swim, it just goes slower.
+      try {
+        if (mcData.blocksByName.magma_block) movements.blocksToAvoid.add(mcData.blocksByName.magma_block.id)
+        if (mcData.blocksByName.cactus) movements.blocksToAvoid.add(mcData.blocksByName.cactus.id)
+        if (mcData.blocksByName.sweet_berry_bush) movements.blocksToAvoid.add(mcData.blocksByName.sweet_berry_bush.id)
+      } catch (e) {}
+      pathMovements = movements
       bot.pathfinder.setMovements(movements)
+      updateSprint()
     } catch (e) { log('movements: ' + e.message) }
     try { bot.armorManager.equipAll() } catch (e) {}
     await sleepMs(1500)
     tryLogin()
+    // v8: if Segs died before this reconnect and the grave is still fresh
+    // (SimpleGraves only keeps it 10 minutes), go back for its stuff once
+    // it is logged in. The death handler saved the spot in brain.lastGrave.
+    setTimeout(() => {
+      try {
+        if (bot && bot.entity && bot.health > 0 && brain.lastGrave && !brain.lastGrave.recovered && Date.now() - brain.lastGrave.at < 9 * 60 * 1000) {
+          recoverGrave().catch(e => log('grave auto-recover: ' + e.message))
+        }
+      } catch (e) {}
+    }, 8000)
   })
 
   function tryLogin () {
@@ -402,6 +438,30 @@ function createBot () {
   bot.on('messagestr', (message) => {
     // v7: tpa requests often arrive as system chat, not player chat
     if (maybeAcceptTpa(message)) return
+    // v8: the server answers /sethome in FRENCH (screenshots 2026-11-07 —
+    // the "Spanish" guess was wrong). If Segs just asked to set a home,
+    // read the reply: a duplicate name or the 3-home limit is refused with
+    // "Vous n'avez pas la permission d'ajouter un autre home !" and Segs
+    // must NOT record a home that was never set. Spanish patterns are kept
+    // as a fallback. Every reply is logged to logs/.
+    if (pendingSethome && Date.now() - pendingSethome.at < 5000) {
+      logEvent('sethome-reply', message)
+      const m = (message || '').toLowerCase()
+      // "Unknown command" (a server WITHOUT the home plugin, like the test
+      // server) is not a refusal — ignore it.
+      if (/unknown (command|or incomplete)/.test(m)) return
+      const fail = /ya (existe|tienes)|existe|no (puedes|se puede|tienes)|l[ií]mite|m[aá]ximo|demasiad|ya hay|no se ha|denegado|pas la permission|ajouter un autre|permission d'ajouter|d[eé]j[aà]|limite|maximum/.test(m)
+      if (fail) { pendingSethome.failed = true; pendingSethome.why = (message || '').slice(0, 100) }
+    }
+    // v8: the /home warmup speaks too — "Début de la téléportation vers
+    // le home : a" (accepted, 3s countdown) and "Téléportation annulée
+    // car vous avez bougé." (cancelled because Segs moved). Track both so
+    // tryServerHome knows WHY a teleport did or didn't happen.
+    if (pendingHome && Date.now() - pendingHome.at < 6000) {
+      const m = (message || '').toLowerCase()
+      if (/t[eé]l[eé]portation annul[eé]e|annul[eé]e car vous avez boug[eé]|teleport.*cancel/.test(m)) { pendingHome.cancelled = true; logEvent('home', 'warmup cancelled by server: ' + (message || '').slice(0, 100)) }
+      else if (/d[eé]but de la t[eé]l[eé]portation|t[eé]l[eé]portation dans/.test(m)) { pendingHome.started = true; logEvent('home', 'warmup started: ' + (message || '').slice(0, 100)) }
+    }
     if (!loggedIn && config.autoLogin && config.authPassword && !config.authPassword.includes('PUT_')) {
       if (/please register|\/register/i.test(message)) tryRegister()
       else if (/please login|\/login/i.test(message)) tryLogin()
@@ -426,6 +486,10 @@ function createBot () {
   // zombies killed Segs 9 times in a row and it got kicked after every death.
   bot.on('death', () => {
     const pos = bot.entity ? [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)] : [0, 0, 0]
+    // v8: the grave (SimpleGraves) sits where Segs died, for 10 minutes.
+    // Remember it with the dimension, so the respawn can go back for it —
+    // or say in chat where it is if it cannot get there.
+    try { brain.lastGrave = { pos, dimension: (bot.game && bot.game.dimension) || 'minecraft:overworld', at: Date.now(), recovered: false }; saveBrain() } catch (e) {}
     brain.deaths.push({ what: 'died', pos, at: new Date().toISOString() })
     if (brain.deaths.length > 10) brain.deaths = brain.deaths.slice(-10)
     saveBrain()
@@ -457,7 +521,7 @@ function createBot () {
       try {
         const target = bot.nearestEntity(e => e.type === 'mob' || e.type === 'player')
         if (target) {
-          const away = bot.entity.position.clone().subtract(target.position).normalize().multiply(6)
+          const away = bot.entity.position.clone().subtract(target.position).normalize().scale(6)
           bot.pathfinder.setGoal(new goals.GoalBlock(bot.entity.position.x + away.x, bot.entity.position.y, bot.entity.position.z + away.z))
         }
       } catch (e) {}
@@ -511,9 +575,9 @@ function createBot () {
     }
   })
 
-  bot.on('kicked', (reason) => { log('Kicked: ' + reason); scheduleReconnect() })
+  bot.on('kicked', (reason) => { connected = false; stopFlee(); log('Kicked: ' + reason); scheduleReconnect() })
   bot.on('error', (err) => { log('Error: ' + err.message) })
-  bot.on('end', (reason) => { log('Disconnected: ' + (reason || '')); scheduleReconnect() })
+  bot.on('end', (reason) => { connected = false; stopFlee(); log('Disconnected: ' + (reason || '')); scheduleReconnect() })
 
   function scheduleReconnect () {
     if (stopping || !config.autoReconnect) return
@@ -649,7 +713,7 @@ function createBot () {
 
     // help
     if (req.includes('help') || req.includes('what can you do')) {
-      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs sethome mine, segs go to mine, segs list homes, segs forget home mine, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop')
+      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs sethome mine, segs go to mine, segs list homes, segs forget home mine, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop, segs set this bed as your bed, segs remember this is your permanent home, segs pick up the items, segs keep these items at your base, segs check for enemies, segs get your stuff')
       return
     }
 
@@ -797,6 +861,25 @@ function createBot () {
       return
     }
 
+    // ---- v8: bed = spawn point ("set this bed as your bed") ----
+    if ((req.includes('bed') && /(your bed|set|spawn|remember|this bed)/.test(req)) || (req.includes('spawn') && /(set|make|your|here)/.test(req))) { await setSpawnBed(); return }
+    // ---- v8: permanent home / room ----
+    if ((req.includes('where is') || req.includes('where')) && (req.includes('your room') || req.includes('permanent home'))) {
+      if (!brain.permanentHome) { say('i dont have a permanent home yet — stand in my room and tell me: segs remember this is your permanent home'); return }
+      const ph = brain.permanentHome
+      say(`my permanent home is at ${ph.pos.join(', ')}` + (ph.serverHome ? ` (server home ${ph.serverHome})` : ''))
+      return
+    }
+    if ((req.includes('permanent home') || req.includes('your room')) && !req.startsWith('go ') && !req.includes('where')) { await rememberPermanentHome(); return }
+    // ---- v8: store items at the base ("keep these items at your base") ----
+    if ((req.includes('store') && req.includes('item')) || req.includes('deposit') || ((req.includes('keep') || req.includes('put')) && (req.includes('base') || req.includes('room') || req.includes('home')) && (req.includes('item') || req.includes('stuff') || req.includes('these')))) { await storeItems(); return }
+    // ---- v8: pick up dropped items ("pick the items", "pick up the bread") ----
+    if ((req.includes('pick') || req.includes('collect') || req.includes('grab')) && (req.includes('item') || req.includes('up') || req.includes('these') || req.includes('them'))) { await pickupItems(req); return }
+    // ---- v8: check for enemies ----
+    if (req.includes('enemies') || req.includes('enemy') || req.includes('is it safe') || (req.includes('safe') && req.includes('here'))) { checkEnemies(); return }
+    // ---- v8: go back to the grave ("get your stuff", "go to your grave") ----
+    if ((req.includes('grave') || req.includes('your stuff')) && (req.includes('get') || req.includes('go') || req.includes('recover') || req.includes('fetch'))) { await recoverGrave(true); return }
+
     // ---- v7: SERVER HOMES (HomePlugin, overworld only, max 3 per player) ----
     // "Segs sethome mine" sets a server home (instant teleport later).
     // "Segs forget home mine" removes it. "Segs list homes" shows them.
@@ -810,7 +893,22 @@ function createBot () {
         say(`i already have 3 homes set: ${brain.serverHomes.join(', ')}. tell me which one to forget first: segs forget home <name>`)
         return
       }
+      // v8: wait for the server's reply before claiming success. The
+      // server refuses a duplicate name (in Spanish) and refuses past 3
+      // homes. /home <name> has a 3s no-movement warmup; /sethome itself
+      // is instant. (messagestr flags a refusal in pendingSethome.failed.)
       serverCmd(`/sethome ${name}`)
+      pendingSethome = { name, at: Date.now() }
+      await sleepMs(1500)
+      if (pendingSethome && pendingSethome.failed) {
+        const why = pendingSethome.why ? ' — the server said: ' + pendingSethome.why : ''
+        say(`the server wouldnt set home ${name}${why}`)
+        logEvent('sethome', `/sethome ${name} refused by server`)
+        pendingSethome = null
+        return
+      }
+      pendingSethome = null
+      lastSetHome = name
       if (!brain.serverHomes.includes(name)) { brain.serverHomes.push(name); saveBrain() }
       logLearn('server-home', `set /sethome ${name}`)
       say(`ok, set home ${name} on the server`); return
@@ -837,6 +935,13 @@ function createBot () {
       let place = req.replace(/^go to (the )?/, '').replace(/ base$/, '').trim()
       if (req === 'go home') place = 'home'
       if (req === 'go farm') place = 'farm'
+      // v8: "go home" / "go to your room" means the PERMANENT home — the
+      // room, not the bed/spawn point (that can move). Teleport with its
+      // linked server home if it has one, else walk there.
+      if ((req === 'go home' || place === 'your room' || place === 'your permanent home') && brain.permanentHome) {
+        await goPermanentHome()
+        return
+      }
       // v7: if it is a server home, teleport with /home first (overworld only)
       if (place && brain.serverHomes.includes(place)) {
         stopAllMovement(); say(`going to ${place}`)
@@ -950,7 +1055,7 @@ function createBot () {
 
     // v6: "Segs stats" — show what it has done (from logs/stats.json)
     if (req === 'stats' || req.includes('show stats') || req.includes('your stats')) {
-      say(`my stats: ${stats.cropsFarmed} crops farmed, ${stats.itemsCrafted} items crafted, ${stats.blocksDug} blocks dug, ${stats.foodEaten} times fed, ${stats.chestsChecked} chests checked, ${stats.smeltsDone} smelts, ${stats.deaths} deaths, ${stats.timesHungry} times hungry`)
+      say(`my stats: ${stats.cropsFarmed} crops farmed, ${stats.itemsCrafted} items crafted, ${stats.blocksDug} blocks dug, ${stats.foodEaten} times fed, ${stats.chestsChecked} chests checked, ${stats.smeltsDone} smelts, ${stats.deaths} deaths, ${stats.timesHungry} times hungry, ${stats.itemsPicked || 0} items picked up, ${stats.itemsStored || 0} items stored, ${stats.graves || 0} graves recovered`)
       return
     }
     // status
@@ -1189,11 +1294,359 @@ function createBot () {
     try { await bot.wake(); say('awake, ready to work') } catch (e) { say('cant wake up yet') }
   }
 
+  // ---- v8: sprint (hunger-dependent) ----
+  // A human sprints when fed and walks when hungry — sprinting drains
+  // hunger fast. The pathfinder only sprints on straight stretches when
+  // allowSprinting is on, so toggle it from the food level: sprint at 10+
+  // (5 drumsticks), walk below that. Called before every walk and by the
+  // 30s watchdog, so it follows the food level live.
+  let sprintOn = null
+  function updateSprint () {
+    if (!pathMovements || !bot || !bot.entity || bot.food == null) return
+    const want = bot.food >= 10
+    if (want !== sprintOn) {
+      sprintOn = want
+      pathMovements.allowSprinting = want
+      log('sprint ' + (want ? 'on' : 'off') + ' (food ' + bot.food + '/20)')
+    }
+  }
+
+  // ---- v8: bed = spawn point ----
+  // "Segs set this bed as your bed" — Segs sleeps in the nearest bed, which
+  // is what sets the vanilla spawn point. If it is daytime it cannot sleep
+  // yet, so it remembers the bed and sleeps in it at night on its own.
+  // Asking again at another bed moves the spawn point there, any time.
+  async function setSpawnBed () {
+    const bed = bot.findBlock({ matching: b => b.name && b.name.includes('bed'), maxDistance: 8 })
+    if (!bed) { say('i cant see a bed near me, put one down and bring me to it'); return }
+    const pos = [Math.floor(bed.position.x), Math.floor(bed.position.y), Math.floor(bed.position.z)]
+    try {
+      stopAllMovement()
+      await gotoPos(bed.position)
+      await bot.sleep(bed)
+      brain.spawnBed = pos; brain.pendingSpawnBed = null; saveBrain()
+      say('ok, this bed is my spawn now — if i die ill come back here')
+      logEvent('spawn', 'spawn point set at bed ' + pos.join(', '))
+    } catch (e) {
+      if (/not night|daytime|day/i.test(e.message)) {
+        brain.pendingSpawnBed = pos; saveBrain()
+        say('its daytime, i cant sleep yet — ill sleep in this bed tonight and set my spawn then')
+        log('spawn bed remembered for tonight: ' + pos.join(', '))
+      } else if (/monster|mob/i.test(e.message)) {
+        say('cant sleep, monsters are too close — clear them out first')
+      } else { say('cant sleep in that bed right now'); log('setSpawnBed failed: ' + e.message) }
+    }
+  }
+  // Night check for a bed remembered during the day (called by the watchdog).
+  async function sleepPendingBed () {
+    if (!brain.pendingSpawnBed || bot.isSleeping) return
+    if (currentJob() !== 'idle, waiting for you') return
+    try {
+      if (bot.time && bot.time.isDay) return
+      const bp = new Vec3(brain.pendingSpawnBed[0], brain.pendingSpawnBed[1], brain.pendingSpawnBed[2])
+      if (bot.entity.position.distanceTo(bp) > 20) return
+      if (nearestHostile(8)) return // monsters nearby block sleeping anyway
+      const bed = bot.blockAt(bp)
+      if (!bed || !bed.name.includes('bed')) { brain.pendingSpawnBed = null; saveBrain(); return }
+      await gotoPos(bp)
+      await bot.sleep(bed)
+      brain.spawnBed = brain.pendingSpawnBed; brain.pendingSpawnBed = null; saveBrain()
+      say('slept in my bed — this is my spawn now')
+      logEvent('spawn', 'spawn point set at bed (night) ' + brain.spawnBed.join(', '))
+    } catch (e) { log('sleepPendingBed: ' + e.message) }
+  }
+
+  // ---- v8: permanent home (the room) ----
+  // Different from the bed/spawn point, which moves whenever the owner says
+  // so: the permanent home is where Segs lives — its room, its chests.
+  // It stays put even if the spawn point changes later.
+  async function rememberPermanentHome () {
+    const pos = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
+    // link the server home set most recently, so "go home" can teleport
+    const serverHome = lastSetHome && brain.serverHomes.includes(lastSetHome) ? lastSetHome : null
+    // scan for the room's chests now, so "store items" knows where to put things
+    const chests = []
+    try {
+      const found = bot.findBlocks({ matching: b => b.name.includes('chest'), maxDistance: 8, count: 6 })
+      for (const p of found) chests.push([Math.floor(p.x), Math.floor(p.y), Math.floor(p.z)])
+    } catch (e) {}
+    brain.permanentHome = { pos, serverHome, setAt: new Date().toISOString() }
+    brain.roomChests = chests
+    saveBrain()
+    say(serverHome ? `ok, this is my permanent home now — my server home for it is ${serverHome}` : 'ok, this is my permanent home now')
+    logEvent('home', 'permanent home set at ' + pos.join(', ') + (serverHome ? ' (server home ' + serverHome + ')' : '') + ', chests: ' + chests.length)
+  }
+  async function goPermanentHome () {
+    if (!brain.permanentHome) return false
+    const ph = brain.permanentHome
+    if (ph.serverHome && brain.serverHomes.includes(ph.serverHome)) {
+      stopAllMovement(); say('going to my room')
+      if (await tryServerHome(ph.serverHome)) { say('at my room'); return true }
+      say('couldnt teleport there, walking instead')
+    }
+    stopAllMovement(); say('going to my room')
+    const ok = await gotoPos(new Vec3(ph.pos[0], ph.pos[1], ph.pos[2]))
+    if (ok) say('at my room')
+    return ok
+  }
+
+  // ---- v8: store items in the room's chests ----
+  // Keeps its tools (pickaxe, sword, etc.) — those stay in its hands.
+  // Everything else goes into the room chests.
+  const KEEP_ITEMS = ['pickaxe', 'axe', 'shovel', 'sword', 'hoe', 'fishing_rod', 'bow', 'crossbow', 'shield', 'helmet', 'chestplate', 'leggings', 'boots', 'elytra', 'trident']
+  async function storeItems () {
+    if (!brain.permanentHome) { say('i dont have a permanent home yet — stand in my room and tell me: segs remember this is your permanent home'); return }
+    const items = bot.inventory.items().filter(i => !KEEP_ITEMS.some(k => i.name.includes(k)))
+    if (!items.length) { say('i have nothing to store, just my tools'); return }
+    if (!(await goPermanentHome())) return // it already said why
+    // chests: the ones scanned when the room was set, else any chest nearby
+    let chestPositions = (brain.roomChests || []).map(p => new Vec3(p[0], p[1], p[2]))
+    if (!chestPositions.length) {
+      try { chestPositions = bot.findBlocks({ matching: b => b.name.includes('chest'), maxDistance: 8, count: 6 }) } catch (e) {}
+    }
+    if (!chestPositions.length) { say('im in my room but i cant see any chest here'); return }
+    const stored = []
+    for (const cp of chestPositions) {
+      if (!items.length) break
+      const block = bot.blockAt(cp)
+      if (!block || !block.name.includes('chest')) continue
+      try {
+        await gotoPos(cp)
+        const chest = await bot.openChest(block)
+        for (const item of [...items]) {
+          try {
+            await chest.deposit(item.type, item.metadata, item.count)
+            stored.push(`${item.count}x ${item.name}`)
+            items.splice(items.indexOf(item), 1)
+          } catch (e) { /* chest full for this stack — try the next chest */ }
+        }
+        chest.close()
+      } catch (e) { log('store: chest at ' + cp + ' failed: ' + e.message) }
+    }
+    if (stored.length) { say(`stored in my room: ${stored.join(', ')}`); logEvent('store', 'stored ' + stored.join(', ')); bumpStat('itemsStored', stored.length) }
+    else say('couldnt store anything, the chests look full')
+    if (items.length) say(`still carrying: ${items.map(i => `${i.count}x ${i.name}`).join(', ')}`)
+  }
+
+  // ---- v8: pick up dropped items ----
+  async function pickupItems (req) {
+    // "pick up the bread" -> bread only; "pick the items" -> everything nearby
+    let wanted = null
+    const m = req.match(/pick (?:up )?(?:the )?(.+)$/) || req.match(/(?:collect|grab) (?:the )?(.+)$/)
+    if (m && m[1] && !/^(items|item|stuff|these|them|everything)$/.test(m[1].trim())) wanted = aliasItem(m[1].trim())
+    // v8 fix (run 22): gotoPos stops up to 2 blocks short (GoalNear range
+    // 2), but picking an item up needs Segs almost on top of it — walk to
+    // range 1 instead, and wait a full second for the server to hand it
+    // over. Re-scan the entities each time: the first walk can take a
+    // while and a falling item's position goes stale.
+    const before = {}
+    for (const it of bot.inventory.items()) before[it.name] = (before[it.name] || 0) + it.count
+    for (let round = 0; round < 6; round++) {
+      const dropped = Object.values(bot.entities || {}).filter(e => e && e.name === 'item' && bot.entity.position.distanceTo(e.position) <= 16)
+      if (!dropped.length) break
+      dropped.sort((a, b) => bot.entity.position.distanceTo(a.position) - bot.entity.position.distanceTo(b.position))
+      let target = null
+      for (const e of dropped) {
+        if (!wanted) { target = e; break }
+        let iname = null
+        try { const di = e.getDroppedItem && e.getDroppedItem(); if (di) iname = di.name } catch (_) {}
+        if (!iname || iname === wanted) { target = e; break }
+      }
+      if (!target) break
+      if (bot.inventory.items().length >= 36) { say('my inventory is full, cant pick up more'); break }
+      try {
+        updateSprint()
+        await gotoWithTimeout(new goals.GoalNear(target.position.x, target.position.y, target.position.z, 1), 15000)
+        await sleepMs(1000) // give the server a moment to hand the item over
+      } catch (err) { log('pickup: ' + err.message); break }
+    }
+    const got = []
+    for (const it of bot.inventory.items()) {
+      const diff = it.count - (before[it.name] || 0)
+      if (diff > 0) got.push(`${diff}x ${it.name}`)
+    }
+    if (got.length) { say(`picked up: ${got.join(', ')}`); logEvent('pickup', 'collected ' + got.join(', ')); bumpStat('itemsPicked', got.length) }
+    else say(wanted ? `couldnt reach any ${wanted}` : 'couldnt reach the items')
+  }
+
+  // ---- v8: enemies — check + evade (like a villager flees) ----
+  const HOSTILE_MOBS = ['zombie', 'skeleton', 'creeper', 'spider', 'enderman', 'witch', 'slime', 'husk', 'drowned', 'stray', 'zombie_villager', 'cave_spider', 'blaze', 'ghast', 'piglin', 'piglin_brute', 'hoglin', 'zoglin', 'phantom', 'vex', 'vindicator', 'pillager', 'ravager', 'evoker', 'guardian', 'elder_guardian', 'warden', 'silverfish', 'endermite', 'magma_cube', 'wither_skeleton', 'zombified_piglin']
+  function nearestHostile (maxDist) {
+    if (!bot || !bot.entities) return null
+    let best = null, bestD = maxDist
+    for (const e of Object.values(bot.entities)) {
+      if (!e || !e.name || !HOSTILE_MOBS.includes(e.name)) continue
+      const d = bot.entity.position.distanceTo(e.position)
+      if (d < bestD) { best = e; bestD = d }
+    }
+    return best
+  }
+  function checkEnemies () {
+    const found = []
+    if (!bot || !bot.entities) { say('i cant see anything right now'); return }
+    for (const e of Object.values(bot.entities)) {
+      if (!e || !e.name || !HOSTILE_MOBS.includes(e.name)) continue
+      const d = Math.round(bot.entity.position.distanceTo(e.position))
+      if (d <= 20) found.push(`${e.name} ${d} blocks away`)
+    }
+    if (!found.length) say('all clear, nothing hostile nearby')
+    else say(`i can see: ${found.slice(0, 5).join(', ')}`)
+    logEvent('enemies', found.length ? found.join('; ') : 'all clear')
+  }
+  // Evade tick (every 5s, background): if a hostile gets close while Segs
+  // is idle, walk away from it — like a villager flees a zombie. If it is
+  // in the middle of a job and the mob is about to hit (under 4 blocks),
+  // interrupt the job and run. Guard mode is the exception: then it fights.
+  // v8: fleeing is a continuous run, not a one-shot pathfinder goal.
+  // Run 27 proved the goal version fails: Segs sprinted to a point 15
+  // blocks away, STOPPED there (goal reached), and the zombie just walked
+  // to where it stopped and killed it 11s later. A real player keeps
+  // running while the mob is close. So the flee loop re-steers directly
+  // away from the nearest hostile every 250ms (forward + sprint + jump)
+  // and only stops when nothing hostile is within 12 blocks.
+  let fleeTimer = null
+  let fleeLastPos = null, fleeLastMove = 0
+  function stopFlee (why) {
+    if (fleeTimer) { clearInterval(fleeTimer); fleeTimer = null }
+    if (why) logEvent('evade', 'flee stopped: ' + why)
+    try { bot.clearControlStates() } catch (e) {}
+  }
+  function startFlee (mob) {
+    if (fleeTimer) return
+    stopAllMovement()
+    if (Date.now() - lastEvadeSay > 30000) { lastEvadeSay = Date.now(); say(`${mob.name} nearby, moving away`) }
+    logEvent('evade', `fleeing ${mob.name} at ${Math.round(bot.entity.position.distanceTo(mob.position))} blocks`)
+    fleeLastPos = bot.entity.position.clone(); fleeLastMove = Date.now()
+    fleeTimer = setInterval(() => {
+      try {
+        // Never flee on stale state: while disconnected bot.entity and
+        // bot.entities are frozen, and a bad lookAt there once poisoned
+        // Segs' yaw with NaN (run 27) so the server kept kicking it.
+        if (!connected) { stopFlee('not connected'); return }
+        if (!bot || !bot.entity) { stopFlee('no entity'); return }
+        if (bot.health <= 0) { stopFlee('dead'); return }
+        if (bot.isSleeping || guardMode) { stopFlee('sleeping/guarding'); return }
+        const m = nearestHostile(12)
+        if (!m) { stopFlee('clear, no hostile within 12'); return }
+        const pos = bot.entity.position
+        if (!pos || !isFinite(pos.x) || !isFinite(pos.y) || !isFinite(pos.z)) { stopFlee('bad position'); return }
+        let away = pos.clone().subtract(m.position)
+        away.y = 0 // flee horizontally — a mob below/above must not point Segs at the sky
+        // If the mob is exactly on top of Segs the vector is (0,0,0) and
+        // normalize() gives NaN — run away in the direction Segs faces.
+        const Vec3 = require('vec3').Vec3
+        if (!isFinite(away.x) || !isFinite(away.z) || away.distanceTo(new Vec3(0, 0, 0)) < 0.1) {
+          away = new Vec3(-Math.sin(bot.entity.yaw), 0, -Math.cos(bot.entity.yaw))
+        } else { away = away.normalize() }
+        const target = pos.clone().add(away.clone().scale(10))
+        if (!isFinite(target.x) || !isFinite(target.z)) { logEvent('evade', `bad target: pos=${pos} away=${away} mobPos=${m.position} yaw=${bot.entity.yaw} mob=${m.name}@${m.position}`); stopFlee('bad target'); return }
+        bot.lookAt(target)
+        bot.setControlState('forward', true)
+        bot.setControlState('sprint', true)
+        // Sprint only, no held jump: bunny-hopping tripped Paper's
+        // "moved too quickly" in run 27. Jump only in a short pulse
+        // when Segs is stuck against a step (hasn't moved in 750ms).
+        if (fleeLastPos && pos.distanceTo(fleeLastPos) > 0.5) { fleeLastPos = pos.clone(); fleeLastMove = Date.now(); bot.setControlState('jump', false) }
+        else if (Date.now() - fleeLastMove > 750) { bot.setControlState('jump', true); setTimeout(() => { try { bot.setControlState('jump', false) } catch (e) {} }, 400) }
+      } catch (e) { stopFlee('error: ' + (e && e.message ? e.message : e)) }
+    }, 250)
+  }
+  async function evadeTick () {
+    try {
+      if (!connected || !bot || !bot.entity || bot.health <= 0 || bot.isSleeping) return
+      if (guardMode) return
+      if (fleeTimer) return // already fleeing; the loop steers itself
+      const job = currentJob()
+      const mob = nearestHostile(job === 'idle, waiting for you' ? 8 : 4)
+      if (!mob) return
+      startFlee(mob)
+    } catch (e) {}
+  }
+
+  // ---- v8: grave recovery (SimpleGraves) ----
+  // The grave sits at the death spot for 10 minutes. After respawn Segs
+  // walks back, finds the grave block (chest-like), and shift+right-clicks
+  // it — that takes everything back at once, inventory as it was at death.
+  // If it cannot reach the spot or cannot find the grave, it says the
+  // coords in chat so the owner knows where the stuff is.
+  function findGraveBlock () {
+    try {
+      return bot.findBlock({ matching: b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'player_head' || b.name === 'barrel', maxDistance: 5 })
+    } catch (e) { return null }
+  }
+  async function recoverGrave (manual) {
+    if (recoveringGrave) return false
+    const g = brain.lastGrave
+    if (!g) { if (manual) say('i dont have a grave to go back to'); return false }
+    const ageMin = (Date.now() - g.at) / 60000
+    if (ageMin > 10) { if (manual) say('that grave is gone by now, graves only last 10 minutes'); brain.lastGrave.recovered = true; saveBrain(); return false }
+    if (g.recovered && !manual) return false
+    if (g.dimension && bot.game && bot.game.dimension && g.dimension !== bot.game.dimension) {
+      say(`i died in ${g.dimension.replace('minecraft:', '')} at ${g.pos.join(', ')} — i cant walk there from here`)
+      brain.lastGrave.recovered = true; saveBrain(); return false
+    }
+    recoveringGrave = true
+    try {
+      say(`i died at ${g.pos.join(', ')} — going back for my stuff`)
+      logEvent('grave', `recovering grave at ${g.pos.join(', ')}, died ${Math.round(ageMin)} min ago`)
+      const arrived = await gotoPos(new Vec3(g.pos[0], g.pos[1], g.pos[2]))
+      if (!arrived) { say(`i cant reach my grave at ${g.pos.join(', ')} — my stuff is there, ${Math.max(0, Math.round(10 - ageMin))} minutes left on it`); brain.lastGrave.recovered = true; saveBrain(); return false }
+      const grave = findGraveBlock()
+      if (!grave) { say(`im at the spot where i died (${g.pos.join(', ')}) but i cant see my grave — it should be right here`); brain.lastGrave.recovered = true; saveBrain(); return false }
+      // Take everything out of the grave. Right-click opens it like a
+      // chest (the user: "press right click u can access it as chest"), so
+      // open it properly with openChest — that WAITS for the window to open
+      // instead of hoping it is there after a fixed sleep. (v8 run 21b: the
+      // old activateBlock + sleep-800ms + currentWindow path silently found
+      // no window and took nothing, while the chest still held 5 bread +
+      // 1 sword. openChest is the same API checkChestFor uses — proven in v6.)
+      // Shift+right-click is the plugin's take-all shortcut; withdrawing
+      // every stack by hand ends with the same inventory.
+      const beforeCount = bot.inventory.items().length
+      let took = 0
+      let opened = false
+      try {
+        const win = await bot.openChest(grave)
+        opened = true
+        const items = win.containerItems().filter(Boolean)
+        for (const it of items) {
+          try { await win.withdraw(it.type, it.metadata, it.count); took += it.count } catch (e) { log('grave withdraw failed for ' + it.name + ': ' + e.message) }
+        }
+        try { win.close() } catch (e) {}
+      } catch (e) {
+        // not a chest-like block after all (e.g. a player head): fall back
+        // to the plugin's own shortcut, shift + right click.
+        log('grave openChest failed (' + e.message + '), trying shift+right-click')
+        try { bot.setControlState('sneak', true); await sleepMs(200); await bot.activateBlock(grave); await sleepMs(1200) } catch (e2) { log('grave activate: ' + e2.message) }
+        try { bot.setControlState('sneak', false) } catch (e2) {}
+        try {
+          if (bot.currentWindow) {
+            opened = true
+            const win = bot.currentWindow
+            const items = win.containerItems().filter(Boolean)
+            for (const it of items) { try { await win.withdraw(it.type, it.metadata, it.count); took += it.count } catch (e2) { log('grave withdraw failed for ' + it.name + ': ' + e2.message) } }
+            try { win.close() } catch (e2) {}
+          }
+        } catch (e2) {}
+      }
+      log('grave: window opened=' + opened + ', took ' + took + ' item(s)')
+      const afterCount = bot.inventory.items().length
+      brain.lastGrave.recovered = true; saveBrain()
+      bumpStat('graves', 1)
+      // took>0 means items moved out of the grave; slot counts alone lie
+      // (withdrawing into an existing stack adds no slot — run 21b).
+      say(took > 0 ? 'got my stuff back from my grave (' + took + ' items)' : 'opened my grave — check if my stuff is back, it should all be there')
+      logEvent('grave', `grave recovered at ${g.pos.join(', ')}, took ${took} items, inventory slots ${beforeCount} -> ${afterCount}`)
+      return true
+    } finally { recoveringGrave = false }
+  }
+
   function stopAllMovement () {
     moveToken++
     following = null
     stopFarming()
     stopAfk()
+    stopFlee()
     try { bot.pathfinder.setGoal(null) } catch (e) {}
     try { bot.pvp.stop() } catch (e) {}
   }
@@ -1211,11 +1664,23 @@ function createBot () {
   // (teleported). The server only has /home in the overworld and only 3
   // homes per player, so anything can fail — the caller walks instead.
   async function tryServerHome (name) {
+    // v8: /home has a 3-second warmup and ANY movement cancels the
+    // teleport, so stand perfectly still first — stop everything, clear
+    // all control states — then wait 3.5s (warmup + a little server lag)
+    // before checking whether Segs actually moved. Never send bare /home:
+    // that opens a GUI on this server, only /home <name> teleports.
+    stopAllMovement()
+    try { bot.clearControlStates() } catch (e) {}
     const before = bot.entity.position.clone()
+    pendingHome = { name, at: Date.now(), started: false, cancelled: false }
     serverCmd(`/home ${name}`)
-    await sleepMs(3000)
+    await sleepMs(3500)
     const moved = bot.entity.position.distanceTo(before) > 2
+    const cancelled = pendingHome && pendingHome.cancelled
+    pendingHome = null
+    if (cancelled) { logEvent('home', `/home ${name} warmup cancelled — Segs moved`); return false }
     if (moved) logEvent('home', `teleported to /home ${name}`)
+    else logEvent('home', `/home ${name} did not teleport (no such home, or the warmup never started)`)
     return moved
   }
   // Auto-accept a /tpa request from the owner. The exact message depends on
@@ -1263,6 +1728,7 @@ function createBot () {
   // announce arrival on false (run 11 proved both "made it" and "at home"
   // were said after walks that never arrived).
   async function gotoPos (pos) {
+    updateSprint() // sprint when fed, walk when hungry — before every walk
     const tok = moveToken
     const stopped = () => tok !== moveToken
     try {
@@ -1577,8 +2043,14 @@ function createBot () {
         say('im getting hungry, sorting food out myself')
         survive().catch(e => log('survive watchdog: ' + e.message))
       }
+      updateSprint()
+      // v8: a bed remembered during the day — sleep in it tonight to set spawn
+      if (brain.pendingSpawnBed) sleepPendingBed().catch(e => log('sleepPendingBed: ' + e.message))
     } catch (e) {}
   }, 30000)
+
+  // v8: enemy evade — check every 5s, flee like a villager if one gets close.
+  setInterval(() => { evadeTick().catch(e => log('evade: ' + e.message)) }, 5000)
 
   // ---- v5: dig / mine / chop / place / fish / smelt ----
   async function digBlock (itemName, count) {

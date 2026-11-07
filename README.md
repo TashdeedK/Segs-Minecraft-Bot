@@ -1,10 +1,71 @@
-# Segs — Free Minecraft Bot — v7 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v8 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
 
-**v7 is v6 + real teleporting on your server, using its actual plugins.**
+**v8 is v7 + bed = spawn point, a permanent home with room chests, grave
+recovery, pickup + store items, enemy evade, and hunger-based sprint.**
 Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+
+## What's new in v8
+
+**Bed = spawn point.** `Segs set this bed as your bed` — Segs walks to the
+bed and sleeps in it; that bed becomes its respawn point, and it remembers
+it. Ask again at another bed and the spawn point moves there. If it's
+daytime it says so and remembers the bed, then sleeps in it on its own the
+first night it can. (Segs had no spawn point at all before this — it
+respawned at the world spawn.)
+
+**Permanent home vs spawn point — two different things.** `Segs remember
+this is your permanent home` marks the spot where Segs stands as its
+permanent home (its room in your base, with its chests). It stays put even
+if the spawn point (bed) moves later. `Segs go home` goes there — by
+`/home <name>` first if a server home is linked to it, otherwise by
+walking. `Segs where is your permanent home` tells you the coords.
+
+**Grave recovery (SimpleGraves).** When Segs dies it remembers the death
+spot. After respawning it walks back on its own, opens the grave like a
+chest and takes everything out — inventory back as it was at death. If it
+can't reach the spot it says the coords in chat (`i cant reach my grave
+at X, Y, Z — my stuff is there, N minutes left on it`), because a grave
+only lasts 10 minutes. `Segs get your stuff` does the same trip by hand.
+
+**Pickup.** `Segs pick up the carrot` / `Segs pick up the items` — it
+walks right onto the dropped item (not 2 blocks short) and collects it.
+Works for anything: food, tools, blocks.
+
+**Store items.** `Segs keep these items at your base` — Segs goes to its
+permanent home and puts everything from its inventory into the room
+chests. It keeps its tools, weapons and armour (pickaxe, sword, bow,
+shield, armour...) and stores the rest.
+
+**Enemies — check and evade.** `Segs check for enemies` scans 20 blocks
+and reports what it sees (`i can see: zombie 19 blocks away`, or all
+clear). On its own, every 5 seconds, if a hostile gets within 8 blocks
+while Segs is idle (4 while it's busy) it **runs away from it, sprinting**,
+and says so in chat. It never runs while guarding. (Walking away was not
+enough — a zombie walks faster than a player walks, so v8 sprints.)
+
+**Danger blocks.** The pathfinder already avoids fire and lava; v8 also
+adds magma blocks, cactus and sweet berry bushes, so Segs routes around
+them instead of walking through.
+
+**Hunger-based walk/run.** Segs sprints when its food is 10 or higher
+and walks when it's hungry, so it doesn't burn food it doesn't have.
+`Segs status` shows hp and food.
+
+**`/home` warmup — it stands still.** A `/home <name>` teleport needs 3
+seconds with no movement, or it cancels. Segs now freezes completely
+(stops moving, clears all controls) before sending the command, waits
+3.5 seconds, and only then checks whether it teleported. It never sends
+bare `/home` (that opens a GUI). If the teleport didn't happen it walks
+instead and says so honestly.
+
+**`/sethome` reply listening.** After `/sethome <name>` Segs listens to
+what the server says back. If the server refuses (same name already set,
+or the 3-home limit — the message is in Spanish on your server) Segs says
+so in chat and does **not** pretend the home was set. Every reply is also
+written to `logs/` so you can see the exact wording.
 
 ## Your server's plugins — what Segs uses (v7)
 
