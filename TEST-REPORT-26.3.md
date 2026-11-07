@@ -325,3 +325,115 @@ Owner (op) built the base: /fill farmland + ripe potatoes, /setblock smoker,
   minutes of the last time it spoke, even if food drops again — by design,
   so it does not spam chat.
 
+
+## v7 — server plugins: /tpa, /sethome, /home (tested 2026-11-07)
+
+Tash sent the server's /plugins list: AuthMe, CoreProtect,
+CreeperBlockProtection, HomePlugin, packetevents, SimpleGraves,
+SkinsRestorer, SmoothChat. No LuckPerms — only player commands work.
+Player commands he confirmed: /tpa <user> (accept with /tpaccept <user>),
+/sethome <name> and /home <name> in the overworld, max 3 homes.
+
+v7 uses exactly those. Test server: local Paper 26.3 build 244, port 25569,
+same harness as v6 (owner-bot playing OrewaSegs). The test server has NO
+HomePlugin/TPA plugin, so /tpa, /tpaccept, /sethome, /home are "unknown
+command" there — the proof is the server log line "Segs issued server
+command: /tpa OrewaSegs" (the bot sent the right command) plus the
+fallback behaviour when the teleport does not happen. The real
+/HomePlugin + TPA plugin behaviour can only be proven on youniga itself.
+
+### Run 1 (zombie massacre — test setup failure, not a bot bug)
+- sethome/list-homes proven: "Segs issued server command: /sethome mine",
+  "my server homes: mine", brain.serverHomes = ['mine'].
+- Then the world (still normal difficulty + night from the v6 hunger
+  tests) spawned zombies at spawn: Segs was slain 9 times, the owner-bot
+  once. After each death Paper kicked the dead bot with "Invalid move
+  player packet received" (a corpse keeps sending movement packets) and
+  the bot reconnected and died again. The tpa/home/go-home tests never
+  ran. Lesson: make the test world safe first (peaceful + day).
+
+### Run 10 (safe world) — all v7 features proven
+- "Segs tp to me" -> "sent you a tpa request, type /tpaccept Segs" +
+  "Segs issued server command: /tpa OrewaSegs". (No accept came, but Segs
+  happened to spawn 1 block from the owner, so the 15s wait ended with
+  "im here" — the walk fallback was NOT exercised here.)
+- Auto-accept: a fake tpa request in chat -> "Segs issued server command:
+  /tpaccept OrewaSegs" + "accepted your tpa, coming to you" — but TWICE
+  (the request arrives via both 'chat' and 'messagestr'). Fixed with a
+  10s dedupe cooldown.
+- "Segs go to mine" -> "Segs issued server command: /home mine", 3s wait,
+  no teleport (no plugin) -> "couldnt teleport there, walking instead"
+  -> walked to the brain base -> "at mine". Fallback proven.
+- "Segs go home" -> "going to home" / "at home". The v7 go-home fix
+  works (v6 answered "i dont know where go home is").
+- /kill Segs -> death logged, ONE respawn packet sent ("respawning..."),
+  but Paper still kicked it 2s later ("Invalid move player packet").
+  The respawn packet (client_command actionId 0, verified correct in
+  the 26.3 protocol data) loses the race with movement packets already
+  in flight when the client learns of the death. Segs recovered via
+  auto-reconnect in 10s and answered "Segs stats" afterwards.
+
+### Run 11 — tpa fallback + dedupe proven, one real bug found
+- Owner teleported 60 blocks away first: "sent you a tpa request" ->
+  "you didnt accept, walking to you instead" -> Segs walked toward the
+  owner. Fallback proven. Auto-accept fired ONCE (dedupe works).
+- BUT: both 60-block walks failed partway and Segs LIED about it —
+  "made it" and "at home" after walks that never arrived. Root cause:
+  the pathfinder cannot plan into unloaded chunks (view distance 5),
+  so long walks fail — and callers announced arrival unconditionally.
+
+### Run 12 — staged walks + honest arrival (partial)
+- gotoPos now retries a failed direct walk in 16-block stages and
+  returns true/false; callers only announce arrival on true.
+- BUT the run exposed a concurrency bug: "go home" started while the
+  tpa walk was still running, its stopAllMovement cancelled the walk's
+  goal, both walks died with "The goal was changed before it could be
+  completed!". The honest-arrival part worked (no false "at home").
+
+### Run 13 — command queue + stop interrupt proven
+- handleTalk is now serialized (one command at a time, in order);
+  "Segs stop" bypasses the queue and cancels movement immediately via
+  a moveToken that in-progress walks check.
+- "Segs tp to me" walk, "Segs stop" 7s into it -> "got it, staying
+  here", walk cancelled, NO "im here". Stop interrupt proven.
+- BUT the following 29-block "go home" walk HUNG 134s with no error
+  and no arrival — the pathfinder can stall forever (water/wall).
+  The queued "Segs stats" never got answered.
+
+### Run 14 — goto timeout proven
+- Every goto attempt is now raced against a timeout (25s direct,
+  20s per stage); on timeout the goal is cancelled.
+- Same scenario as run 13: the stuck walk failed honestly in ~45s
+  ("goto timeout after 25000ms", "goto stage 1/1 failed: goto timeout
+  after 20000ms", "i cant reach there, too far or blocked") and the
+  queued "Segs stats" WAS answered. No hang, no lie.
+- "Stage 1/1" showed the stage goals used the bot's CURRENT y, so on
+  rising ground a waypoint could sit below the surface and be
+  unreachable by definition — fixed by using GoalXZ (x/z only) for
+  waypoints in run 15.
+
+### Run 15 — GoalXZ waypoints (same route, still not arriving)
+- Stop interrupt proven again ("ok, waiting here"). Go-home: direct
+  goto timed out (25s), stage 1/1 timed out (20s), honest "i cant
+  reach there", stats answered. GoalXZ exists and ran (no crash) — but
+  Segs still could not cover the last <=16 blocks of this wild
+  cross-country route in 45s. The bot is physically stuck on this
+  terrain (likely water/steep ground around spawn), not a planning bug.
+- No further runs: the failure is honest and bounded, and on the real
+  server Segs will mostly TELEPORT (/home, /tpa) between bases — that
+  is the point of v7. Walking is the fallback.
+
+### What is still NOT proven (v7)
+- The real youniga.deployd.sh server — Tash must test it. On youniga,
+  /tpa, /tpaccept, /sethome, /home, /delhome exist for real, so the
+  teleports that only "sent the command" here should actually move Segs.
+  If /home or /tpa behaves differently there (different message text
+  for a tpa request), tell Mu the exact message and the auto-accept
+  matcher will be adjusted.
+- Long wild cross-country walks (30-60 blocks through unloaded
+  forest/hills) may still fail honestly with "i cant reach there".
+  Short walks near base work (proven v5/v6 + run 10).
+- Death on Paper: Segs tries to respawn immediately but Paper usually
+  kicks it first ("Invalid move player packet"); it reconnects in 10s
+  and carries on. Same recovery as v6.
+- Enchanting, villager trading, horse/boat riding still out of scope.

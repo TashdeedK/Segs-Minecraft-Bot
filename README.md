@@ -1,10 +1,42 @@
-# Segs — Free Minecraft Bot — v6 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v7 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
 
-**v6 is v5 + a real learning system, a survival brain, and casual talk.**
+**v7 is v6 + real teleporting on your server, using its actual plugins.**
 Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+
+## Your server's plugins — what Segs uses (v7)
+
+From the `/plugins` list Tash sent (2026-11-07): AuthMe, CoreProtect,
+CreeperBlockProtection, HomePlugin, packetevents, SimpleGraves,
+SkinsRestorer, SmoothChat. **No LuckPerms ranks** — so Segs can only use
+PLAYER commands, never op commands (`/tp`, `/give`, `/gamemode` will not
+work and Segs never tries them). What it does use:
+- **AuthMe** — `/login` on join (already in v3+, proven on Paper).
+- **/tpa + /tpaccept** — real teleporting. `Segs tp to me` sends you a tpa
+  request; you type `/tpaccept Segs`. If you send `/tpa Segs` first, Segs
+  auto-accepts it. If nobody accepts within 15s, Segs walks to you instead.
+- **HomePlugin — /sethome, /home, /delhome (max 3 homes, overworld only)**.
+  `Segs sethome mine` saves a server home; `Segs go to mine` teleports with
+  `/home mine` first and walks if the teleport fails; `Segs list homes`
+  shows them; `Segs forget home mine` removes one. If it already has 3
+  homes and you ask for a 4th, it tells you which one to forget first.
+- CoreProtect / CreeperBlockProtection — the world is protected, good for it.
+- SimpleGraves — if Segs dies, its items go to a grave (it can be fetched).
+- SkinsRestorer / SmoothChat / packetevents — cosmetic / library, nothing
+  Segs needs to do.
+
+v7 also fixes a real bug found while wiring this up: `Segs go home` never
+reached the go-home code — the "go to" handler caught it first and answered
+"i dont know where go home is". It now goes home properly. Two more fixes
+from testing: long walks (60+ blocks) failed because the pathfinder cannot
+plan into unloaded chunks, so Segs now walks in 16-block stages and only
+says "im here" / "at home" when it actually arrived — before, it said so
+even after a failed walk. And when Segs dies it now tries to respawn
+immediately (vanilla respawn packet); note Paper still kicks it for the
+movement packets sent while dead, so on Paper it recovers by auto-reconnect
+in 10s — same as v6, just faster to notice.
 
 ## The learning system (logs/) — how Segs improves day by day
 

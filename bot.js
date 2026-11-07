@@ -217,7 +217,7 @@ function aliasItem (name) {
 // "Segs this is the smoker" / "Segs this is the furnace" — Segs stores the
 // block + position, then USES it on its own when it needs food or smelting.
 // Landmark types: farm (with a crop), chest, furnace, smoker, bed, table.
-let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {}, landmarks: {} }
+let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {}, landmarks: {}, serverHomes: [] }
 try {
   if (fs.existsSync('./brain.json')) brain = { ...brain, ...JSON.parse(fs.readFileSync('./brain.json', 'utf8')) }
 } catch (e) {}
@@ -230,6 +230,7 @@ if (!brain.macros) brain.macros = {}
 if (!brain.deaths) brain.deaths = []
 if (!brain.found) brain.found = {}
 if (!brain.landmarks) brain.landmarks = {}
+if (!brain.serverHomes) brain.serverHomes = []
 function saveBrain () { try { fs.writeFileSync('./brain.json', JSON.stringify(brain, null, 2)) } catch (e) {} }
 // Save the last ACTION task (not questions like "what time is it") so "do it again" works.
 // (Simulation run 2 found this bug: lastTask was only saved for unknown commands,
@@ -357,6 +358,20 @@ function createBot () {
     setTimeout(() => { loggedIn = true }, 2000)
   }
 
+  // v7: ONE command at a time. Chat messages used to each start their own
+  // handleTalk, so "go home" could start while the tpa walk was still
+  // running — its stopAllMovement cancelled the walk's goal and both walks
+  // died ("The goal was changed before it could be completed!", run 12).
+  // Everything now queues behind the running command, in order.
+  let talkQueue = Promise.resolve()
+  function queueTalk (username, msg, isWhisper) {
+    talkQueue = talkQueue.then(() => handleTalk(username, msg, isWhisper)).catch(e => { log('talk error: ' + e.message); logEvent('error', 'talk error: ' + e.message) })
+    return talkQueue
+  }
+  // moveToken: bumped every time movement is cancelled. A walk in progress
+  // checks it and aborts silently instead of retrying a walk the user stopped.
+  let moveToken = 0
+
   bot.on('chat', (username, message) => {
     if (!bot || username === BOT_NAME) return
     const msg = message.trim()
@@ -372,10 +387,21 @@ function createBot () {
       if (/please login|\/login|not logged in|login with/i.test(msg)) { tryLogin(); return }
     }
     if (/logged in successfully|welcome back|successfully logged/i.test(msg)) { loggedIn = true; return }
-    handleTalk(username, msg).catch(e => { log('talk error: ' + e.message); logEvent('error', 'talk error: ' + e.message) })
+    // v7: a /tpa request from the owner arrives as chat/system text — accept it
+    if (maybeAcceptTpa(msg)) return
+    // v7: "stop" must interrupt a running walk NOW, not wait behind it in
+    // the queue — cancel the movement immediately, then let the queued
+    // handler say "ok stopped" when its turn comes.
+    const stopReq = msg.toLowerCase().replace(/^segs\s+/, '')
+    if (/^(stop|stay|wait|wait here|stay here|chill|hold on)$/.test(stopReq) || stopReq === 'stop following' || stopReq === 'stop follow' || stopReq.includes('stop farm') || stopReq.includes('stop afk') || stopReq.includes('stop guard') || stopReq.includes('stop protecting')) {
+      stopAllMovement()
+    }
+    queueTalk(username, msg)
   })
 
   bot.on('messagestr', (message) => {
+    // v7: tpa requests often arrive as system chat, not player chat
+    if (maybeAcceptTpa(message)) return
     if (!loggedIn && config.autoLogin && config.authPassword && !config.authPassword.includes('PUT_')) {
       if (/please register|\/register/i.test(message)) tryRegister()
       else if (/please login|\/login/i.test(message)) tryLogin()
@@ -385,7 +411,7 @@ function createBot () {
 
   bot.on('whisper', (username, message) => {
     if (!bot || username === BOT_NAME) return
-    handleTalk(username, message.trim(), true).catch(() => {})
+    queueTalk(username, message.trim(), true)
   })
 
   bot.on('sleep', () => log('Segs is sleeping'))
@@ -393,6 +419,11 @@ function createBot () {
 
   // v5 LEARNING from playing: when it dies, remember where and warn next time.
   // This is coded memory, not AI training - it just does not forget what happened.
+  // v7: also RESPAWN immediately (client_command action 0 = the vanilla
+  // "Respawn" button). Without this, the dead bot keeps sending movement
+  // packets and Paper kicks it with "Invalid move player packet received",
+  // then it reconnects and dies again — proven in the v7 run 1 test, where
+  // zombies killed Segs 9 times in a row and it got kicked after every death.
   bot.on('death', () => {
     const pos = bot.entity ? [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)] : [0, 0, 0]
     brain.deaths.push({ what: 'died', pos, at: new Date().toISOString() })
@@ -401,6 +432,17 @@ function createBot () {
     bumpStat('deaths')
     logLearn('death', `died at ${pos.join(', ')}`)
     log('Segs died at ' + pos.join(', ') + ' - remembered, will be careful there')
+    // Respawn: send the vanilla respawn packet right away, then keep sending
+    // it every 500ms until alive again (max 5s). A single packet can lose
+    // the race with the movement packets Paper flags on a corpse ("Invalid
+    // move player packet received") — run 10 proved one shot is not enough.
+    try { bot.clearControlStates() } catch (e) {}
+    try { bot._client.write('client_command', { actionId: 0 }); log('respawning...') } catch (e) { log('respawn failed: ' + e.message) }
+    const respawnTimer = setInterval(() => {
+      if (!bot || bot.health > 0) { clearInterval(respawnTimer); return }
+      try { bot._client.write('client_command', { actionId: 0 }) } catch (e) {}
+    }, 500)
+    setTimeout(() => clearInterval(respawnTimer), 5000)
   })
 
   bot.on('entityHurt', (entity) => {
@@ -607,7 +649,7 @@ function createBot () {
 
     // help
     if (req.includes('help') || req.includes('what can you do')) {
-      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop')
+      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs sethome mine, segs go to mine, segs list homes, segs forget home mine, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop')
       return
     }
 
@@ -720,15 +762,30 @@ function createBot () {
       stopAllMovement(); say(pick(['ok stopped', 'got it, staying here', 'ok, waiting here'])); return
     }
 
-    // tp / come to me - bot cannot /tp unless it has op, so it walks/runs to you
+    // tp / come to me — v7: REAL teleport via /tpa (the server has a TPA
+    // plugin and no LP ranks, so /tpa is a player command Segs can use).
+    // Segs sends the request, the owner types /tpaccept Segs. If nobody
+    // accepts within 15s, Segs walks instead, like before.
     if (req.includes('tp to me') || req.includes('teleport to me') || req.includes('come to me') || req.includes('come here') || req === 'come' || req === 'tp' || req === 'teleport' || req.includes('come to') || req.includes('tp me')) {
       const player = bot.players[username]?.entity
       if (!player) { say('i cant see you right now'); return }
       brain.lastPos = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]; saveBrain()
       stopAllMovement()
-      say(pick(['on my way', 'coming to you', 'got it, coming']))
-      await gotoPos(player.position)
-      say(pick(['here', 'im here', 'made it']))
+      say('sent you a tpa request, type /tpaccept Segs')
+      serverCmd(`/tpa ${config.owner}`)
+      logEvent('tpa', 'sent /tpa to ' + config.owner)
+      const tpaToken = moveToken
+      await sleepMs(15000)
+      if (tpaToken !== moveToken) return // stopped while waiting, do not walk
+      const ownerNow = bot.players[username]?.entity
+      if (ownerNow && bot.entity.position.distanceTo(ownerNow.position) < 5) {
+        say(pick(['here', 'im here', 'made it'])); return
+      }
+      say('you didnt accept, walking to you instead')
+      logEvent('tpa', 'tpa not accepted in 15s, walking instead')
+      const playerAgain = bot.players[username]?.entity
+      if (!playerAgain) { say('i cant see you right now'); return }
+      if (await gotoPos(playerAgain.position)) say(pick(['here', 'im here', 'made it']))
       return
     }
 
@@ -740,24 +797,74 @@ function createBot () {
       return
     }
 
+    // ---- v7: SERVER HOMES (HomePlugin, overworld only, max 3 per player) ----
+    // "Segs sethome mine" sets a server home (instant teleport later).
+    // "Segs forget home mine" removes it. "Segs list homes" shows them.
+    // Server homes are for TELEPORTING; brain bases are for WALKING to a
+    // place Segs knows. "Segs go to mine" tries /home first, walks if it fails.
+    if (req.startsWith('sethome ') || req.includes('set home ')) {
+      const m = req.match(/sethome\s+(\S+)/) || req.match(/set home\s+(\S+)/)
+      const name = m && m[1]
+      if (!name) { say('sethome what? try: segs sethome mine'); return }
+      if (!brain.serverHomes.includes(name) && brain.serverHomes.length >= 3) {
+        say(`i already have 3 homes set: ${brain.serverHomes.join(', ')}. tell me which one to forget first: segs forget home <name>`)
+        return
+      }
+      serverCmd(`/sethome ${name}`)
+      if (!brain.serverHomes.includes(name)) { brain.serverHomes.push(name); saveBrain() }
+      logLearn('server-home', `set /sethome ${name}`)
+      say(`ok, set home ${name} on the server`); return
+    }
+    if (req.includes('forget home ')) {
+      const name = req.split('forget home ')[1].trim().split(/\s+/)[0]
+      if (!name) { say('forget which home?'); return }
+      serverCmd(`/delhome ${name}`)
+      brain.serverHomes = brain.serverHomes.filter(h => h !== name); saveBrain()
+      say(`ok, forgot home ${name}`); return
+    }
+    if (req.includes('list homes') || req.includes('my homes')) {
+      if (!brain.serverHomes.length) { say('i dont have any server homes set yet, try: segs sethome home'); return }
+      say(`my server homes: ${brain.serverHomes.join(', ')}`); return
+    }
+
     // go to a place - MUST come before "farm", or "go to the farm" starts
     // farming instead of just walking there (simulation run 3 bug).
     if (req.startsWith('go to') || req.startsWith('go to the') || req === 'go farm' || req === 'go home') {
       // named base? "go to mine", "go to farm base", "go to home"
-      const place = req.replace(/^go to (the )?/, '').replace(/ base$/, '').trim()
+      // (v7 fix: "go home" and "go farm" do not start with "go to", so the
+      // replace below left place as "go home" and the bot said "i dont know
+      // where go home is" instead of going home. Normalize them here.)
+      let place = req.replace(/^go to (the )?/, '').replace(/ base$/, '').trim()
+      if (req === 'go home') place = 'home'
+      if (req === 'go farm') place = 'farm'
+      // v7: if it is a server home, teleport with /home first (overworld only)
+      if (place && brain.serverHomes.includes(place)) {
+        stopAllMovement(); say(`going to ${place}`)
+        if (await tryServerHome(place)) { say(`at ${place}`); return }
+        say('couldnt teleport there, walking instead')
+        logEvent('home', `/home ${place} failed, walking instead`)
+      }
       if (place && brain.bases[place]) {
         stopAllMovement(); say(`going to ${place}`)
-        await gotoPos(new Vec3(brain.bases[place][0], brain.bases[place][1], brain.bases[place][2]))
-        say(`at ${place}`); return
+        if (await gotoPos(new Vec3(brain.bases[place][0], brain.bases[place][1], brain.bases[place][2]))) say(`at ${place}`)
+        return
+      }
+      // old single-home field (kept for backwards compat with older brain.json)
+      if (place === 'home' && brain.home) {
+        stopAllMovement(); say('going home')
+        if (await gotoPos(new Vec3(brain.home[0], brain.home[1], brain.home[2]))) say('home')
+        return
       }
       if (place === 'farm' && config.farmCenter) {
-        stopAllMovement(); await gotoPos(new Vec3(config.farmCenter[0], config.farmCenter[1], config.farmCenter[2])); say('at the farm'); return
+        stopAllMovement(); if (await gotoPos(new Vec3(config.farmCenter[0], config.farmCenter[1], config.farmCenter[2]))) say('at the farm')
+        return
       }
       const coordMatch = req.match(/(-?\d+)\s+(-?\d+)\s+(-?\d+)/)
       if (coordMatch) {
         const [x, y, z] = coordMatch.slice(1).map(Number)
         stopAllMovement(); say('on my way there')
-        await gotoPos(new Vec3(x, y, z)); say('here'); return
+        if (await gotoPos(new Vec3(x, y, z))) say('here')
+        return
       }
       if (place) { say(`i dont know where ${place} is, tell me: segs remember this is ${place}`); return }
       // "go to" with nothing after - fall through to other handlers
@@ -898,7 +1005,7 @@ function createBot () {
     if (req === 'go home' || req.includes('go home') || req.includes('take me home')) {
       const home = brain.bases.home || brain.home
       if (!home) { say('i dont know where home is yet, stand somewhere and say segs remember this is home'); return }
-      stopAllMovement(); say('going home'); await gotoPos(new Vec3(home[0], home[1], home[2])); say('home'); return
+      stopAllMovement(); say('going home'); if (await gotoPos(new Vec3(home[0], home[1], home[2]))) say('home'); return
     }
     if (req.includes('come back') || req === 'return' || req.includes('go back')) {
       // "come back to me" means come to the OWNER, not to the last place.
@@ -907,7 +1014,7 @@ function createBot () {
         const player = bot.players[username]?.entity
         if (!player) { say('i cant see you right now'); return }
         stopAllMovement(); say('coming back to you')
-        await gotoPos(player.position); say('here'); return
+        if (await gotoPos(player.position)) say('here'); return
       }
       const backTo = brain.lastPos || brain.bases.home || brain.home
       if (!backTo) { say('back where? i dont remember'); return }
@@ -1083,6 +1190,7 @@ function createBot () {
   }
 
   function stopAllMovement () {
+    moveToken++
     following = null
     stopFarming()
     stopAfk()
@@ -1090,9 +1198,110 @@ function createBot () {
     try { bot.pvp.stop() } catch (e) {}
   }
 
+  // ---- v7: SERVER COMMANDS (player commands only — no LP ranks on the server) ----
+  // youniga plugins: AuthMe, CoreProtect, CreeperBlockProtection, HomePlugin,
+  // packetevents, SimpleGraves, SkinsRestorer, SmoothChat. No LuckPerms, so
+  // Segs can only use PLAYER commands: /login, /tpa, /tpaccept, /sethome,
+  // /home, /delhome. It never tries /tp, /give or /gamemode (those need op).
+  // Every server command goes through here so it is logged in logs/.
+  function serverCmd (cmd) {
+    try { bot.chat(cmd); logEvent('server-cmd', cmd) } catch (e) { log('server cmd failed: ' + e.message) }
+  }
+  // Try a server /home teleport. Returns true if Segs actually moved
+  // (teleported). The server only has /home in the overworld and only 3
+  // homes per player, so anything can fail — the caller walks instead.
+  async function tryServerHome (name) {
+    const before = bot.entity.position.clone()
+    serverCmd(`/home ${name}`)
+    await sleepMs(3000)
+    const moved = bot.entity.position.distanceTo(before) > 2
+    if (moved) logEvent('home', `teleported to /home ${name}`)
+    return moved
+  }
+  // Auto-accept a /tpa request from the owner. The exact message depends on
+  // the server's TPA plugin, so match flexibly: it must mention teleport +
+  // accept + the owner's name. Only the owner, never anyone else.
+  // (v7 fix: the same request arrives via BOTH the 'chat' and 'messagestr'
+  // events, so without a cooldown Segs accepted twice and said so twice.)
+  let lastTpaAccept = 0
+  function maybeAcceptTpa (text) {
+    const lower = (text || '').toLowerCase()
+    if (!lower.includes('teleport')) return false
+    if (!lower.includes('tpaccept') && !lower.includes('accept')) return false
+    if (!lower.includes(OWNER)) return false
+    if (Date.now() - lastTpaAccept < 10000) return true // already accepted, swallow the duplicate
+    lastTpaAccept = Date.now()
+    serverCmd(`/tpaccept ${config.owner}`)
+    say('accepted your tpa, coming to you')
+    logEvent('tpa', 'auto-accepted /tpa from ' + config.owner)
+    return true
+  }
+
+  // A goto that gives up instead of hanging forever. The pathfinder can
+  // stall indefinitely (stuck in water, behind a wall, recalculating) —
+  // run 13 proved a 29-block walk can hang 134s with no error at all.
+  // Race each attempt against a timeout and cancel the goal on timeout,
+  // so a stuck walk fails honestly instead of blocking the whole queue.
+  async function gotoWithTimeout (goal, ms = 25000) {
+    let timer
+    try {
+      await Promise.race([
+        bot.pathfinder.goto(goal),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('goto timeout after ' + ms + 'ms')), ms) })
+      ])
+    } catch (e) {
+      try { bot.pathfinder.setGoal(null) } catch (_) {}
+      throw e
+    } finally { clearTimeout(timer) }
+  }
+
+  // Returns true if Segs got within 2 blocks of pos, false otherwise.
+  // Long walks fail when the goal sits in unloaded chunks (the pathfinder
+  // plans the whole route up front and view distance is only 5), so a
+  // failed direct walk is retried in 16-block stages toward the goal —
+  // chunks load as Segs moves. Callers MUST check the result: never
+  // announce arrival on false (run 11 proved both "made it" and "at home"
+  // were said after walks that never arrived).
   async function gotoPos (pos) {
-    try { await bot.pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, 1)) }
-    catch (e) { log('goto failed: ' + e.message); say('i cant reach there, too far or blocked') }
+    const tok = moveToken
+    const stopped = () => tok !== moveToken
+    try {
+      await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2))
+      return true
+    } catch (e) {
+      if (stopped()) return false // cancelled by a stop command, not a failure
+      log('goto failed, retrying in stages: ' + e.message)
+    }
+    const start = bot.entity.position.clone()
+    const stages = Math.max(1, Math.ceil(start.distanceTo(pos) / 16))
+    for (let i = 1; i <= stages; i++) {
+      if (stopped()) return false
+      const t = i / stages
+      const ix = start.x + (pos.x - start.x) * t
+      const iz = start.z + (pos.z - start.z) * t
+      try {
+        // GoalXZ, not GoalNear: a waypoint must not care about height.
+        // (Run 14: stages used the bot's CURRENT y, so on rising ground the
+        // waypoint sat 3+ blocks below the surface and could never be
+        // reached — the walk timed out even though the route was walkable.)
+        await gotoWithTimeout(new goals.GoalXZ(ix, iz), 20000)
+      } catch (e) {
+        if (stopped()) return false
+        log(`goto stage ${i}/${stages} failed: ` + e.message)
+        say('i cant reach there, too far or blocked')
+        return false
+      }
+    }
+    if (stopped()) return false
+    try {
+      await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2))
+      return true
+    } catch (e) {
+      if (stopped()) return false
+      log('goto final step failed: ' + e.message)
+      say('i cant reach there, too far or blocked')
+      return false
+    }
   }
   // same walk, but silent on failure (for farming: one unreachable crop
   // should not spam chat, the caller decides what to do)
