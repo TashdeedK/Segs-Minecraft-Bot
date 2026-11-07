@@ -378,6 +378,25 @@ function createBot () {
       movements.allowParkour = true
       movements.canDig = true
       movements.allow1by1towers = false
+      // v9.4: DOORS. The pathfinder's canOpenDoors defaults to false AND
+      // its openable set only contains fence gates, so with canDig=true
+      // the A* dug THROUGH doors instead of opening them — Tash watched
+      // Segs break a house door on youniga. Enable door opening, add
+      // every wooden door (not iron — those need redstone, not trapdoors)
+      // to the openable set, and NEVER break a door: doors go in
+      // blocksCantBreak, so even if opening fails Segs says "i cant
+      // reach there" instead of destroying Tash's house.
+      movements.canOpenDoors = true
+      try {
+        for (const name of Object.keys(mcData.blocksByName)) {
+          if (name.endsWith('_door') && !name.startsWith('iron') && !name.includes('trapdoor')) {
+            movements.openable.add(mcData.blocksByName[name].id)
+          }
+          if (name.endsWith('_door') || name.includes('trapdoor') || name.endsWith('_fence_gate')) {
+            movements.blocksCantBreak.add(mcData.blocksByName[name].id)
+          }
+        }
+      } catch (e) { log('doors: ' + e.message) }
       // v8: danger blocks. Lava + fire are already in the default
       // blocksToAvoid; add magma blocks (burn feet) and cactus (thorns).
       // Water stays allowed — Segs can swim, it just goes slower.
@@ -537,6 +556,14 @@ function createBot () {
     // it every 500ms until alive again (max 5s). A single packet can lose
     // the race with the movement packets Paper flags on a corpse ("Invalid
     // move player packet received") — run 10 proved one shot is not enough.
+    // v9.4: STOP EVERYTHING FIRST. The old code only cleared control
+    // states, but a pathfinder goal / flee loop / follow loop still
+    // moving sends position packets from the corpse, which is what
+    // Paper flags. stopAllMovement cancels the goal, the flee timer,
+    // following, farming, AFK and PvP — then the respawn packet goes
+    // out with nothing else moving. If Paper still kicks the corpse,
+    // the auto-reconnect in 10s is the fallback (unchanged).
+    try { stopAllMovement() } catch (e) {}
     try { bot.clearControlStates() } catch (e) {}
     try { bot._client.write('client_command', { actionId: 0 }); log('respawning...') } catch (e) { log('respawn failed: ' + e.message) }
     const respawnTimer = setInterval(() => {
@@ -2233,6 +2260,34 @@ function createBot () {
   // running while the mob is close. So the flee loop re-steers directly
   // away from the nearest hostile every 250ms (forward + sprint + jump)
   // and only stops when nothing hostile is within 12 blocks.
+  // v9.4: flee must not run off an edge. Check the ground ahead in a
+  // direction before running that way: 'safe' = solid block to stand on
+  // within 2 below, 'blocked' = a wall in the way, 'drop' = nothing to
+  // stand on (cliff, bridge edge, void). A drop means do NOT run that
+  // way — Tash watched Segs flee a phantom on a 1-wide bridge at Y200
+  // and fall off. If no direction is safe, Segs stands still: taking a
+  // hit beats a 200-block fall, and the loop re-checks every 250ms.
+  function groundAhead (dir, dist = 1.5) {
+    try {
+      const pos = bot.entity.position
+      const ahead = pos.clone().add(dir.clone().scale(dist))
+      const Vec3 = require('vec3').Vec3
+      const bx = Math.floor(ahead.x), by = Math.floor(pos.y), bz = Math.floor(ahead.z)
+      const foot = bot.blockAt(new Vec3(bx, by, bz))
+      const below1 = bot.blockAt(new Vec3(bx, by - 1, bz))
+      const below2 = bot.blockAt(new Vec3(bx, by - 2, bz))
+      const solid = b => b && b.boundingBox === 'block'
+      if (solid(foot)) return 'blocked'
+      if (solid(below1) || solid(below2)) return 'safe'
+      return 'drop'
+    } catch (e) { return 'safe' } // if unsure, do not block fleeing
+  }
+  function rotateDir (dir, deg) {
+    const Vec3 = require('vec3').Vec3
+    const rad = deg * Math.PI / 180
+    const cos = Math.cos(rad), sin = Math.sin(rad)
+    return new Vec3(dir.x * cos - dir.z * sin, 0, dir.x * sin + dir.z * cos)
+  }
   let fleeTimer = null
   let fleeLastPos = null, fleeLastMove = 0
   function stopFlee (why) {
@@ -2267,8 +2322,26 @@ function createBot () {
         if (!isFinite(away.x) || !isFinite(away.z) || away.distanceTo(new Vec3(0, 0, 0)) < 0.1) {
           away = new Vec3(-Math.sin(bot.entity.yaw), 0, -Math.cos(bot.entity.yaw))
         } else { away = away.normalize() }
-        const target = pos.clone().add(away.clone().scale(10))
+        let target = pos.clone().add(away.clone().scale(10))
         if (!isFinite(target.x) || !isFinite(target.z)) { logEvent('evade', `bad target: pos=${pos} away=${away} mobPos=${m.position} yaw=${bot.entity.yaw} mob=${m.name}@${m.position}`); stopFlee('bad target'); return }
+        // v9.4: EDGE CHECK. If the flee direction runs off a drop, try
+        // the other directions; if none is safe, stand still this tick.
+        if (groundAhead(away) === 'drop') {
+          let safeDir = null
+          for (const deg of [45, -45, 90, -90, 135, -135, 180]) {
+            const rot = rotateDir(away, deg)
+            if (groundAhead(rot) === 'safe') { safeDir = rot; break }
+          }
+          if (!safeDir) {
+            logEvent('evade', 'no safe flee direction (edge) — holding still')
+            bot.setControlState('forward', false)
+            bot.setControlState('sprint', false)
+            bot.setControlState('jump', false)
+            return
+          }
+          away = safeDir
+          target = pos.clone().add(safeDir.clone().scale(10))
+        }
         bot.lookAt(target)
         bot.setControlState('forward', true)
         bot.setControlState('sprint', true)
@@ -2456,6 +2529,59 @@ function createBot () {
   // chunks load as Segs moves. Callers MUST check the result: never
   // announce arrival on false (run 11 proved both "made it" and "at home"
   // were said after walks that never arrived).
+  // v9.4: DOOR ASSIST. The fork's A* cannot route through a 2-block door:
+  // getMoveForward only "opens" the feet-level block and always tries to
+  // break the head-level block, so a door is either broken (v9.3) or
+  // impassable (v9.4 first try). When a goto fails, look for a wooden door
+  // nearby, open it, and walk straight through it with direct movement
+  // (the open doorway IS walkable — the pathfinder just cannot plan it).
+  // Returns true if Segs got through a door.
+  async function tryDoorAssist (goalPos) {
+    try {
+      if (!bot || !bot.entity) return false
+      const Vec3 = require('vec3').Vec3
+      const door = bot.findBlock({
+        matching: b => b && b.name && b.name.endsWith('_door') && !b.name.startsWith('iron') && !b.name.includes('trapdoor'),
+        maxDistance: 4
+      })
+      if (!door) return false
+      const pos = bot.entity.position
+      const dp = new Vec3(door.position.x + 0.5, door.position.y, door.position.z + 0.5)
+      try {
+        const props = door.getProperties ? door.getProperties() : {}
+        if (props.open === false) {
+          await bot.activateBlock(door)
+          await sleepMs(400)
+        }
+      } catch (e) {}
+      // walk straight through: aim 2 blocks past the door, away from Segs.
+      // FIRST clear the pathfinder goal — while a GoalFollow is active the
+      // pathfinder owns the movement keys and overrides the direct
+      // forward/sprint states, so the walk-through goes nowhere (run 48:
+      // moved 0.0-0.2 blocks). The caller re-sets its goal afterwards.
+      try { bot.pathfinder.setGoal(null) } catch (e) {}
+      try { bot.clearControlStates() } catch (e) {}
+      const through = new Vec3(dp.x - pos.x, 0, dp.z - pos.z)
+      if (through.distanceTo(new Vec3(0, 0, 0)) < 0.1) return false
+      through.normalize()
+      const past = dp.clone().add(through.clone().scale(2))
+      const startPos = pos.clone()
+      bot.lookAt(new Vec3(past.x, pos.y + 1, past.z))
+      bot.setControlState('forward', true)
+      bot.setControlState('sprint', false)
+      const t0 = Date.now()
+      while (Date.now() - t0 < 3000) {
+        await sleepMs(200)
+        if (!bot || !bot.entity || bot.health <= 0) break
+        if (bot.entity.position.distanceTo(startPos) > 1.5) break
+        bot.lookAt(new Vec3(past.x, bot.entity.position.y + 1, past.z))
+      }
+      bot.setControlState('forward', false)
+      const moved = bot.entity ? bot.entity.position.distanceTo(startPos) : 0
+      logEvent('door', `door assist: moved ${moved.toFixed(1)} blocks through door at ${door.position}`)
+      return moved > 1.5
+    } catch (e) { return false }
+  }
   async function gotoPos (pos) {
     updateSprint() // sprint when fed, walk when hungry — before every walk
     const tok = moveToken
@@ -2467,6 +2593,13 @@ function createBot () {
     } catch (e) {
       log(`gotoPos FAIL: from ${from} to ${pos.x},${pos.y},${pos.z}: ${e.message} (still at ${bot.entity ? bot.entity.position : '?'})`)
       if (stopped()) return false // cancelled by a stop command, not a failure
+      // v9.4: maybe a door is in the way — push through it, then retry
+      if (await tryDoorAssist(pos)) {
+        try {
+          await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2))
+          return true
+        } catch (e2) { log('goto after door assist failed: ' + e2.message) }
+      }
       log('goto failed, retrying in stages: ' + e.message)
     }
     const start = bot.entity.position.clone()
@@ -2507,12 +2640,31 @@ function createBot () {
   }
 
   async function followLoop () {
+    let lastPos = null, lastMove = Date.now()
     while (following && bot && bot.entity) {
       const p = bot.players[following]
       if (!p || !p.entity) { await sleepMs(1000); continue }
       const dist = p.entity.position.distanceTo(bot.entity.position)
       if (dist > 3) {
         try { bot.pathfinder.setGoal(new goals.GoalFollow(p.entity, 2)) } catch (e) {}
+        // v9.4: stuck at a door? If Segs has not moved in 6s while
+        // following, try the door assist (open a nearby door and walk
+        // through it), then re-set the follow goal.
+        const nowPos = bot.entity.position
+        if (lastPos && nowPos.distanceTo(lastPos) < 0.5) {
+          if (Date.now() - lastMove > 6000) {
+            lastMove = Date.now()
+            if (await tryDoorAssist(p.entity.position)) {
+              try { bot.pathfinder.setGoal(new goals.GoalFollow(p.entity, 2)) } catch (e) {}
+            }
+          }
+        } else {
+          lastPos = nowPos.clone()
+          lastMove = Date.now()
+        }
+      } else {
+        lastPos = bot.entity.position.clone()
+        lastMove = Date.now()
       }
       await sleepMs(1000)
     }

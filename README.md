@@ -1,4 +1,4 @@
-# Segs — Free Minecraft Bot — v9.3 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v9.4 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
@@ -6,6 +6,44 @@ Talk to it like a person. No `!` needed.
 **v9 is v8 + smart sorting into a 16-column storage unit, a base map it
 remembers, paper auto-crafting, and sort jobs you can stop and resume.**
 Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+
+## What's new in v9.4
+
+Three real-server reports from Tash, all fixed (two proven, one honest limit):
+
+**Doors — Segs broke a house door instead of opening it.** The
+pathfinder's `canOpenDoors` defaults to false AND its openable set
+only holds fence gates, so with `canDig=true` the A* dug through
+doors. Worse, the fork's A* can never route through a 2-block door
+on its own: it only "opens" the feet-level block and always tries to
+break the head-level block. Fixed with a door assist: `canOpenDoors`
+is on, wooden doors are in the openable set, doors/fence gates are in
+`blocksCantBreak` (Segs never breaks one now), and when a goto or a
+follow gets stuck, Segs opens a nearby wooden door and the pathfinder
+walks through the open doorway. PROVEN in runs 48/48b: closed door —
+Segs opened it and walked out; already-open door — Segs walked
+straight through; the door stayed intact in both cases.
+
+**Death — "why does he die and reconnect, cant he just press respawn?"**
+Segs DOES press respawn: it sends the vanilla respawn packet the
+moment it dies, then every 500ms for 5s. But Paper still kicks the
+dead client with "Invalid move player packet received" — the fork's
+physics loop keeps sending position packets from the corpse, and no
+bot-level stop (pathfinder goal, flee, follow, farm, PvP — all
+cancelled first in v9.4) prevents that. The 10s auto-reconnect is the
+fallback and it works: Segs rejoins and walks back to recover its
+grave. Respawn-in-place on Paper is a fork/physics limit, not a bot
+setting — reported honestly, not promised.
+
+**Fleeing off a bridge — Segs fled a phantom on a 1-wide bridge at
+Y200 and fell off.** The flee loop steered straight away from the mob
+with direct forward/sprint movement and no ground check. Fixed: every
+flee tick now checks the ground 1.5 blocks ahead in the flee
+direction; a drop (cliff, bridge edge, void) is refused, the other
+directions are tried, and if none is safe Segs STANDS STILL — taking
+a hit beats a 200-block fall. PROVEN in run 50: Segs held still on
+the bridge ("no safe flee direction (edge) — holding still") and
+stayed at y=101 instead of falling.
 
 ## What's new in v9.3
 

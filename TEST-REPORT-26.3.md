@@ -825,6 +825,57 @@ What is still NOT proven: the /tpa accept itself on real youniga
 server has no TPA plugin, so only the sending side is proven here.
 Tash must confirm the accept works on youniga.
 
+### v9.4 — runs 48/48b (doors), 49 (death), 50 (bridge flee)
+
+Three real-server reports from Tash on youniga, all investigated in
+simulation on Paper 26.3.
+
+**Doors — run 48 (closed) and 48b (already open): PROVEN.** A house
+(oak planks, one oak door) was built on the flat platform. Segs
+inside, owner outside, "Segs follow me". Run 48 (door closed): the
+door assist opened it and Segs walked out to (-138, 71, 156); the
+door stayed oak_door, both halves. Run 48b (door already open —
+Tash's exact complaint): Segs walked straight through the open
+doorway to (-138, 71, 156); the door stayed intact. Two test-setup
+bugs were found and fixed along the way (not bot bugs): the first
+house was built floating 6 blocks above the terrain, and the first
+floor fill put planks at foot level (y=71) so the bot was blocked by
+its own floor — the house now has its floor at y=70, walls/door at
+y=71-72, roof at y=73. The fork's A* cannot route through a 2-block
+door by itself (getMoveForward only "opens" the feet block and always
+tries to break the head block), which is why the bot-level door
+assist exists; the assist's job is opening the door, and the
+pathfinder then walks through the open doorway.
+
+**Death — run 49: respawn packet does NOT prevent the Paper kick.**
+Segs followed the owner (walking), then /kill. Segs sent the respawn
+packet immediately ("respawning...") and stopAllMovement cancelled
+the goal/flee/follow/farm/PvP first — but Paper still kicked it 2s
+later ("Invalid move player packet received"). Segs reconnected in
+10s and recovered its grave ("i died at -132, 71, 158 — going back
+for my stuff"). Conclusion: the fork's physics loop sends position
+packets from the corpse no matter what the bot stops, so
+respawn-in-place on Paper is a fork limit, not a bot setting. The
+reconnect + grave recovery is the working fallback.
+
+**Bridge flee — run 50: PROVEN.** A 1-wide stone bridge at y=100
+(Segs' feet y=101). A NoAI zombie was summoned 1 block north of
+Segs, so "away from the mob" points south — straight off the bridge.
+Two test-setup bugs first: teleporting Segs to y=100 put it INSIDE
+the bridge stone (it was pushed off and fell), and /difficulty
+peaceful deletes summoned hostiles instantly, so the zombie never
+existed — the run uses y=101 and /difficulty normal. Result: Segs
+said "zombie nearby, moving away", the edge check fired ("no safe
+flee direction (edge) — holding still"), Segs moved west along the
+bridge to (-138.5, 101, 158.1) and stayed at y=101 — no fall, no
+death. The flee ended "clear, no hostile within 12".
+
+What is still NOT proven: respawn-in-place on real youniga (Paper
+kicks the corpse in simulation too — the reconnect is the proven
+path); a real door on Tash's actual house (the test house is a
+simulation replica); a real phantom flee (the test used a zombie —
+phantoms fly, but the edge check is direction-based, not mob-based).
+
 ### What is still NOT proven (v9)
 - The real youniga.deployd.sh server — Tash must test it (unchanged).
   In particular: real-server sorting (his room ↔ storage unit
