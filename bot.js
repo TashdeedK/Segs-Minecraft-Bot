@@ -1,6 +1,15 @@
-// Segs - free Mineflayer bot, v8 - bed spawn, permanent home, grave recovery,
-//   pickup + store items, enemy evade, hunger-dependent sprint, danger avoidance
-//   (v7: /tpa + /sethome /home, command queue, honest walks, goto timeout)
+// Segs - free Mineflayer bot, v9.2 - wall-safe column teaching
+//   (v9.1: bottom-first fill, owner-only commands, double-chest dedup;
+//    v9: 16-column sorting + base map + A-to-Z guide;
+//    v8: bed spawn, permanent home, grave recovery, pickup + store,
+//    enemy evade, hunger-dependent sprint, danger avoidance;
+//    v7: /tpa + /sethome /home, command queue, honest walks, goto timeout)
+//   v9.2 changes: scanColumnChests anchors on the nearest container
+//   (exact x,z footprint) so a continuous wall of columns no longer
+//   bleeds into its neighbours; re-teaching a column MERGES instead
+//   of overwriting; teaching a column already claimed by another
+//   category is refused. Tools stay bottom-first (v9.1) until Tash
+//   decides on best-at-top — that call is independent of this fix.
 // Node 22+ : npm install, then edit config.json, then node bot.js
 // Talk like this (only OrewaSegs can command it):
 //   "Segs tp to me" / "Segs come here" / "Segs follow me"
@@ -822,14 +831,53 @@ function createBot () {
           const chests = scanColumnChests(new Vec3(here[0], here[1], here[2]))
           if (!chests.length) { say('i cant see any chest or barrel in this column — stand right next to it and try again'); return }
           const chestPos = chests.map(p => [p.x, p.y, p.z])
+          // v9.2: re-teaching ADDS to what Segs knows instead of
+          // overwriting it (teaching per floor used to lose the other
+          // floors), and a column already claimed by another category
+          // is refused instead of silently stolen — in a continuous
+          // wall, standing at the wrong column must not re-label it.
           if (cat) {
-            brain.columns[cat] = { category: cat, name: cat + ' column', chests: chestPos, pos: here, taughtAt: Date.now() }
+            for (const [k, c] of Object.entries(brain.columns || {})) {
+              if (!c || !c.chests || c.category === cat) continue
+              if (c.chests.some(p => chestPos.some(q => sameChestInventory(p, q)))) {
+                say(`wait, those chests are already the ${c.category || 'blank'} column — stand at the ${cat} column and try again`); return
+              }
+            }
+            // a blank column taught earlier at this same spot becomes the named column
+            for (const [k, c] of Object.entries(brain.columns || {})) {
+              if (c && !c.category && c.chests && c.chests.some(p => chestPos.some(q => sameChestInventory(p, q)))) delete brain.columns[k]
+            }
+            const prev = (brain.columns[cat] && brain.columns[cat].chests) || []
+            const all = mergeChestLists([prev, chestPos])
+            const added = all.length - prev.length
+            brain.columns[cat] = { category: cat, name: cat + ' column', chests: all, pos: here, taughtAt: Date.now() }
             saveBrain()
-            logLearn('column', `${cat} column at ${here.join(', ')} (${chests.length} chests)`)
-            say(`ok, this is the ${cat} column — ${chests.length} chests, i will remember it`); return
+            logLearn('column', `${cat} column at ${here.join(', ')} (${all.length} chests, ${added} new)`)
+            say(prev.length ? `ok, this is the ${cat} column — ${all.length} chests now (${added} new), i will remember it` : `ok, this is the ${cat} column — ${all.length} chests, i will remember it`); return
           }
           // no type word: a blank column Segs can claim later for a
-          // category that has no column yet
+          // category that has no column yet. Re-teaching the same
+          // blank column (e.g. from another floor) merges into it.
+          // If these chests already belong to a named column, say so
+          // instead of making a second blank copy of them.
+          for (const c of Object.values(brain.columns || {})) {
+            if (c && c.category && c.chests && c.chests.some(p => chestPos.some(q => sameChestInventory(p, q)))) {
+              say(`those chests are already the ${c.category} column`); return
+            }
+          }
+          let blankKey = null
+          for (const [k, c] of Object.entries(brain.columns || {})) {
+            if (c && !c.category && c.chests && c.chests.some(p => chestPos.some(q => sameChestInventory(p, q)))) { blankKey = k; break }
+          }
+          if (blankKey) {
+            const prev = brain.columns[blankKey].chests || []
+            const all = mergeChestLists([prev, chestPos])
+            brain.columns[blankKey].chests = all
+            brain.columns[blankKey].taughtAt = Date.now()
+            saveBrain()
+            logLearn('column', `blank column at ${here.join(', ')} (${all.length} chests)`)
+            say(`ok, noted this column (${all.length} chests now) — i will use it for a category that has no column yet`); return
+          }
           brain.columns['blank-' + here.join(',')] = { category: null, name: 'blank column', chests: chestPos, pos: here, taughtAt: Date.now() }
           saveBrain()
           logLearn('column', `blank column at ${here.join(', ')} (${chests.length} chests)`)
@@ -1925,26 +1973,62 @@ function createBot () {
     if (/seed|sapling|mushroom|kelp|vine|cactus|chorus_plant|chorus_flower|azalea|spore_blossom|hanging_roots|glow_lichen|moss|fern|grass|tall_grass|dead_bush/.test(name)) return 'seeds'
     return 'misc'
   }
-  // Scan the chests/barrels of one column: everything within 2 blocks
-  // horizontally of the taught spot, from 2 below it to 10 above (a
-  // column is a vertical stack, up to 10 tall, with stairways).
+  // v9.2: Scan the chests/barrels of ONE column only. Tash's real
+  // storage unit is one continuous wall — columns sit side by side
+  // with no gap — so the old scan (everything within 2 blocks
+  // horizontally of where Segs stands) also recorded the columns
+  // next door, and ores could land in the wrong column. Now Segs
+  // anchors on the NEAREST container block to where he stands and
+  // reads that exact (x, z) footprint block by block, from 10 below
+  // to 10 above (a column is a vertical stack, up to 10 tall, with
+  // stairways). Reading block-by-block matters: the old findBlocks
+  // call capped at 40 containers, and a real wall has 160+ chests
+  // nearby, so the top levels never even reached the filter (run 46
+  // first try: only 6-7 of 10 recorded). A double chest is two
+  // adjacent blocks sharing one 54-slot inventory, so keeping one
+  // (x, z) per level still records it once — 10 double chests = 10,
+  // not 20.
   function scanColumnChests (pos) {
-    let found = []
-    try { found = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 12, count: 40 }) } catch (e) {}
-    const inCol = found.filter(p => Math.abs(p.x - pos.x) <= 2 && Math.abs(p.z - pos.z) <= 2 && p.y >= pos.y - 10 && p.y <= pos.y + 10)
-      .sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z) // bottom to top
-    // a double chest is two adjacent blocks sharing one 54-slot
-    // inventory — keep only the first half, or Segs opens the same
-    // inventory twice per level.
+    let anchor = null
+    try { anchor = bot.findBlock({ matching: b => isContainer(b), maxDistance: 8 }) } catch (e) {}
+    if (!anchor) return []
+    const ax = anchor.position.x
+    const az = anchor.position.z
+    const inCol = []
+    for (let y = pos.y - 10; y <= pos.y + 10; y++) {
+      let block = null
+      try { block = bot.blockAt(new Vec3(ax, y, az)) } catch (e) {}
+      if (block && isContainer(block)) inCol.push(new Vec3(ax, y, az))
+    }
+    return inCol.sort((a, b) => a.y - b.y) // bottom to top
+  }
+  // Two chest positions are the SAME inventory if they are the same
+  // block, or two halves of one double chest (same y, adjacent in x
+  // or z). Used when merging re-teaches and when checking whether a
+  // column is already claimed — teaching from the other half of a
+  // double chest must not double-count it or steal it for another
+  // category.
+  function sameChestInventory (a, b) {
+    const ax = a[0] !== undefined ? a[0] : a.x
+    const ay = a[1] !== undefined ? a[1] : a.y
+    const az = a[2] !== undefined ? a[2] : a.z
+    const bx = b[0] !== undefined ? b[0] : b.x
+    const by = b[1] !== undefined ? b[1] : b.y
+    const bz = b[2] !== undefined ? b[2] : b.z
+    if (ax === bx && ay === by && az === bz) return true
+    if (ay !== by) return false
+    return (Math.abs(ax - bx) === 1 && az === bz) || (Math.abs(az - bz) === 1 && ax === bx)
+  }
+  // Merge chest lists, dropping the second half of any double chest
+  // (keep the west/north half, like the v9.1 dedup). Input/output are
+  // [x, y, z] arrays, sorted bottom to top.
+  function mergeChestLists (lists) {
+    const merged = new Map()
+    for (const list of lists) for (const p of list) merged.set(p[0] + ',' + p[1] + ',' + p[2], p)
+    const all = [...merged.values()].sort((a, b) => a[1] - b[1] || a[0] - b[0] || a[2] - b[2])
     const kept = []
-    const seen = new Set()
-    for (const p of inCol) {
-      const key = p.x + ',' + p.y + ',' + p.z
-      if (seen.has(key)) continue
-      const west = (p.x - 1) + ',' + p.y + ',' + p.z
-      const north = p.x + ',' + p.y + ',' + (p.z - 1)
-      if (seen.has(west) || seen.has(north)) continue // second half of a double chest
-      seen.add(key)
+    for (const p of all) {
+      if (kept.some(q => q[1] === p[1] && ((q[0] === p[0] - 1 && q[2] === p[2]) || (q[2] === p[2] - 1 && q[0] === p[0])))) continue
       kept.push(p)
     }
     return kept

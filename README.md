@@ -1,4 +1,4 @@
-# Segs — Free Minecraft Bot — v9.1 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v9.2 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
@@ -6,6 +6,31 @@ Talk to it like a person. No `!` needed.
 **v9 is v8 + smart sorting into a 16-column storage unit, a base map it
 remembers, paper auto-crafting, and sort jobs you can stop and resume.**
 Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+
+## What's new in v9.2
+
+Your storage wall is one continuous wall with no gap between columns,
+and v9.1's teaching scan picked up the neighbours too. Fixed and
+simulation-proven (runs 46/46b, see TEST-REPORT-26.3.md):
+
+1. **Teaching is wall-safe now.** Segs anchors on the nearest chest and
+   reads only that column's exact footprint, block by block — so
+   teaching the ore column records exactly its 10 chests, not the tools
+   or foods columns next door. The old 40-chest scan cap is gone too
+   (it would have missed the top chests on your real 160-chest wall).
+2. **Re-teaching adds instead of overwriting.** Teach a column from the
+   ground floor, then again from a higher floor, and Segs keeps all 10
+   — it says "10 chests now (0 new)". Teaching from the other half of
+   a double chest does not double-count it either.
+3. **A mis-teach is refused.** If you stand at the ores column and say
+   "Segs this is the foods column", Segs says those chests are already
+   the ores column and changes nothing.
+
+**The hold-off is lifted: you can teach the columns now with v9.2.**
+Teach in this order: storage unit, your room, the 16 columns, trash
+chest, sugarcane chests, then trading hall and other places. Tools
+still fill bottom-first in v9.2 — the best-at-top call is separate and
+still yours to make.
 
 ## What's new in v9.1
 

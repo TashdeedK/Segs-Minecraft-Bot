@@ -819,3 +819,69 @@ Bugs found in v9.1 (all fixed in the shipped bot.js):
 - v9.1 changed tools to bottom-first like every other column. The
   "best tools at the top" tier-to-chest rule is dropped unless Tash
   says he wants it back — asked in the v9.1 delivery message.
+
+### v9.2 — runs 46 + 46b (wall-safe column teaching)
+
+Tash built the real storage unit as one continuous wall: 16 columns,
+10 double chests each, no gap between columns. v9.1's scan recorded
+every chest within 2 blocks sideways of where Segs stands, so teaching
+one column also picked up its neighbours. Three changes, all tested:
+
+1. scanColumnChests anchors on the NEAREST container block and reads
+   that exact (x, z) footprint block by block, y -10..+10. No neighbour
+   bleed, and no findBlocks count cap (see bug 1 below).
+2. Re-teaching a column MERGES instead of overwriting (per-floor
+   teaching used to lose the other floors). Double-chest halves are
+   deduped across teaches, so teaching from the other half of a
+   double chest does not double-count it.
+3. Teaching a column already claimed by another category is refused
+   in chat ("wait, those chests are already the ores column"), so a
+   mis-teach in a wall cannot silently re-label a column. Blank
+   columns merge the same way.
+
+Tools stay bottom-first (v9.1) in v9.2 — the best-at-top call is
+independent of this fix and still awaiting Tash's answer.
+
+Run 46 (first try) — FOUND A BUG, then fixed it:
+- Wall built as in Tash's photos: 3 contiguous 10-double-chest
+  columns, ores -146/-145, tools -144/-143, foods -142/-141, z=158,
+  y71-80. Teach ores from the east half: only "6 chests". Re-teach
+  from the west half: "7 chests now (1 new)". Tools and foods: 7 each.
+- Cause: findBlocks capped at 40 containers, and the wall (60 chests)
+  plus older test chests nearby meant the top levels never reached
+  the filter. The same cap would hit Tash's real wall (160 chests).
+  Fix: the scan now reads the anchored (x, z) block by block with
+  bot.blockAt — no cap, no neighbours.
+- The guard test and the sort already passed in this try: mis-teaching
+  the ores column as foods was refused, and 4 ore stacks (20 items)
+  landed in the ores column only.
+
+Run 46b (retest after the block-by-block fix) — PROVEN:
+- "Segs this is the ore column" -> "10 chests, i will remember it"
+- Re-teach from the other half -> "10 chests now (0 new)"
+- Tools -> 10 chests; foods -> 10 chests; "Segs list columns" ->
+  "ores (10 chests), tools (10 chests), foods (10 chests)"
+- Mis-teach refused again, columns unchanged.
+- "Segs move the ores to the ore column" -> "done sorting — moved
+  4 stacks (20 items), 0 failed". verify46: ores bottom chest =
+  iron_ingot x5, gold_ingot x3, raw_iron x4, coal x8; tools bottom
+  (empty); foods bottom (empty); room (empty). brain.json: ores 10
+  chests x=-146 y71..80, tools 10 x=-143 y71..80, foods 10 x=-141
+  y71..80 — each column exactly its own footprint.
+- One verify artifact, not a bot bug: the ores TOP chest (y=80) could
+  not be opened by the verify bot — it teleports 2 blocks south of
+  the wall and falls to the ground, 9 blocks below the chest. The
+  chest itself is proven by Segs' own scan (recorded in brain), and
+  the bottom-first deposit + all 20 items in the bottom chest prove
+  nothing went up there.
+- Test-world note: "Segs this is my room" reported 10 chests because
+  the leftover run-44 valuables column (-140,158) sits untaught next
+  to the room in the test world and is not in any column yet. On the
+  real server, teach all columns BEFORE teaching the room (as the
+  setup order already says) and this does not happen.
+
+What is still NOT proven (unchanged): the real youniga server — Tash
+must test v9.2 there (join first, teach a column or two, then a small
+one-category sort before the full "Segs sort my room"). The tools
+tier order (netherite > diamond > iron > gold > stone > wood) and the
+best-at-top vs bottom-first call are still awaiting his answer.
