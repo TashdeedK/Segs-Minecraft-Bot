@@ -796,6 +796,35 @@ Bugs found in v9.1 (all fixed in the shipped bot.js):
    chest (skips a block whose west or north neighbour at the same
    y is already kept).
 
+### v9.3 — run 47 (tp-to-me from far away)
+
+Tash's first real-server report on v9.2: Segs joined youniga fine,
+but "Segs tp to me" answered "i cant see you right now" and did
+nothing. Segs was far away from him. Root cause in the code: the
+"tp to me" handler checked bot.players[owner]?.entity BEFORE sending
+the /tpa — far away the server never sends the owner's entity, so
+Segs returned early and the /tpa was never sent. Fixed in v9.3: the
+/tpa is sent first with no visibility check; visibility only gates
+the walking fallback after the 15s wait. Teleport success is
+detected by Segs having moved >10 blocks or the owner being within
+5 blocks.
+
+Run 47 (owner teleported 1000+ blocks away, then "Segs tp to me"):
+PROVEN. Segs' first reply was "sent you a tpa request, type
+/tpaccept Segs" (NOT "i cant see you"), and the server log shows
+"Segs issued server command: /tpa OrewaSegs". After 15s with no
+accept (this test server has no TPA plugin, so no teleport can
+complete here) Segs fell back and said "i cant see you right now —
+type /tpaccept Segs next time, or come closer and try again". The
+"come back to me" and "look at me" handlers keep their visibility
+checks — those are walk/look actions, which genuinely need to see
+the player.
+
+What is still NOT proven: the /tpa accept itself on real youniga
+(Segs sending /tpa and Tash typing /tpaccept Segs) — the test
+server has no TPA plugin, so only the sending side is proven here.
+Tash must confirm the accept works on youniga.
+
 ### What is still NOT proven (v9)
 - The real youniga.deployd.sh server — Tash must test it (unchanged).
   In particular: real-server sorting (his room ↔ storage unit

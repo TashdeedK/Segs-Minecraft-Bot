@@ -1,4 +1,4 @@
-# Segs — Free Minecraft Bot — v9.2 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v9.3 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
@@ -6,6 +6,27 @@ Talk to it like a person. No `!` needed.
 **v9 is v8 + smart sorting into a 16-column storage unit, a base map it
 remembers, paper auto-crafting, and sort jobs you can stop and resume.**
 Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+
+## What's new in v9.3
+
+Tash tested v9.2 on the real youniga server: Segs joined fine, but
+"Segs tp to me" just answered "i cant see you right now" and did
+nothing — Segs was far away from him (at spawn, Tash at his base).
+
+That was a real bug in Segs, not Tash doing it wrong. The "tp to me"
+handler checked "can I see you" BEFORE sending the /tpa request. Far
+away, the server never sends Tash's player to Segs, so Segs said "i
+cant see you" and never sent the /tpa at all. A /tpa works over any
+distance — that is the whole point of it.
+
+Fixed: "Segs tp to me" now sends the /tpa FIRST, with no visibility
+check. Tash types /tpaccept Segs and Segs teleports to him. Only the
+walking fallback (after 15s with no accept) checks visibility — you
+cannot walk to someone you cannot see. Teleport success is detected
+by Segs having moved a long way, or the owner being within 5 blocks.
+If it still cannot see him after 15s, Segs now says plainly: "i cant
+see you right now — type /tpaccept Segs next time, or come closer and
+try again".
 
 ## What's new in v9.2
 

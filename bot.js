@@ -7,6 +7,8 @@
 //   v9.2 changes: scanColumnChests anchors on the nearest container
 //   (exact x,z footprint) so a continuous wall of columns no longer
 //   bleeds into its neighbours; re-teaching a column MERGES instead
+//   (v9.3: 'Segs tp to me' sends /tpa FIRST with no visibility check —
+//   the old check blocked the request entirely when Tash was far away.)
 //   of overwriting; teaching a column already claimed by another
 //   category is refused. Tools stay bottom-first (v9.1) until Tash
 //   decides on best-at-top — that call is independent of this fix.
@@ -994,25 +996,38 @@ function createBot () {
     // plugin and no LP ranks, so /tpa is a player command Segs can use).
     // Segs sends the request, the owner types /tpaccept Segs. If nobody
     // accepts within 15s, Segs walks instead, like before.
+    // v9.3: the /tpa is sent FIRST, with NO "can I see you" check — a
+    // /tpa works over any distance, that is the whole point of it. The
+    // old code checked visibility BEFORE sending the request, so when
+    // Tash was far away (Segs at spawn, Tash at his base) the server
+    // never sent Tash's entity to Segs, Segs said "i cant see you
+    // right now" and NEVER SENT THE /tpa AT ALL. That is the exact bug
+    // Tash hit on youniga 2026-11-07. The visibility check now only
+    // gates the WALKING fallback (you cannot walk to someone you
+    // cannot see). Teleport success is detected by Segs having moved
+    // a long way (the /tpa landed) or the owner being within 5 blocks.
     if (req.includes('tp to me') || req.includes('teleport to me') || req.includes('come to me') || req.includes('come here') || req === 'come' || req === 'tp' || req === 'teleport' || req.includes('come to') || req.includes('tp me')) {
-      const player = bot.players[username]?.entity
-      if (!player) { say('i cant see you right now'); return }
       brain.lastPos = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]; saveBrain()
       stopAllMovement()
+      const beforePos = bot.entity.position.clone()
       say('sent you a tpa request, type /tpaccept Segs')
       serverCmd(`/tpa ${config.owner}`)
       logEvent('tpa', 'sent /tpa to ' + config.owner)
       const tpaToken = moveToken
       await sleepMs(15000)
       if (tpaToken !== moveToken) return // stopped while waiting, do not walk
+      const moved = bot.entity.position.distanceTo(beforePos)
       const ownerNow = bot.players[username]?.entity
-      if (ownerNow && bot.entity.position.distanceTo(ownerNow.position) < 5) {
+      if (moved > 10 || (ownerNow && bot.entity.position.distanceTo(ownerNow.position) < 5)) {
         say(pick(['here', 'im here', 'made it'])); return
       }
+      // not accepted (or no TPA on this server) — walk only if Segs can
+      // actually see the owner. Far away the server never sends the
+      // owner's entity, so walking is impossible and Segs says so.
+      const playerAgain = bot.players[username]?.entity
+      if (!playerAgain) { say('i cant see you right now — type /tpaccept Segs next time, or come closer and try again'); return }
       say('you didnt accept, walking to you instead')
       logEvent('tpa', 'tpa not accepted in 15s, walking instead')
-      const playerAgain = bot.players[username]?.entity
-      if (!playerAgain) { say('i cant see you right now'); return }
       if (await gotoPos(playerAgain.position)) say(pick(['here', 'im here', 'made it']))
       return
     }
