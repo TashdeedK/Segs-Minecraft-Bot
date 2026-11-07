@@ -161,3 +161,167 @@ All runs: both bots joined as protocol 777, no kicks, no crashes.
 - Farming/crafting/guard were exercised on the vanilla test world only as
   far as the simulation above; the farm in the test world had no ripe wheat.
 - Enchanting, villager trading, horse/boat riding are not implemented (see README).
+
+## v6 appendix (2026-11-07) — logs, landmarks, survival, casual talk
+
+### CRITICAL FINDING: vanilla 26.3 drops bot commands, Paper 26.3 accepts them
+The v6 simulation was first run on the vanilla 26.3 server. Setup commands
+(/fill, /setblock) sent by the owner bot never reached the server — 0
+"issued server command" lines in the vanilla log, while plain chat worked.
+Isolated with 4 tests:
+- mineflayer bot.chat('/say viachat123') -> client wrote chat_command, server: nothing
+- direct client.write('chat_command', {command: 'say direct123'}) -> nothing
+- direct client.write('chat_command_signed', {...full signed fields...}) -> nothing
+- bot.chat('plainchat123') -> chat_message -> server: "[Not Secure] <OrewaSegs> plainchat123" (works)
+- enforces-secure-chat=false on vanilla: no change.
+- Same bot on **Paper 26.3 build 244** (port 25569): "OrewaSegs issued server
+  command: /say paper123" — commands WORK. And Segs itself:
+  "Segs issued server command: /login testonly" — **auto /login works on Paper**.
+Packet IDs/definitions are identical between 26.1 and 26.3 data
+(0x07 chat_command, 0x08 signed, 0x09 chat_message), and the fork's NMP
+chat.js is identical to npm NMP — so this is a vanilla-26.3 server behaviour
+(silently dropping unsigned chat_command), not a fork data bug.
+**Why this matters:** youniga.deployd.sh is a cracked server with a login
+plugin (AuthMe) — AuthMe runs on Paper/Spigot, not vanilla. Rin's bot works
+there, and Segs' /login now provably works on Paper 26.3. The v6 simulation
+below ran on Paper for this reason. The vanilla server is kept only for
+movement/join tests; command tests need Paper.
+
+### v6 run 1 (Paper) — teach the base + full survival flow, end to end
+Owner (op) built the base: /fill farmland + ripe potatoes, /setblock smoker,
+/setblock chest, /item replace block ... container.0 with coal 8. All executed.
+- "Segs this is the potato farm" / "this is the smoker" / "this is the food
+  chest" -> "i know: potato farm at -129, 71, 163 | smoker at -131, 70, 165 |
+  food chest at -132, 70, 165" — landmarks record the BLOCK's position, not
+  Segs' feet (that was the first-run bug: all three landmarks got Segs' own
+  position 731,65,448; fixed by finding the nearest matching block within 8).
+- "Segs get food" -> "i need food, going to get some" -> "going to the potato
+  farm to harvest" -> harvested 14 potatoes -> "got potato, cooking it now"
+  -> "no coal, checking the chest for coal" -> "found 8x coal in the chest"
+  -> "cooking potato in the smoker" -> "cooked, got baked_potato" -> "fed,
+  all good". Full flow, every step narrated in chat. stats.json after:
+  cropsFarmed 14, chestsChecked 1, smeltsDone 1, foodEaten 1, timesHungry 1.
+- Log files verified on disk: logs/2026-11-07.log, actions.jsonl,
+  chat.jsonl, learning.jsonl, stats.json — real entries (landmark learns,
+  farm harvests with positions, chest take, smelt start).
+- 2 minor bugs found and fixed: (1) farmOnce said "i need potato to replant"
+  right after harvesting a potato (drop had not landed in inventory yet) —
+  now waits 600ms and warns at most once per session; (2) "i cant reach
+  there, too far or blocked" spammed chat 5x for unreachable crop blocks —
+  farmOnce now skips them quietly (gotoPosQuiet, log only).
+
+### v6 run 2 (Paper) — casual talk + stats
+- "Segs how are you" -> "im good, hp 20/20 food 20/20, idle, waiting for you"
+- "Segs tell me a story" -> the Segs-walked-5-blocks story
+- "Segs are you AI" -> "im a bot, not AI. Tash coded me, i just do what im
+  told and remember stuff"
+- "Segs what should i do" -> "we could farm, mine, or build something, what
+  do you feel like"
+- "Segs farm potato" -> farming; "Segs stats" -> "my stats: 14 crops farmed,
+  0 items crafted, 0 blocks dug, 1 times fed, 1 chests checked, 1 smelts,
+  0 deaths, 1 times hungry" (stats persist across restarts).
+- Bug found: Paper broadcasts command feedback as chat ("Applied effect
+  Hunger to Segs]") and Segs answered it ("hmm, i didn't get that") because
+  it contains "Segs". Fixed: chat handler ignores command-feedback lines
+  (applied/gave/set/teleported/...) and lines ending in ']'.
+
+### v6 run 3 (Paper) — farm all + remember + fun talk
+- "Segs stop" -> "ok, waiting here"; "remember that the potato farm is at
+  the back of the house" -> saved; "Segs farm all" -> "farming everything
+  ripe around here" then wheat, carrot, potato in turn, "done farming
+  everything"; "Segs i love you" -> "i know, i try my best";
+  "Segs what do you remember" -> "facts: the potato farm is at the back of
+  the house".
+- Bug found: "i dont know that crop on this version" for beetroot — the crop
+  block is named 'beetroots' in minecraft-data, not 'beetroot' (verified:
+  blocksByName['beetroot'] false, ['beetroots'] true). Fixed in CROPS.
+  (Wheat/carrot/potato block names were already right.)
+- Watchdog note: the hunger effect in this run did not drop food below 12
+  before autoEat fed Segs from its inventory, so the 60s watchdog did not
+  fire — see run 4 for the dedicated watchdog test.
+
+### v6 run 4 (Paper) — beetroot fix + watchdog
+- Beetroot fix VERIFIED: "Segs farm beetroot" -> "ok, farming beetroot around
+  here" (no more "i dont know that crop"), cropsFarmed 14 -> 24.
+- Watchdog did NOT fire: /clear + hunger 120 level 3 while idle, but food
+  sat at exactly 12 at the 60s check (threshold was `food < 12`) and the
+  next check was after the bot's 160s timeout. Fixed: threshold `food < 14`
+  (matches autoEat's minHunger) and check every 30s instead of 60s.
+  See run 5 for the retest.
+
+### v6 run 5 (Paper) — watchdog retest
+- First attempt: NO "getting hungry" line, even with threshold 14 and 30s
+  checks. Root cause was the TEST server, not the bot: Paper was on
+  difficulty=peaceful, and on peaceful food never drains, so the hunger
+  effect could not drop food at all. The watchdog correctly did nothing.
+  Fixed the test: difficulty=normal, retest as run 5b.
+
+### v6 run 5b (Paper) — watchdog retest on normal difficulty
+- Still NO "getting hungry" line, even on normal difficulty with hunger 180
+  level 3 for 149s. The survival routine itself is proven (run 1), so the
+  problem is the watchdog's trigger, not the routine. Suspect: `bot.food`
+  not updating, or the interval not firing. Run 6b adds a temporary debug
+  line to the watchdog (logs food/health/job every 30s) to find out.
+- Harness bug found in run 6: the owner bot exits at a fixed 40s, so
+  scripted messages at 60s/110s were never sent. Fixed: owner now stays
+  until the last scripted message + 8s.
+
+### v6 run 6b (Paper) — watchdog debug
+- The watchdog IS firing every 30s, job is right ("idle, waiting for you"),
+  but **food=20 forever** — even with Hunger 180 level 3 on normal
+  difficulty for 90+ seconds. Cause: a fresh player joins with saturation
+  20, and exhaustion eats saturation first (20 saturation = 80 exhaustion);
+  180s of hunger level 3 is only ~72 exhaustion, so food never drops. The
+  watchdog was correct to do nothing; the test was wrong. (Also found a
+  second 45s global timeout in the owner harness that cut run 6 short —
+  fixed to follow the script length.)
+- Run 7 retests with hunger amplifier 255 for 20s: exhaustion ~25/sec,
+  saturation burns in ~3s, then food drops fast — the watchdog must fire.
+
+### v6 run 7 (Paper) — watchdog proof, hunger 255
+- Hunger 20s amplifier 255 applied (confirmed "Applied effect Hunger to
+  Segs"), Segs idle, ran 134s. STILL no watchdog, no death, no chat.
+  At amplifier 255 exhaustion should burn saturation in ~3s and food to 0
+  in seconds — so either the server is not draining food, or bot.food is
+  not updating client-side. Run 8 is the definitive probe: debug line back
+  (logs food + saturation + health every 30s) and "Segs status" at 30s/70s.
+
+### v6 run 8 (Paper) — definitive food probe
+- Status at 30s and 70s after hunger 255: "hp 20/20 food 20/20" both times.
+  Watchdog debug: food=20, **sat=0 then sat=1**, health=20. So saturation
+  was already ~0 (the saturation theory was wrong) and food STILL never
+  dropped. The Hunger effect was doing nothing to this player at all.
+  Root cause found: the Paper world was created when server.properties said
+  difficulty=peaceful, and world difficulty lives in level.dat — changing
+  server.properties afterward does NOT change the existing world. The world
+  was peaceful the whole time, so food never drains. Run 9 sets
+  /difficulty normal in-game first, then retests the watchdog.
+
+### v6 run 9 (Paper) — watchdog PROVEN, /difficulty normal in-game
+- After `/difficulty normal`, hunger 255 crashed food to 0 and the watchdog
+  fired ON ITS OWN at 10:02:07 (no command from the owner):
+  "im getting hungry, sorting food out myself" -> "i need food, going to
+  get some" -> "going to the potato farm to harvest" -> harvested 9
+  potatoes -> "got potato, cooking it now" -> "no coal, checking the chest
+  for coal" -> "checked the chest, no coal in there" (run 1 had taken the
+  only 8 coal) -> "no coal anywhere, i cant cook this" -> ate the raw
+  potato instead ("fed, all good"). food 0 -> 1, health 17 -> 14.
+  stats: cropsFarmed 33, timesHungry 2, foodEaten 2.
+- Death (not a bug): at 10:03:45 Segs was slain by a Zombie Villager at
+  (-132, 70, 164) by the chest — it was night on normal difficulty and Segs
+  was weak (food 1, hp 14). The death was logged and remembered:
+  "[learn] death: died at -132, 70, 164", brain.deaths has it. The
+  death-learning system works.
+- Watchdog final state: threshold food < 14, check every 30s, 5-min
+  cooldown, only when idle. The survival routine is proven both by command
+  (run 1) and on its own (run 9).
+
+### What is still NOT proven (v6)
+- The real youniga.deployd.sh server — Tash must test it on his PC/Mac.
+  But: Segs' /login provably works on Paper 26.3, and youniga is a
+  Paper-type server with AuthMe, so the login path is the same one tested.
+- Enchanting, villager trading, horse/boat riding still out of scope.
+- The watchdog's 5-minute cooldown means it will not re-fire within 5
+  minutes of the last time it spoke, even if food drops again — by design,
+  so it does not spam chat.
+

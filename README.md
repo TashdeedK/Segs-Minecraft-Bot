@@ -1,7 +1,66 @@
-# Segs — Free Minecraft Bot — v5 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v6 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
+
+**v6 is v5 + a real learning system, a survival brain, and casual talk.**
+Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+
+## The learning system (logs/) — how Segs improves day by day
+
+Everything Segs does is written to a `logs/` folder next to `bot.js`:
+- `logs/2026-11-07.log` — one human-readable line per event, per day
+- `logs/actions.jsonl` — one JSON object per action (time, action, result, position)
+- `logs/chat.jsonl` — every chat message it heard + every reply it sent
+- `logs/learning.jsonl` — every new thing it learned (landmark, fact, death, find)
+- `logs/stats.json` — running totals (crops farmed, items crafted, deaths, food eaten...)
+
+Logs are small on purpose (one line per event, 30-day rotation, 5MB cap per file)
+and never contain the password. `logs/` is gitignored.
+
+**To improve the bot day by day:** zip the `logs/` folder and upload it here.
+Mu reads the logs, finds what went wrong or what Segs keeps doing, and fixes the
+code. That is the whole learning loop — the bot logs, you upload, the code gets
+better. `Segs stats` shows the totals in chat any time.
+
+## Teach it your base (walkthrough)
+
+Call Segs to you, stand next to a thing, and tell it what it is:
+- `Segs this is the potato farm` / `Segs this is the wheat farm`
+- `Segs this is the food chest` / `Segs this is the coal chest`
+- `Segs this is the smoker` / `Segs this is the furnace`
+- `Segs what is here` — lists everything it knows nearby
+
+Landmarks are THINGS (farm/chest/furnace/smoker); bases are PLACES
+(`Segs remember this is home`, `Segs list bases`).
+
+## Survival — it takes care of itself, and says so in chat
+
+When Segs gets hungry it does not just stand there. It says what it is doing,
+then does it: `Segs get food` (or on its own, every 60s when idle and hungry):
+1. Eat food it already has.
+2. Else go to a potato farm it was shown, harvest ripe potatoes.
+3. Cook them in a smoker/furnace it was shown — if it has no coal, it checks
+   a chest it was shown for coal first.
+4. Eat, and say "fed, all good".
+5. If it cannot find food anywhere, it says so in chat and asks you.
+
+It also narrates everything it does in chat, so you always know what it is up to.
+
+## Casual talk
+
+`Segs how are you`, `Segs tell me a story`, `Segs sing a song`,
+`Segs are you AI` (honest answer: "im a bot, not AI"), `Segs i love you`,
+`Segs what should i do`, `Segs favourite food`, `Segs who is the best player`.
+If it does not understand a sentence, it guesses the meaning from the words
+and suggests the right command instead of just saying "didn't get that".
+
+## Crops — which can it farm?
+
+Wheat, carrot, potato, beetroot — all 4 replantable crops.
+`Segs farm potato` farms one kind, `Segs farm all` farms every ripe crop nearby.
+Pumpkins and melons grow on stems and are not replanted the same way, so they
+are not in the farm list (it can still dig them if you ask).
 
 **v5 is v4 + a smarter brain.** Same native 26.3 fork build (Misty4119 six-repo
 Mineflayer fork, protocol 777), plus:

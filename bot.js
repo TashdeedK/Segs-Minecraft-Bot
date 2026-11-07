@@ -84,8 +84,67 @@ let afkTimer = null
 let guardMode = false
 let stopping = false
 
+// ---- v6: LOG SYSTEM — how Segs "learns" day by day ----
+// Everything Segs does is written to a logs/ folder next to bot.js:
+//   logs/2026-11-07.log   - human-readable daily log (one line per event)
+//   logs/actions.jsonl    - one JSON object per action (time, action, result, position)
+//   logs/chat.jsonl       - every chat message it heard + every reply it sent
+//   logs/learning.jsonl   - every new thing it learned (base, fact, death, find)
+//   logs/stats.json       - running totals (tasks done, crops farmed, deaths, uptime)
+// Nothing in logs/ contains the password. logs/ is gitignored.
+// To improve the bot: zip the logs/ folder and upload it here — Mu reads the
+// logs, finds what went wrong or what Segs keeps doing, and fixes the code.
+// Storage is kept small on purpose: logs are one line per event (no spam),
+// daily files rotate, and anything older than 30 days is deleted on startup.
+const LOG_DIR = './logs'
+const LOG_KEEP_DAYS = 30
+const LOG_MAX_BYTES = 5 * 1024 * 1024 // 5MB per file, then it starts a fresh part
+try { fs.mkdirSync(LOG_DIR, { recursive: true }) } catch (e) {}
+function logDay () { return new Date().toISOString().slice(0, 10) }
+function logStamp () { return new Date().toISOString().slice(11, 19) }
+function appendLog (file, line) {
+  try {
+    const p = require('path').join(LOG_DIR, file)
+    if (fs.existsSync(p) && fs.statSync(p).size > LOG_MAX_BYTES) {
+      fs.renameSync(p, p + '.old')
+    }
+    fs.appendFileSync(p, line + '\n')
+  } catch (e) {}
+}
+function pruneLogs () {
+  try {
+    const cutoff = Date.now() - LOG_KEEP_DAYS * 24 * 3600 * 1000
+    for (const f of fs.readdirSync(LOG_DIR)) {
+      const p = require('path').join(LOG_DIR, f)
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p) } catch (e) {}
+    }
+  } catch (e) {}
+}
+pruneLogs()
+// stats: cumulative counters, saved so they survive restarts
+let stats = { started: new Date().toISOString(), tasksDone: 0, chatsAnswered: 0, cropsFarmed: 0, itemsCrafted: 0, blocksDug: 0, deaths: 0, foodEaten: 0, chestsChecked: 0, smeltsDone: 0, timesHungry: 0 }
+try { if (fs.existsSync(LOG_DIR + '/stats.json')) stats = { ...stats, ...JSON.parse(fs.readFileSync(LOG_DIR + '/stats.json', 'utf8')) } } catch (e) {}
+function saveStats () { try { fs.writeFileSync(LOG_DIR + '/stats.json', JSON.stringify(stats, null, 2)) } catch (e) {} }
+function bumpStat (key, n = 1) { stats[key] = (stats[key] || 0) + n; saveStats() }
+
 function log (msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`) }
-function say (msg) { try { bot.chat(msg) } catch (e) { log('chat failed: ' + e.message) } }
+// logEvent: the core of the learning system. Every important thing Segs does
+// goes to the daily log AND to actions.jsonl, so it can be reviewed later.
+function logEvent (type, msg, extra = {}) {
+  const entry = { time: new Date().toISOString(), type, msg, pos: bot?.entity ? [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)] : null, ...extra }
+  appendLog(`${logDay()}.log`, `[${logStamp()}] [${type}] ${msg}`)
+  appendLog('actions.jsonl', JSON.stringify(entry))
+  log(`[${type}] ${msg}`)
+}
+function logChat (who, msg, reply = null) {
+  appendLog('chat.jsonl', JSON.stringify({ time: new Date().toISOString(), who, msg, reply }))
+}
+function logLearn (what, detail) {
+  appendLog('learning.jsonl', JSON.stringify({ time: new Date().toISOString(), what, detail }))
+  logEvent('learn', `${what}: ${detail}`)
+}
+// say() talks in chat AND logs the reply, so the chat log shows both sides.
+function say (msg) { try { bot.chat(msg); logChat('Segs', msg) } catch (e) { log('chat failed: ' + e.message) } }
 function pick (arr) { return arr[Math.floor(Math.random() * arr.length)] }
 function isOwner (username) { return username && username.toLowerCase() === OWNER }
 function sleepMs (ms) { return new Promise(r => setTimeout(r, ms)) }
@@ -96,7 +155,7 @@ const CROPS = {
   carrot: { block: 'carrots', maxAge: 7, seed: 'carrot' },
   potatoes: { block: 'potatoes', maxAge: 7, seed: 'potato' },
   potato: { block: 'potatoes', maxAge: 7, seed: 'potato' },
-  beetroot: { block: 'beetroot', maxAge: 3, seed: 'beetroot_seeds' },
+  beetroot: { block: 'beetroots', maxAge: 3, seed: 'beetroot_seeds' },
 }
 
 // Item name helpers: "iron pickaxe" -> "iron_pickaxe", "a diamond sword" -> "diamond_sword"
@@ -153,7 +212,12 @@ function aliasItem (name) {
 // brain.macros = custom shortcuts the owner taught it ("learn daily means ...")
 // brain.deaths = where it died and what killed it (it learns to be careful there)
 // brain.found = where it found useful stuff (ores, farms, water)
-let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {} }
+// v6: brain.landmarks = things in the base Segs was shown, by type.
+// "Segs this is the potato farm" / "Segs this is the food chest" /
+// "Segs this is the smoker" / "Segs this is the furnace" — Segs stores the
+// block + position, then USES it on its own when it needs food or smelting.
+// Landmark types: farm (with a crop), chest, furnace, smoker, bed, table.
+let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {}, landmarks: {} }
 try {
   if (fs.existsSync('./brain.json')) brain = { ...brain, ...JSON.parse(fs.readFileSync('./brain.json', 'utf8')) }
 } catch (e) {}
@@ -165,6 +229,7 @@ if (!brain.facts) brain.facts = []
 if (!brain.macros) brain.macros = {}
 if (!brain.deaths) brain.deaths = []
 if (!brain.found) brain.found = {}
+if (!brain.landmarks) brain.landmarks = {}
 function saveBrain () { try { fs.writeFileSync('./brain.json', JSON.stringify(brain, null, 2)) } catch (e) {} }
 // Save the last ACTION task (not questions like "what time is it") so "do it again" works.
 // (Simulation run 2 found this bug: lastTask was only saved for unknown commands,
@@ -295,13 +360,19 @@ function createBot () {
   bot.on('chat', (username, message) => {
     if (!bot || username === BOT_NAME) return
     const msg = message.trim()
+    // v6 fix: Paper broadcasts command feedback as chat from the command
+    // sender, e.g. "Applied effect Hunger to Segs]". That is NOT the owner
+    // talking - ignore system/command-feedback lines or Segs answers them.
+    if (/^(applied|gave|set|teleported|enchanted|summoned|filled|changed|cleared|removed|killed|spawned|granted|revoked)\b/i.test(msg)) return
+    if (msg.endsWith(']') && !msg.toLowerCase().includes('segs ')) return
     log(`<${username}> ${msg}`)
+    logChat(username, msg)
     if (!loggedIn && config.autoLogin && config.authPassword && !config.authPassword.includes('PUT_')) {
       if (/please register|\/register|not registered/i.test(msg)) { tryRegister(); return }
       if (/please login|\/login|not logged in|login with/i.test(msg)) { tryLogin(); return }
     }
     if (/logged in successfully|welcome back|successfully logged/i.test(msg)) { loggedIn = true; return }
-    handleTalk(username, msg).catch(e => { log('talk error: ' + e.message) })
+    handleTalk(username, msg).catch(e => { log('talk error: ' + e.message); logEvent('error', 'talk error: ' + e.message) })
   })
 
   bot.on('messagestr', (message) => {
@@ -327,6 +398,8 @@ function createBot () {
     brain.deaths.push({ what: 'died', pos, at: new Date().toISOString() })
     if (brain.deaths.length > 10) brain.deaths = brain.deaths.slice(-10)
     saveBrain()
+    bumpStat('deaths')
+    logLearn('death', `died at ${pos.join(', ')}`)
     log('Segs died at ' + pos.join(', ') + ' - remembered, will be careful there')
   })
 
@@ -470,19 +543,61 @@ function createBot () {
       rememberTask(req)
     }
 
-    // greetings / small talk - anyone can say hi, commands are owner-only
+    // greetings / small talk - anyone can say hi, commands are owner-only.
+    // v6: much wider casual talk, all fixed replies (no AI). It understands
+    // the *meaning* by matching the words you use, not by thinking.
     if (/^(hi|hello|hey|yo|hii|hello there|good morning|good afternoon|good evening)$/.test(req)) {
-      say(pick(['yo', 'hey, whats up', 'yo, ready when you are'])); return
+      const t = bot.time?.timeOfDay ?? 6000
+      const greet = t > 13000 && t < 23000 ? 'good night, still up?' : t < 6000 ? 'good morning' : t < 12000 ? 'good morning' : 'hey'
+      say(pick(['yo', 'hey, whats up', 'yo, ready when you are', greet])); return
     }
-    if (/^(thanks|thank you|thx|nice|good bot|good job)$/.test(req)) {
-      say(pick(['np', 'anytime', 'you got it'])); return
+    if (/^(thanks|thank you|thx|nice|good bot|good job|well done)$/.test(req)) {
+      say(pick(['np', 'anytime', 'you got it', 'thats what im here for'])); return
     }
-    if (/^(bye|good night|goodbye|see you)$/.test(req) && !req.includes('sleep')) {
-      say(pick(['bye, see you', 'later'])); return
+    if (/^(bye|good night|goodbye|see you|see ya|gn)$/.test(req) && !req.includes('sleep')) {
+      say(pick(['bye, see you', 'later', 'good night, ill keep watch'])); return
     }
     if (req.includes('who are you') || req.includes('your name') || req === 'who r u') {
       say("i'm Segs, Tash made me"); return
     }
+    if (req.includes('how are you') || req === 'how r u' || req.includes('you ok') || req.includes('are you ok') || req.includes('you good')) {
+      say(`im good, hp ${Math.round(bot.health)}/20 food ${bot.food}/20, ${currentJob()}`); return
+    }
+    if (req.includes('whats up') || req === 'sup' || req === 'wassup' || req.includes('what are you up to')) {
+      say(pick(['nothing much, just ' + currentJob(), 'chilling here, what do you need', 'waiting for orders, boss'])); return
+    }
+    if (req.includes('i love you') || req.includes('you are the best') || req.includes('youre the best') || req.includes('best bot')) {
+      say(pick(['aww, i like you too', 'youre the best owner', 'i know, i try my best'])); return
+    }
+    if (req.includes('lol') || req.includes('haha') || req === 'funny' || req.includes('that was funny')) {
+      say(pick(['haha', 'lol, i know right', 'glad you liked it'])); return
+    }
+    if (req.includes('are you ai') || req.includes('are you a robot') || req.includes('are you real') || req.includes('are you human')) {
+      say('im a bot, not AI. Tash coded me, i just do what im told and remember stuff'); return
+    }
+    if (req.includes('tell me a story') || req.includes('story time')) {
+      say('ok, once there was a bot named Segs who walked 5 blocks and felt like a hero. the end'); return
+    }
+    if (req.includes('sing') || req.includes('sing a song')) {
+      say('la la la, im a little bot, farming wheat and dodging creepers, la la la'); return
+    }
+    if (req.includes('favourite food') || req.includes('favorite food')) { say('baked potato, obviously'); return }
+    if (req.includes('favourite mob') || req.includes('favorite mob')) { say('wolves, they are loyal like me'); return }
+    if (req.includes('favourite block') || req.includes('favorite block')) { say('diamond ore, shiny'); return }
+    if (req.includes('do you like me') || req.includes('do you like minecraft')) { say('yeah, minecraft is my whole life, and youre my favourite player'); return }
+    if (req.includes('what should i do') || req.includes('im bored')) {
+      const t = bot.time?.timeOfDay ?? 6000
+      const isNight = t > 13000 && t < 23000
+      say(isNight ? 'its night, we could sleep or fight mobs, your call' : bot.food < 10 ? 'im hungry, lets get food first' : 'we could farm, mine, or build something, what do you feel like')
+      return
+    }
+    if (req.includes('is it raining') || req.includes('is it snowing')) {
+      say(bot.isRaining ? 'yeah, its raining' : 'no, clear skies'); return
+    }
+    if (req.includes('what day is it') || req.includes('what day')) {
+      say(`day ${bot.time?.day ?? '?'}`); return
+    }
+    if (req.includes('who is the best player') || req.includes('best player')) { say('OrewaSegs, obviously'); return }
 
     // from here: orders. Owner only.
     if (!isOwner(username)) {
@@ -492,7 +607,7 @@ function createBot () {
 
     // help
     if (req.includes('help') || req.includes('what can you do')) {
-      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs remember this is home, segs go to mine, segs list bases, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop')
+      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop')
       return
     }
 
@@ -533,6 +648,64 @@ function createBot () {
       if (i >= 0) { brain.facts.splice(i, 1); saveBrain(); say('ok, forgot that') }
       else say('i dont remember that one')
       return
+    }
+
+    // ---- v6: TEACH ME YOUR BASE (walkthrough) ----
+    // Call Segs to you, stand next to a thing, and say what it is:
+    // "Segs this is the potato farm" / "Segs this is the food chest" /
+    // "Segs this is the smoker" / "Segs this is the furnace" /
+    // "Segs this is the wheat farm" / "Segs this is the coal chest".
+    // Segs stores it as a landmark and USES it on its own when it needs food.
+    // "Segs what is here" lists everything it knows nearby.
+    // "Segs this is the ..." is different from "remember this is home":
+    // landmarks are THINGS (farm/chest/furnace/smoker), bases are PLACES.
+    if (isOwner(username) && req.startsWith('this is the')) {
+      const name = req.replace(/^this is the\s*/, '').trim()
+      if (name) {
+        let type = 'place'
+        let crop = null
+        if (name.includes('farm')) { type = 'farm'; crop = ['potato', 'wheat', 'carrot', 'beetroot'].find(c => name.includes(c)) || 'wheat' }
+        else if (name.includes('chest')) type = 'chest'
+        else if (name.includes('smoker')) type = 'smoker'
+        else if (name.includes('furnace')) type = 'furnace'
+        else if (name.includes('bed')) type = 'bed'
+        else if (name.includes('table')) type = 'table'
+        // v6 fix (simulation run 1): record the position of the THING, not
+        // Segs' own feet. Stand next to the farm/chest/smoker and the nearest
+        // matching block is the landmark. Fall back to Segs' position if none
+        // is near (e.g. "this is the base" with no block to match).
+        let pos = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
+        const matchBlock = (b) => {
+          if (type === 'farm') return b.name === (crop === 'wheat' ? 'wheat' : crop === 'carrot' ? 'carrots' : crop === 'potato' ? 'potatoes' : 'beetroot')
+          if (type === 'chest') return b.name.includes('chest')
+          if (type === 'smoker') return b.name === 'smoker'
+          if (type === 'furnace') return b.name === 'furnace'
+          if (type === 'bed') return b.name.includes('bed')
+          if (type === 'table') return b.name === 'crafting_table'
+          return false
+        }
+        const near = type !== 'place' ? bot.findBlock({ matching: matchBlock, maxDistance: 8 }) : null
+        if (near) pos = [near.position.x, near.position.y, near.position.z]
+        brain.landmarks[name] = { name, type, crop, pos }
+        saveBrain()
+        logLearn('landmark', `${name} (${type}) at ${pos.join(', ')}`)
+        say(`ok, got it, this is the ${name}. i will remember it`); return
+      }
+    }
+    if (req.includes('what is here') || req.includes('show me around') || req.includes('what do you know here') || req.includes('list landmarks')) {
+      const marks = Object.values(brain.landmarks || {})
+      if (!marks.length) { say('i dont know this place yet, show me around: stand next to something and say segs this is the ...'); return }
+      say('i know: ' + marks.map(m => `${m.name} at ${m.pos.join(', ')}`).join(' | ')); return
+    }
+    // ---- v6: SURVIVAL commands ----
+    // "Segs get food" / "Segs survive" / "Segs im hungry" (owner says it for Segs)
+    // runs the full survival routine: eat what it has, else farm, cook, eat.
+    // It also runs ON ITS OWN when it gets hungry (watchdog, every 60s).
+    if (req.includes('get food') || req.includes('find food') || req === 'survive' || req.includes('take care of yourself') || req.includes('sort yourself out') || req.includes('you are hungry') || req.includes('youre hungry')) {
+      await survive(); return
+    }
+    if (req.includes('check the chest') || req.includes('look in the chest')) {
+      await checkChestFor(FOOD_ITEMS.concat(FUEL_ITEMS), 8); return
     }
 
     // sleep / wake - check first, before "stop" etc.
@@ -590,11 +763,21 @@ function createBot () {
       // "go to" with nothing after - fall through to other handlers
     }
 
-    // farm
+    // farm — wheat, carrot, potato, beetroot (all 4 replantable crops).
+    // "Segs farm potato" farms potatoes, "Segs farm all" farms every ripe
+    // crop nearby. Pumpkins/melons grow on stems and are not replanted the
+    // same way, so they are not in the farm list.
+    if (req.includes('farm all') || req.includes('harvest all') || req.includes('farm everything')) {
+      say('farming everything ripe around here')
+      logEvent('farm', 'farm all started')
+      for (const key of ['wheat', 'carrot', 'potato', 'beetroot']) { startFarming(key); await sleepMs(8000); stopFarming() }
+      say('done farming everything'); return
+    }
     if (req.includes('farm') || req.includes('harvest')) {
       const cropName = ['wheat', 'carrot', 'carrots', 'potato', 'potatoes', 'beetroot'].find(c => req.includes(c)) || 'wheat'
       const key = cropName === 'carrots' ? 'carrot' : cropName === 'potatoes' ? 'potato' : cropName
       if (!CROPS[key]) { say('farm what? wheat, carrot, potato, beetroot'); return }
+      logEvent('farm', `farm ${key} started`)
       startFarming(key)
       return
     }
@@ -658,6 +841,11 @@ function createBot () {
       }
     }
 
+    // v6: "Segs stats" — show what it has done (from logs/stats.json)
+    if (req === 'stats' || req.includes('show stats') || req.includes('your stats')) {
+      say(`my stats: ${stats.cropsFarmed} crops farmed, ${stats.itemsCrafted} items crafted, ${stats.blocksDug} blocks dug, ${stats.foodEaten} times fed, ${stats.chestsChecked} chests checked, ${stats.smeltsDone} smelts, ${stats.deaths} deaths, ${stats.timesHungry} times hungry`)
+      return
+    }
     // status
     if (req.includes('status') || req.includes('how are you') || req.includes('what are you doing') || req.includes('where are you')) {
       const inv = bot.inventory.items().slice(0, 5).map(i => `${i.name} x${i.count}`).join(', ') || 'empty'
@@ -849,6 +1037,26 @@ function createBot () {
     // remember this task for "do it again"
     brain.lastTask = req; saveBrain()
 
+    // v6: keyword fallback — if it does not understand the exact sentence,
+    // it guesses the meaning from the words and suggests the right command,
+    // instead of just saying "didn't get that". Still fixed rules, no AI.
+    {
+      const hints = [
+        [/food|hungry|eat|starving/, 'do you want me to get food? try: segs get food'],
+        [/farm|harvest|crop|potato|wheat|carrot|beetroot/, 'want me to farm? try: segs farm potato'],
+        [/sleep|bed|tired/, 'want me to sleep? try: segs sleep'],
+        [/come|here|tp|teleport/, 'want me to come to you? try: segs tp to me'],
+        [/follow/, 'want me to follow you? try: segs follow me'],
+        [/fight|attack|kill|zombie|skeleton|creeper|mob/, 'want me to fight? try: segs guard me'],
+        [/craft|make|build/, 'want me to craft something? try: segs craft iron pickaxe'],
+        [/chest|coal|smoker|furnace|cook|smelt/, 'want me to cook or check a chest? try: segs get food'],
+        [/home|base/, 'want to go home? try: segs go home, or segs list bases'],
+        [/dance|jump|fun|play/, 'want me to have fun? try: segs dance'],
+      ]
+      const hint = hints.find(([re]) => re.test(req))
+      if (hint) { say(`hmm, i didnt quite get that. ${hint[1]}`); return }
+    }
+
     say("hmm, i didn't get that. try: segs help")
   }
 
@@ -886,6 +1094,11 @@ function createBot () {
     try { await bot.pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, 1)) }
     catch (e) { log('goto failed: ' + e.message); say('i cant reach there, too far or blocked') }
   }
+  // same walk, but silent on failure (for farming: one unreachable crop
+  // should not spam chat, the caller decides what to do)
+  async function gotoPosQuiet (pos) {
+    await bot.pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, 1))
+  }
 
   async function followLoop () {
     while (following && bot && bot.entity) {
@@ -899,9 +1112,11 @@ function createBot () {
     }
   }
 
+  let replantWarned = false
   function startFarming (cropName) {
     if (farming) stopFarming()
     farming = true
+    replantWarned = false
     const center = config.farmCenter
       ? new Vec3(config.farmCenter[0], config.farmCenter[1], config.farmCenter[2])
       : bot.entity.position.clone()
@@ -930,16 +1145,25 @@ function createBot () {
       const block = bot.blockAt(pos)
       if (!block) continue
       try {
-        await gotoPos(pos)
+        // walk to the crop; if one block is unreachable, skip it quietly
+        // (simulation: 5 chat-spam "cant reach there" lines for blocks the
+        // bot had already harvested or could not stand next to)
+        try { await gotoPosQuiet(pos) } catch (e) { log('farm skip unreachable ' + pos); continue }
         await bot.dig(block)
+        bumpStat('cropsFarmed')
+        logEvent('farm', `harvested 1x ${cropName} at ${pos.x}, ${pos.y}, ${pos.z}`)
+        // wait a moment for the drop to land in the inventory before
+        // checking for seed to replant (simulation: it said "i need potato
+        // to replant" right after harvesting a potato)
+        await sleepMs(600)
         const seed = bot.inventory.items().find(i => i.name === crop.seed)
         if (seed) {
           await bot.equip(seed, 'hand')
           const soil = bot.blockAt(pos.offset(0, -1, 0))
           if (soil && soil.name === 'farmland') await bot.placeBlock(soil, new Vec3(0, 1, 0))
-        } else {
+        } else if (!replantWarned) {
+          replantWarned = true
           say(`i need ${crop.seed} to replant ${cropName}`)
-          await sleepMs(1000)
         }
       } catch (e) { log('harvest one failed: ' + e.message) }
     }
@@ -999,6 +1223,154 @@ function createBot () {
     } catch (e) { log('fetch failed: ' + e.message); say(`couldnt get ${itemName}, maybe too far or i need a better tool`) }
   }
 
+  // ---- v6: SURVIVAL — the bot takes care of itself, and narrates every step ----
+  // The whole point: when Segs is hungry it does not just stand there.
+  // It SAYS what it is doing in chat, then does it: check inventory -> eat,
+  // else go to a farm it was shown -> harvest -> cook in a smoker/furnace
+  // it was shown (checking a chest for coal first if it has none) -> eat.
+  // Teach it your base with: "Segs this is the potato farm", "Segs this is
+  // the food chest", "Segs this is the smoker", "Segs this is the furnace".
+  const FOOD_ITEMS = ['baked_potato', 'cooked_beef', 'cooked_porkchop', 'cooked_chicken', 'cooked_mutton', 'cooked_rabbit', 'bread', 'apple', 'carrot', 'potato', 'cooked_cod', 'cooked_salmon', 'cookie', 'melon_slice', 'pumpkin_pie', 'mushroom_stew', 'beetroot_soup']
+  const COOKABLE = { potato: 'baked_potato', raw_beef: 'cooked_beef', raw_porkchop: 'cooked_porkchop', raw_chicken: 'cooked_chicken', raw_mutton: 'cooked_mutton', raw_rabbit: 'cooked_rabbit', raw_cod: 'cooked_cod', raw_salmon: 'cooked_salmon', kelp: 'dried_kelp' }
+  const FUEL_ITEMS = ['coal', 'charcoal', 'oak_log', 'oak_planks', 'coal_block']
+  function hasFood () { return bot.inventory.items().find(i => FOOD_ITEMS.includes(i.name)) }
+  function hasRawFood () { return bot.inventory.items().find(i => COOKABLE[i.name]) }
+  // Open the nearest chest (or a chest landmark) and take what we need.
+  async function checkChestFor (wantedNames, takeCount = 8) {
+    let chestBlock = null
+    const chestMark = Object.values(brain.landmarks || {}).find(l => l.type === 'chest')
+    if (chestMark) chestBlock = bot.blockAt(new Vec3(chestMark.pos[0], chestMark.pos[1], chestMark.pos[2]))
+    if (!chestBlock || !chestBlock.name.includes('chest')) {
+      chestBlock = bot.findBlock({ matching: b => b.name.includes('chest'), maxDistance: 8 })
+    }
+    if (!chestBlock) { say('i cant see a chest near me'); return null }
+    try {
+      await gotoPos(chestBlock.position)
+      const chest = await bot.openChest(chestBlock)
+      const items = chest.containerItems()
+      const found = items.find(i => i && wantedNames.includes(i.name))
+      if (!found) { say(`checked the chest, no ${wantedNames[0]} in there`); chest.close(); return null }
+      const take = Math.min(takeCount, found.count)
+      await chest.withdraw(found.type, found.metadata, take)
+      chest.close()
+      bumpStat('chestsChecked')
+      logEvent('chest', `took ${take}x ${found.name} from chest at ${chestBlock.position}`)
+      say(`found ${take}x ${found.name} in the chest`)
+      return found.name
+    } catch (e) { log('chest check failed: ' + e.message); say('couldnt open that chest'); return null }
+  }
+  // Cook raw food in a smoker (fast, for food) or furnace. Checks for fuel first.
+  async function cookFood (rawName, count = 4) {
+    const cookedName = COOKABLE[rawName]
+    if (!cookedName) { say(`${rawName} cant be cooked`); return false }
+    let cooker = null
+    const smokerMark = Object.values(brain.landmarks || {}).find(l => l.type === 'smoker')
+    const furnaceMark = Object.values(brain.landmarks || {}).find(l => l.type === 'furnace')
+    for (const mark of [smokerMark, furnaceMark]) {
+      if (mark) { const b = bot.blockAt(new Vec3(mark.pos[0], mark.pos[1], mark.pos[2])); if (b && (b.name === 'smoker' || b.name === 'furnace')) { cooker = b; break } }
+    }
+    if (!cooker) cooker = bot.findBlock({ matching: b => b.name === 'smoker' || b.name === 'furnace', maxDistance: 8 })
+    if (!cooker) { say('i need a smoker or furnace nearby to cook this'); return false }
+    let fuel = bot.inventory.items().find(i => FUEL_ITEMS.includes(i.name))
+    if (!fuel) {
+      say('no coal, checking the chest for coal')
+      logEvent('survive', 'no fuel in inventory, checking chest for coal')
+      const got = await checkChestFor(FUEL_ITEMS)
+      if (!got) { say('no coal anywhere, i cant cook this'); return false }
+      fuel = bot.inventory.items().find(i => FUEL_ITEMS.includes(i.name))
+    }
+    try {
+      await gotoPos(cooker.position)
+      // openFurnace works for furnace, smoker AND blast furnace (same window type)
+      const win = await bot.openFurnace(cooker)
+      const mcData = mcDataFor(bot.version)
+      const raw = mcData.itemsByName[rawName]
+      const have = bot.inventory.items().find(i => i.type === raw.id)
+      if (!have) { say(`i dont have any ${rawName} to cook`); win.close(); return false }
+      say(`cooking ${rawName} in the ${cooker.name}`)
+      await win.putInput(have.type, null, Math.min(count, have.count))
+      await win.putFuel(fuel.type, null, 1)
+      logEvent('smelt', `cooking ${Math.min(count, have.count)}x ${rawName} in ${cooker.name}`)
+      // wait for it to cook (smoker ~5s each, furnace ~10s), then take it
+      await sleepMs(12000)
+      try { await win.takeOutput() } catch (e) {}
+      win.close()
+      bumpStat('smeltsDone')
+      say(`cooked, got ${cookedName}`)
+      return true
+    } catch (e) { log('cook failed: ' + e.message); say('couldnt cook that'); return false }
+  }
+  // The full survival routine. Run by "Segs get food" / "Segs survive",
+  // and on its own when the hunger watchdog fires.
+  let surviving = false
+  async function survive () {
+    if (surviving) { say('already sorting food out, give me a sec'); return }
+    surviving = true
+    bumpStat('timesHungry')
+    try {
+      logEvent('survive', `survival routine started, food ${bot.food}/20 health ${Math.round(bot.health)}/20`)
+      // 1. already have food? just eat.
+      const food = hasFood()
+      if (food) {
+        say(`i have ${food.name}, eating now`)
+        try { await bot.autoEat?.eat() } catch (e) {}
+        bumpStat('foodEaten')
+        say('fed, all good')
+        return
+      }
+      say('i need food, going to get some')
+      // 2. raw food in inventory? cook it.
+      const raw = hasRawFood()
+      if (raw) {
+        say(`i have raw ${raw.name}, cooking it`)
+        if (await cookFood(raw.name, 4)) { try { await bot.autoEat?.eat() } catch (e) {}; bumpStat('foodEaten'); say('fed, all good') }
+        return
+      }
+      // 3. go to a farm we were shown (potato first, then any farm landmark)
+      const farmMark = Object.values(brain.landmarks || {}).find(l => l.type === 'farm' && l.crop === 'potato')
+        || Object.values(brain.landmarks || {}).find(l => l.type === 'farm')
+      if (farmMark) {
+        say(`going to the ${farmMark.crop || ''} farm to harvest`)
+        logEvent('survive', `going to ${farmMark.name} farm at ${farmMark.pos}`)
+        await gotoPos(new Vec3(farmMark.pos[0], farmMark.pos[1], farmMark.pos[2]))
+        startFarming(farmMark.crop || 'potato')
+        await sleepMs(12000)
+        stopFarming()
+        const got = bot.inventory.items().find(i => i.name === 'potato' || i.name === 'carrot' || i.name === 'wheat' || i.name === 'beetroot')
+        if (got) {
+          say(`got ${got.name}, cooking it now`)
+          if (got.name === 'potato' && await cookFood('potato', 4)) { try { await bot.autoEat?.eat() } catch (e) {}; bumpStat('foodEaten'); say('fed, all good'); return }
+          if (FOOD_ITEMS.includes(got.name)) { try { await bot.autoEat?.eat() } catch (e) {}; bumpStat('foodEaten'); say('fed, all good'); return }
+        }
+        say('the farm had nothing ripe to eat')
+      }
+      // 4. check a chest for food
+      say('checking the chest for food')
+      const fromChest = await checkChestFor(FOOD_ITEMS)
+      if (fromChest) { try { await bot.autoEat?.eat() } catch (e) {}; bumpStat('foodEaten'); say('fed, all good'); return }
+      // 5. nothing worked - ask the owner, out loud, like a player would
+      say('i need food and i cant find any, can you give me some or show me the farm')
+      logEvent('survive', 'survival routine ended: no food found, asked owner')
+    } finally { surviving = false }
+  }
+  // Hunger watchdog: every 30s, if Segs is idle and getting hungry, it sorts
+  // itself out. It says so in chat first, and it will not spam (5 min
+  // cooldown). Threshold 14 matches autoEat's minHunger: autoEat eats what
+  // Segs has; if it has nothing, food keeps falling and this takes over.
+  // (Simulation run 4: threshold was <12 with a 60s check — food sat at
+  // exactly 12 at the check and the watchdog never fired. 30s + <14 fixes it.)
+  let lastHungrySay = 0
+  setInterval(() => {
+    try {
+      if (!bot || !bot.entity || bot.health <= 0) return
+      if (bot.food < 14 && currentJob() === 'idle, waiting for you' && Date.now() - lastHungrySay > 5 * 60 * 1000) {
+        lastHungrySay = Date.now()
+        say('im getting hungry, sorting food out myself')
+        survive().catch(e => log('survive watchdog: ' + e.message))
+      }
+    } catch (e) {}
+  }, 30000)
+
   // ---- v5: dig / mine / chop / place / fish / smelt ----
   async function digBlock (itemName, count) {
     const mcData = mcDataFor(bot.version)
@@ -1025,6 +1397,7 @@ function createBot () {
       } catch (e) { log('dig failed: ' + e.message); break }
     }
     say(dug > 0 ? `dug ${dug}x ${itemName}` : `couldnt dig ${itemName}, maybe i need a better tool`)
+    if (dug > 0) { bumpStat('blocksDug', dug); logEvent('dig', `dug ${dug}x ${itemName}`) }
   }
   async function placeBlock (itemName, count) {
     const mcData = mcDataFor(bot.version)
@@ -1111,6 +1484,8 @@ function createBot () {
           if (!table) { say(`i can make ${itemName}, but i need a crafting table nearby`); return }
         }
         await bot.craft(recipe, craftsNeeded, table)
+        bumpStat('itemsCrafted', count)
+        logEvent('craft', `crafted ${count}x ${itemName}`)
         say(pick([`done, crafted ${count}x ${itemName}`, `here you go, ${count}x ${itemName} ready`]))
         return
       } catch (e) {

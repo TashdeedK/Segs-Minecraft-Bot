@@ -6,3 +6,4 @@ package-lock.json
 segs-26.3/
 vanilla-server/
 *.log
+logs/
