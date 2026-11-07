@@ -113,18 +113,69 @@ function parseItemAndCount (text) {
   }
   t = t.replace(/\b(a|an|some|please|me|the)\b/g, ' ').replace(/\s+/g, ' ').trim()
   // plural -> singular for common tools, keep it simple
-  const itemName = t.replace(/ /g, '_')
+  const itemName = aliasItem(t.replace(/ /g, '_'))
   return { itemName, count: Math.max(1, Math.min(64, count || 1)) }
+}
+
+// Common shorthand -> real Minecraft item/block names.
+// "do you have iron" means iron_ingot, "wood" means oak_log, etc.
+// (Simulation run 2 found this bug: "iron" is not an item name.)
+const ITEM_ALIASES = {
+  iron: 'iron_ingot', gold: 'gold_ingot', diamond: 'diamond', emerald: 'emerald',
+  coal: 'coal', wood: 'oak_log', log: 'oak_log', logs: 'oak_logs', plank: 'oak_planks',
+  planks: 'oak_planks', stone: 'stone', dirt: 'dirt', sand: 'sand', glass: 'glass',
+  wheat: 'wheat', carrot: 'carrot', potato: 'potato', beetroot: 'beetroot',
+  bread: 'bread', apple: 'apple', meat: 'cooked_beef', steak: 'cooked_beef',
+  chicken: 'cooked_chicken', pork: 'cooked_porkchop', fish: 'cod',
+  stick: 'stick', sticks: 'stick', torch: 'torch', torches: 'torch',
+  sword: 'iron_sword', pickaxe: 'iron_pickaxe', axe: 'iron_axe', shovel: 'iron_shovel',
+  bow: 'bow', arrow: 'arrow', arrows: 'arrow', shield: 'shield', bed: 'white_bed',
+  chest: 'chest', furnace: 'furnace', table: 'crafting_table', boat: 'oak_boat',
+  seeds: 'wheat_seeds', seed: 'wheat_seeds', string: 'string', leather: 'leather',
+  feather: 'feather', bone: 'bone', bones: 'bone', wool: 'white_wool',
+  cobble: 'cobblestone', cobblestone: 'cobblestone', obsidian: 'obsidian',
+  redstone: 'redstone', lapis: 'lapis_lazuli', quartz: 'quartz',
+  netherite: 'netherite_ingot', copper: 'copper_ingot', amethyst: 'amethyst_shard',
+}
+function aliasItem (name) {
+  if (!name) return name
+  // "oak_logs" -> "oak_log" (singular) for item lookups, keep blocks as-is where needed
+  const lower = name.toLowerCase()
+  if (ITEM_ALIASES[lower]) return ITEM_ALIASES[lower]
+  if (lower.endsWith('_logs')) return lower.slice(0, -1)
+  return lower
 }
 
 // ---- Segs brain: remembers places + last task, so long messages make sense ----
 // Saved to brain.json next to bot.js (NOT in the GitHub repo - see .gitignore).
-// It remembers: home, farm, last task, last place it was before following you.
-let brain = { home: null, farm: null, lastTask: null, lastPos: null }
+// v5: MULTIPLE bases, not just one home. brain.bases = { home: [x,y,z], farm: [...], mine: [...] }
+// brain.facts = things the owner taught it ("remember that ...")
+// brain.macros = custom shortcuts the owner taught it ("learn daily means ...")
+// brain.deaths = where it died and what killed it (it learns to be careful there)
+// brain.found = where it found useful stuff (ores, farms, water)
+let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {} }
 try {
   if (fs.existsSync('./brain.json')) brain = { ...brain, ...JSON.parse(fs.readFileSync('./brain.json', 'utf8')) }
 } catch (e) {}
+// migrate v3/v4 single home/farm into the multi-base map
+if (brain.home && !brain.bases.home) brain.bases.home = brain.home
+if (brain.farm && !brain.bases.farm) brain.bases.farm = brain.farm
+if (!brain.bases) brain.bases = {}
+if (!brain.facts) brain.facts = []
+if (!brain.macros) brain.macros = {}
+if (!brain.deaths) brain.deaths = []
+if (!brain.found) brain.found = {}
 function saveBrain () { try { fs.writeFileSync('./brain.json', JSON.stringify(brain, null, 2)) } catch (e) {} }
+// Save the last ACTION task (not questions like "what time is it") so "do it again" works.
+// (Simulation run 2 found this bug: lastTask was only saved for unknown commands,
+// because every real action returned early before the save line.)
+const QUERY_WORDS = ['status', 'how are you', 'what are you doing', 'where are you', 'what time', 'is it night', 'is it day', 'do you have', 'how much', 'how many', 'what do you need', 'are you busy', 'help', 'what do you remember', 'what did you learn', 'list bases']
+function rememberTask (req) {
+  if (!req) return
+  if (QUERY_WORDS.some(q => req.includes(q))) return
+  if (req === 'again' || req === 'do it again') return
+  brain.lastTask = req; saveBrain()
+}
 function currentJob () {
   if (bot?.isSleeping) return 'sleeping'
   if (farming) return 'farming'
@@ -269,6 +320,16 @@ function createBot () {
   bot.on('sleep', () => log('Segs is sleeping'))
   bot.on('wake', () => { say(pick(['morning', 'awake, ready to work', 'good morning, what now'])) })
 
+  // v5 LEARNING from playing: when it dies, remember where and warn next time.
+  // This is coded memory, not AI training - it just does not forget what happened.
+  bot.on('death', () => {
+    const pos = bot.entity ? [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)] : [0, 0, 0]
+    brain.deaths.push({ what: 'died', pos, at: new Date().toISOString() })
+    if (brain.deaths.length > 10) brain.deaths = brain.deaths.slice(-10)
+    saveBrain()
+    log('Segs died at ' + pos.join(', ') + ' - remembered, will be careful there')
+  })
+
   bot.on('entityHurt', (entity) => {
     if (!bot.entity || entity !== bot.entity) return
     defendCheck()
@@ -377,7 +438,8 @@ function createBot () {
     const clauses = splitClauses(req)
     if (clauses.length > 1 && isOwner(username)) {
       say(pick(['ok, doing it step by step', 'got it, one thing at a time']))
-      brain.lastTask = req; saveBrain()
+      // save the CLEANED plan (not the raw "can you please..." version)
+      brain.lastTask = clauses.join(' and '); saveBrain()
       for (const clause of clauses) {
         // stop words inside a multi-step plan: "stop" ends the whole plan
         if (/^(stop|stay|wait)$/.test(clause)) { stopAllMovement(); say('ok stopped'); return }
@@ -394,6 +456,19 @@ function createBot () {
     }
     // single clause from here on - use the cleaned single request
     if (clauses.length === 1) req = clauses[0]
+
+    // v5: remember the action for "do it again" - do this for EVERY action,
+    // not just unknown ones (that was the run-2 bug). Queries are skipped
+    // inside rememberTask(). Also run a taught macro if the request matches one.
+    if (isOwner(username)) {
+      const macroKey = Object.keys(brain.macros || {}).find(k => req === k || req.startsWith(k + ' '))
+      if (macroKey && req !== brain.macros[macroKey]) {
+        say(`ok, doing my ${macroKey} routine`)
+        await handleTalk(username, 'Segs ' + brain.macros[macroKey], isWhisper)
+        return
+      }
+      rememberTask(req)
+    }
 
     // greetings / small talk - anyone can say hi, commands are owner-only
     if (/^(hi|hello|hey|yo|hii|hello there|good morning|good afternoon|good evening)$/.test(req)) {
@@ -417,7 +492,46 @@ function createBot () {
 
     // help
     if (req.includes('help') || req.includes('what can you do')) {
-      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs craft iron pickaxe, segs afk, segs guard me, segs eat, segs status, segs stop')
+      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs remember this is home, segs go to mine, segs list bases, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop')
+      return
+    }
+
+    // ---- v5: LEARNING (coded, not AI) ----
+    // MUST run before farm/craft/guard handlers, or "learn daily means farm wheat"
+    // starts farming instead of saving the routine (simulation v5 run 2 bug).
+    // "Segs remember that the mine is dangerous at night" - it stores the fact.
+    // "Segs learn daily means go to the farm and farm wheat and come back" - macro,
+    // then "Segs daily" runs the whole routine. "Segs what do you remember" lists it all.
+    // It also learns on its own: where it died, where it found stuff.
+    if (isOwner(username) && req.startsWith('remember that')) {
+      const fact = req.replace(/^remember that\s*/, '').trim()
+      if (fact) {
+        if (!brain.facts.includes(fact)) { brain.facts.push(fact); saveBrain() }
+        say(`ok, remembered: ${fact}`); return
+      }
+    }
+    if (isOwner(username) && (req.includes('what do you remember') || req.includes('what did you learn') || req.includes('what have you learned'))) {
+      const bits = []
+      if (Object.keys(brain.bases || {}).length) bits.push('bases: ' + Object.keys(brain.bases).join(', '))
+      if (brain.facts.length) bits.push('facts: ' + brain.facts.join(' | '))
+      if (Object.keys(brain.macros || {}).length) bits.push('routines: ' + Object.keys(brain.macros).join(', '))
+      if (brain.deaths.length) bits.push('deaths: ' + brain.deaths.slice(-3).map(d => `${d.what} at ${d.pos.join(', ')}`).join(' | '))
+      say(bits.length ? bits.join('. ') : 'nothing yet, teach me: segs remember that ... or segs learn daily means ...')
+      return
+    }
+    if (isOwner(username)) {
+      const learnMatch = req.match(/learn (\w+) means (.+)/)
+      if (learnMatch) {
+        const name = learnMatch[1], cmd = cleanClause(learnMatch[2])
+        brain.macros[name] = cmd; saveBrain()
+        say(`ok, learned ${name}: when you say segs ${name}, i will do: ${cmd}`); return
+      }
+    }
+    if (isOwner(username) && req.startsWith('forget that')) {
+      const fact = req.replace(/^forget that\s*/, '').trim()
+      const i = brain.facts.indexOf(fact)
+      if (i >= 0) { brain.facts.splice(i, 1); saveBrain(); say('ok, forgot that') }
+      else say('i dont remember that one')
       return
     }
 
@@ -451,6 +565,29 @@ function createBot () {
       say(pick(['ok, following you', 'following you now', 'got it, sticking with you']))
       followLoop()
       return
+    }
+
+    // go to a place - MUST come before "farm", or "go to the farm" starts
+    // farming instead of just walking there (simulation run 3 bug).
+    if (req.startsWith('go to') || req.startsWith('go to the') || req === 'go farm' || req === 'go home') {
+      // named base? "go to mine", "go to farm base", "go to home"
+      const place = req.replace(/^go to (the )?/, '').replace(/ base$/, '').trim()
+      if (place && brain.bases[place]) {
+        stopAllMovement(); say(`going to ${place}`)
+        await gotoPos(new Vec3(brain.bases[place][0], brain.bases[place][1], brain.bases[place][2]))
+        say(`at ${place}`); return
+      }
+      if (place === 'farm' && config.farmCenter) {
+        stopAllMovement(); await gotoPos(new Vec3(config.farmCenter[0], config.farmCenter[1], config.farmCenter[2])); say('at the farm'); return
+      }
+      const coordMatch = req.match(/(-?\d+)\s+(-?\d+)\s+(-?\d+)/)
+      if (coordMatch) {
+        const [x, y, z] = coordMatch.slice(1).map(Number)
+        stopAllMovement(); say('on my way there')
+        await gotoPos(new Vec3(x, y, z)); say('here'); return
+      }
+      if (place) { say(`i dont know where ${place} is, tell me: segs remember this is ${place}`); return }
+      // "go to" with nothing after - fall through to other handlers
     }
 
     // farm
@@ -536,24 +673,116 @@ function createBot () {
       await handleTalk(username, 'Segs ' + brain.lastTask, isWhisper)
       return
     }
-    // remember places: "remember this is home" / "remember this is the farm"
-    if (req.includes('remember this is home') || req.includes('this is home') || req.includes('remember home')) {
-      brain.home = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]; saveBrain()
-      say('ok, remembered this as home'); return
+    // ---- v5: MULTIPLE bases ----
+    // "Segs remember this is home" / "remember this is the mine base" / "remember this is base 2"
+    // You can have as many bases as you want. "Segs list bases" shows them all.
+    // "Segs go to farm" / "Segs go to mine" walks to that base. "Segs go home" = the home base.
+    {
+      // "remember that ..." is a FACT, not a place - the learning block above
+      // already handled it; never let it become a base (simulation v5 run 2 bug).
+      if (req.startsWith('remember that')) { /* fall through */ }
+      else {
+      const remMatch = req.match(/remember (?:this is|this|that) (?:the )?(.+?)(?: base)?$/)
+      if (req.includes('remember') && remMatch) {
+        const name = remMatch[1].replace(/\b(my|our)\b/g, '').trim().replace(/\s+/g, ' ')
+        if (name && name !== 'this' && !name.startsWith('that ')) {
+          const pos = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
+          brain.bases[name] = pos
+          if (name === 'home') brain.home = pos
+          if (name === 'farm') { brain.farm = pos; config.farmCenter = pos }
+          saveBrain()
+          say(`ok, remembered this as ${name} (${pos.join(', ')})`); return
+        }
+      }
+      }
     }
-    if (req.includes('remember this is the farm') || req.includes('this is the farm') || req.includes('remember the farm')) {
-      brain.farm = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
-      config.farmCenter = brain.farm; saveBrain()
-      say('ok, remembered this as the farm'); return
+    if (req.includes('list bases') || req.includes('my bases') || req.includes('where are my bases') || req.includes('show bases')) {
+      const names = Object.keys(brain.bases || {})
+      if (!names.length) { say('i dont know any bases yet, stand somewhere and say segs remember this is home'); return }
+      say('my bases: ' + names.map(n => `${n} at ${brain.bases[n].join(', ')}`).join(' | ')); return
+    }
+    if (req.startsWith('forget base') || req.startsWith('forget ') && req.includes('base')) {
+      const name = req.replace(/^forget (base )?/, '').replace(/ base$/, '').trim()
+      if (brain.bases[name]) { delete brain.bases[name]; if (name === 'home') brain.home = null; if (name === 'farm') brain.farm = null; saveBrain(); say(`ok, forgot ${name}`) }
+      else say(`i dont know a base called ${name}`)
+      return
     }
     if (req === 'go home' || req.includes('go home') || req.includes('take me home')) {
-      if (!brain.home) { say('i dont know where home is yet, stand somewhere and say segs remember this is home'); return }
-      stopAllMovement(); say('going home'); await gotoPos(new Vec3(brain.home[0], brain.home[1], brain.home[2])); say('home'); return
+      const home = brain.bases.home || brain.home
+      if (!home) { say('i dont know where home is yet, stand somewhere and say segs remember this is home'); return }
+      stopAllMovement(); say('going home'); await gotoPos(new Vec3(home[0], home[1], home[2])); say('home'); return
     }
     if (req.includes('come back') || req === 'return' || req.includes('go back')) {
-      const backTo = brain.lastPos || brain.home
+      // "come back to me" means come to the OWNER, not to the last place.
+      // (Simulation v5 run 3: it said "back where?" inside a long plan.)
+      if (req.includes('to me') || req.includes('to you')) {
+        const player = bot.players[username]?.entity
+        if (!player) { say('i cant see you right now'); return }
+        stopAllMovement(); say('coming back to you')
+        await gotoPos(player.position); say('here'); return
+      }
+      const backTo = brain.lastPos || brain.bases.home || brain.home
       if (!backTo) { say('back where? i dont remember'); return }
       stopAllMovement(); say('coming back'); await gotoPos(new Vec3(backTo[0], backTo[1], backTo[2])); return
+    }
+    // ---- v5: more player stuff ----
+    // dig / mine / chop: "Segs dig stone", "Segs mine iron ore", "Segs chop wood"
+    if (req.startsWith('dig') || req.startsWith('mine') || req.startsWith('chop')) {
+      const rest = req.replace(/^(dig|mine|chop)\s*/, '')
+      const { itemName, count } = parseItemAndCount(rest)
+      await digBlock(itemName, count)
+      return
+    }
+    // place: "Segs place a torch", "Segs place stone"
+    if (req.startsWith('place')) {
+      const rest = req.replace(/^place\s*/, '')
+      const { itemName, count } = parseItemAndCount(rest)
+      await placeBlock(itemName, count)
+      return
+    }
+    // fish: "Segs fish" (needs a fishing rod)
+    if (req === 'fish' || req.includes('go fishing') || req.includes('start fishing')) {
+      await goFishing()
+      return
+    }
+    // smelt: "Segs smelt iron ore" (needs a furnace + coal nearby)
+    if (req.startsWith('smelt') || req.startsWith('cook')) {
+      const rest = req.replace(/^(smelt|cook)\s*/, '')
+      const { itemName, count } = parseItemAndCount(rest)
+      await smeltItem(itemName, count)
+      return
+    }
+    // inventory: "Segs inventory" / "Segs what do you have"
+    if (req === 'inventory' || req.includes('show inventory') || req.includes('what is in your inventory')) {
+      const items = bot.inventory.items()
+      if (!items.length) { say('my inventory is empty'); return }
+      say('i have: ' + items.map(i => `${i.name} x${i.count}`).join(', ')); return
+    }
+    // drop all: "Segs drop everything"
+    if (req.includes('drop everything') || req.includes('drop all')) {
+      await dropAll(); return
+    }
+    // fun / human stuff: dance, jump, wave, look at me, joke, who are you
+    if (req.includes('dance')) {
+      say('ok watch this')
+      bot.setControlState('jump', true); setTimeout(() => bot.setControlState('jump', false), 600)
+      try { bot.look(bot.entity.yaw + Math.PI, 0) } catch (e) {}
+      setTimeout(() => { try { bot.look(bot.entity.yaw + Math.PI, 0) } catch (e) {} }, 700)
+      return
+    }
+    if (req === 'jump' || req.includes('jump up')) { bot.setControlState('jump', true); setTimeout(() => bot.setControlState('jump', false), 500); say('boing'); return }
+    if (req.includes('wave') || req.includes('say hi')) { try { bot.swingArm('right') } catch (e) {}; say('hi'); return }
+    if (req.includes('look at me')) {
+      const player = bot.players[username]?.entity
+      if (!player) { say('i cant see you'); return }
+      try { await bot.lookAt(player.position.offset(0, 1.6, 0)) } catch (e) {}
+      say('looking at you'); return
+    }
+    if (req.includes('tell me a joke') || req.includes('joke')) {
+      say(pick(['why did the creeper cross the road? to get to the other side... and explode', 'i told a zombie a joke once, he fell apart', 'what do you call a pig that does karate? a pork chop', 'i would tell you a crafting joke but its too blocky'])); return
+    }
+    if (req.includes('who are you') || req.includes('your name') || req.includes('who made you')) {
+      say('im Segs, your bot. Tash made me, i work for OrewaSegs'); return
     }
     // "do you have iron" / "how much wheat do you have" / "how many diamonds"
     {
@@ -770,13 +999,96 @@ function createBot () {
     } catch (e) { log('fetch failed: ' + e.message); say(`couldnt get ${itemName}, maybe too far or i need a better tool`) }
   }
 
+  // ---- v5: dig / mine / chop / place / fish / smelt ----
+  async function digBlock (itemName, count) {
+    const mcData = mcDataFor(bot.version)
+    const blockName = aliasItem(itemName)
+    const blockDef = mcData.blocksByName[blockName] || mcData.blocksByName[blockName.replace(/_log$/, '_log')]
+    if (!blockDef) { say(`i dont know how to dig ${itemName}`); return }
+    // only look nearby (16 blocks) - far targets make pathfinder wander and
+    // hand-digging stone takes forever (simulation v5 run 2: never finished).
+    const block = bot.findBlock({ matching: b => b.name === blockName, maxDistance: 16 })
+    if (!block) { say(`i cant see any ${itemName} near me, get closer to some`); return }
+    // equip the best tool for this block if we have one (mineflayer-tool)
+    try { await bot.tool.equipForBlock(block) } catch (e) {}
+    say(`ok, digging ${count}x ${itemName}`)
+    let dug = 0
+    for (let i = 0; i < count; i++) {
+      const b = bot.findBlock({ matching: x => x.name === blockName, maxDistance: 16 })
+      if (!b) break
+      try {
+        await gotoPos(b.position)
+        await bot.dig(bot.blockAt(b.position))
+        dug++
+        // learn where it found this stuff
+        brain.found[blockName] = [Math.floor(b.position.x), Math.floor(b.position.y), Math.floor(b.position.z)]; saveBrain()
+      } catch (e) { log('dig failed: ' + e.message); break }
+    }
+    say(dug > 0 ? `dug ${dug}x ${itemName}` : `couldnt dig ${itemName}, maybe i need a better tool`)
+  }
+  async function placeBlock (itemName, count) {
+    const mcData = mcDataFor(bot.version)
+    const blockName = aliasItem(itemName)
+    const item = bot.inventory.items().find(i => i.name === blockName || i.name === itemName)
+    if (!item) { say(`i dont have any ${itemName} to place, give me some`); return }
+    const ref = bot.blockAt(bot.entity.position.offset(0, -1, 0))
+    if (!ref || ref.name === 'air') { say('i need solid ground under me to place that'); return }
+    try {
+      await bot.equip(item, 'hand')
+      await bot.placeBlock(ref, new Vec3(0, 1, 0))
+      say(`placed ${itemName}`)
+    } catch (e) { log('place failed: ' + e.message); say(`couldnt place ${itemName} here`) }
+  }
+  async function goFishing () {
+    const rod = bot.inventory.items().find(i => i.name === 'fishing_rod')
+    if (!rod) { say('i need a fishing rod to fish, give me one'); return }
+    const water = bot.findBlock({ matching: b => b.name === 'water', maxDistance: 8 })
+    if (!water) { say('i need water nearby to fish'); return }
+    try {
+      await bot.equip(rod, 'hand')
+      say('fishing, give me a sec')
+      await bot.fish()
+      say('caught something')
+    } catch (e) { log('fish failed: ' + e.message); say('didnt catch anything this time') }
+  }
+  async function smeltItem (itemName, count) {
+    const furnaceBlock = bot.findBlock({ matching: b => b.name === 'furnace', maxDistance: 6 })
+    if (!furnaceBlock) { say('i need a furnace nearby to smelt that'); return }
+    const fuel = bot.inventory.items().find(i => ['coal', 'charcoal', 'oak_log', 'oak_planks'].includes(i.name))
+    if (!fuel) { say('i need coal or wood as fuel to smelt'); return }
+    try {
+      const furnace = await bot.openFurnace(furnaceBlock)
+      const mcData = mcDataFor(bot.version)
+      const raw = mcData.itemsByName[aliasItem(itemName)] || mcData.blocksByName[aliasItem(itemName)]
+      if (!raw) { say(`i dont know what ${itemName} is`); return }
+      const have = bot.inventory.items().find(i => i.type === raw.id)
+      if (!have) { say(`i dont have any ${itemName} to smelt`); return }
+      await furnace.putInput(have.type, null, Math.min(count, have.count))
+      await furnace.putFuel(fuel.type, null, 1)
+      say(`smelting ${itemName}, come back in a bit`)
+      setTimeout(async () => { try { await furnace.takeOutput() } catch (e) {} }, 15000)
+    } catch (e) { log('smelt failed: ' + e.message); say('couldnt use that furnace') }
+  }
+  async function dropAll () {
+    const keep = ['iron_sword', 'diamond_sword', 'iron_pickaxe', 'diamond_pickaxe', 'bow', 'shield']
+    const items = bot.inventory.items().filter(i => !keep.includes(i.name))
+    if (!items.length) { say('nothing to drop'); return }
+    for (const item of items) { try { await bot.toss(item.type, null, item.count) } catch (e) {} }
+    say(`dropped ${items.length} stacks, kept my tools`)
+  }
+
   async function doCraft (itemName, count) {
     const mcData = mcDataFor(bot.version)
     const item = mcData.itemsByName[itemName]
     if (!item) { say(`i dont know ${itemName}, try another name`); return }
-    const recipes = bot.recipesFor(item.id, null, 1, null)
-    if (!recipes || !recipes.length) { say(`no recipe for ${itemName}, maybe need a crafting table nearby`); return }
-    for (const recipe of recipes) {
+    // recipesFor() filters by inventory, so with no ingredients it returns []
+    // and the old code wrongly said "no recipe". recipesAll() lists the recipe
+    // no matter what we carry, so we can tell the user what is really missing.
+    // (Simulation v5 run 3: bread said "no recipe" - the recipe exists, it just
+    // needs a crafting table and 3 wheat.)
+    const allRecipes = (bot.recipesAll ? bot.recipesAll(item.id, null, true) : []) || []
+    if (!allRecipes.length) { say(`no recipe for ${itemName}`); return }
+    for (const recipe of allRecipes) {
       const craftsNeeded = Math.ceil(count / (recipe.result.count || 1))
       const missing = []
       for (const d of (recipe.delta || [])) {
@@ -796,7 +1108,7 @@ function createBot () {
         let table = null
         if (recipe.requiresTable) {
           table = bot.findBlock({ matching: b => b.name === 'crafting_table', maxDistance: 6 })
-          if (!table) { say('i need a crafting table nearby for that'); return }
+          if (!table) { say(`i can make ${itemName}, but i need a crafting table nearby`); return }
         }
         await bot.craft(recipe, craftsNeeded, table)
         say(pick([`done, crafted ${count}x ${itemName}`, `here you go, ${count}x ${itemName} ready`]))

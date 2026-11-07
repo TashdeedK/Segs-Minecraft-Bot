@@ -111,3 +111,53 @@ not a failure.
   this run (no farm, no items, no mobs in the test world). The code paths are
   the same v3 code that was tested for syntax and logic; the 26.3-critical
   paths (join, spawn, tick_end, move, chat, login) are the ones proven above.
+
+---
+
+## v5 — simulation testing (2026-11-07, after the v4 report above)
+
+Method: the local vanilla 26.3 server was restarted, and a second fork bot
+playing **OrewaSegs** talked to Segs in real in-game chat while Segs ran —
+3 runs on v4 first (to find bugs), then 3 runs on v5 (to verify the fixes).
+All runs: both bots joined as protocol 777, no kicks, no crashes.
+
+### Bugs found in v4 (3 runs)
+1. "Segs do you have iron" -> "i dont know what iron is" (iron is not an item name).
+2. "Segs do it again" -> "do what again? i dont remember yet" after real actions
+   (lastTask was only saved for unknown commands, every real action returned early).
+3. "go to the farm" started farming instead of walking there (farm handler ran first).
+4. "craft bread 5" -> "no recipe for bread" (recipesFor() filters by inventory, so
+   with no wheat it returns nothing — the recipe exists, it needs a table + 3 wheat).
+
+### Bugs found in v5 round 1 (2 more)
+5. "remember that the mine is dangerous at night" became a base called
+   "mine is dangerous at night" (base-remember regex caught it).
+6. "learn daily means farm wheat" started farming instead of saving the routine
+   (farm handler ran before the learn handler). "dig stone" also never finished
+   in that run — it chased a stone block 24 blocks away and hand-digged.
+
+### v5 fixes, all verified in simulation runs 1b/2b/3b
+- Item alias map (iron->iron_ingot, gold->gold_ingot, wood->oak_log, etc).
+  "do you have iron" now says "i dont have any iron_ingot".
+- lastTask is saved for every action (queries skipped); "do it again" re-ran
+  "tp to me" correctly.
+- "go to <place>" handler runs before farm; "go to the farm" with no farm set
+  says so instead of farming; multi-step message now farms exactly once.
+- doCraft uses recipesAll() (ignores inventory) and reports the real missing
+  items: "i need 15x wheat for 5x bread".
+- Learning handlers (remember that / learn / what do you remember) run before
+  farm/craft/guard; base-remember ignores "remember that".
+  Verified: fact saved, macro "daily" saved, "what do you remember" lists
+  "facts: the mine is dangerous at night. routines: daily".
+- dig now equips the best tool and only looks 16 blocks away; "dug 1x stone"
+  verified, and the find was learned into brain.found.
+- "come back to me" walks to the owner: "coming back to you" / "here".
+- Multi-base verified: "remember this is mine base" / "list bases" /
+  "go to mine" all worked; brain.json now stores bases, facts, macros,
+  deaths, found.
+
+### What is still NOT proven
+- The real youniga.deployd.sh server (blocked from this VM) — same as v4.
+- Farming/crafting/guard were exercised on the vanilla test world only as
+  far as the simulation above; the farm in the test world had no ripe wheat.
+- Enchanting, villager trading, horse/boat riding are not implemented (see README).

@@ -1,7 +1,37 @@
-# Segs — Free Minecraft Bot — v4 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v5 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
+
+**v5 is v4 + a smarter brain.** Same native 26.3 fork build (Misty4119 six-repo
+Mineflayer fork, protocol 777), plus:
+
+- **Multiple bases, not one home.** `Segs remember this is home`, `Segs remember this is the mine base`,
+  `Segs remember this is base 2` — as many as you want. `Segs list bases` shows them,
+  `Segs go to mine` walks there, `Segs go home` goes home. It remembers them in
+  `brain.json` even after restarts.
+- **It learns (coded memory, not AI).** `Segs remember that the mine is dangerous at night`
+  stores a fact. `Segs learn daily means go to the farm and farm wheat and come back`
+  teaches it a routine — then `Segs daily` runs the whole thing. `Segs what do you remember`
+  lists bases, facts, routines and deaths. It also learns on its own: where it died,
+  where it found stone/ores, what worked.
+- **More player stuff:** `Segs dig stone`, `Segs mine iron ore`, `Segs chop wood`
+  (equips the best tool it has), `Segs place torch`, `Segs fish`, `Segs smelt iron ore`
+  (needs furnace + coal), `Segs inventory`, `Segs drop everything`, `Segs dance`, `Segs jump`,
+  `Segs look at me`, `Segs tell me a joke`, `Segs who are you`.
+- **6 bugs fixed after running it 3 times in simulation** (see TEST-REPORT-26.3.md):
+  "do you have iron" now understands iron/gold/wood/etc, "do it again" works after
+  real actions, "go to the farm" no longer starts farming, "craft bread" tells you
+  exactly what is missing instead of "no recipe", "come back to me" walks to you,
+  and "learn / remember that" no longer get eaten by the farm handler.
+
+**Can it really learn like a player?** Honest answer: no real AI training — a free
+Node bot cannot train a model while it plays. What it CAN do, and now does, is
+remember everything that happens to it (places, facts, routines, deaths, finds)
+and use that memory next time. That is learning in the only form a bot like this
+can honestly offer. Enchanting, villager trading and riding horses are still out
+of scope — it does everything else a normal player does: walk, run, jump, swim,
+fight, farm, craft, smelt, fish, dig, place, eat, sleep, guard, AFK, chat.
 
 **v4 is a different bot under the hood from v3.** v3 used npm Mineflayer (26.1 only) + a
 `tick_end` wrapper, and it could only join a 26.3 server through ViaBackwards.
