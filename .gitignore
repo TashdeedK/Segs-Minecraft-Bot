@@ -3,3 +3,6 @@ config.json
 brain.json
 package-lock.json
 .DS_Store
+segs-26.3/
+vanilla-server/
+*.log

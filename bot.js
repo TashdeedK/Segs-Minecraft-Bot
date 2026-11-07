@@ -36,9 +36,25 @@ const BOT_NAME = config.username || 'Segs'
 // Mineflayer bot ~1.5s after join with "invalid_player_movement"
 // unless it sends client_tick_end after move packets. That fix is
 // already wired in - do not remove it.
+
+// v4: resolve minecraft-data THROUGH mineflayer, not from this folder.
+// npm plugins pull in a plain npm minecraft-data (no 26.3) which would
+// shadow the fork's vendor overlay if we did a plain require().
+// Resolving from mineflayer's own folder finds vendor/minecraft-data (26.3).
+function mcDataFor (version) {
+  try {
+    const mfPath = require.resolve('mineflayer')
+    const mcPath = require.resolve('minecraft-data', { paths: [require('path').dirname(mfPath)] })
+    return require(mcPath)(version)
+  } catch (e) {
+    // plain require as a last resort (npm data, up to 26.1 only)
+    return require('minecraft-data')(version)
+  }
+}
+
 function resolveVersion (requested) {
   try {
-    const mc = require('minecraft-data')(requested)
+    const mc = mcDataFor(requested)
     // minecraft-data returns null (not an error) for unknown versions
     // if another version was loaded first, so check the result too.
     if (!mc || !mc.version) throw new Error('unknown version ' + requested)
@@ -142,6 +158,11 @@ function createBot () {
     username: BOT_NAME,
     version: EFFECTIVE_VERSION,
     auth: 'offline',
+    // LOW RAM: tell the server to send only 5 chunks around us (view distance 5).
+    // The bot does not render, so this is the main RAM lever: ~121 chunks instead
+    // of ~500+ at view 12. Server may cap it lower/higher; 5 is our request.
+    // On a 500MB-1GB machine this keeps the bot at ~200-400MB.
+    viewDistance: 5,
   })
 
   bot.loadPlugin(pathfinder)
@@ -151,19 +172,18 @@ function createBot () {
   bot.loadPlugin(autoEat)
   bot.loadPlugin(armorManager)
 
-  // ---- 26.3 tick_end fix (Mineflayer issue #4189, 2026-10-18) ----
+  // ---- 26.3 tick_end (Mineflayer issue #4189, 2026-10-18) ----
   // Since 26.3 the server kicks a client ~1.5s after join with
   // "multiplayer.disconnect.invalid_player_movement" if it sends a
   // second position packet without a client_tick_end in between.
-  // Mineflayer 4.39.0 never sends tick_end, so WITHOUT this the bot
-  // is kicked on any stock vanilla/Paper 26.3 server - even through
-  // ViaVersion/ViaBackwards (bot speaking 26.1). Vanilla clients have
-  // sent tick_end every tick since 1.21.2, and minecraft-protocol
-  // already defines the packet for 26.1, so writing it just works.
-  // Fix verified by the issue reporter on Paper 26.3-205 via
-  // ViaBackwards, stable for long sessions. Upstream master now sends
-  // it in the physics tick loop; this wrapper does the same job for
-  // the published 4.39.0 until a newer Mineflayer is released.
+  // v4 NATIVE 26.3 FORK: the fork's physics loop already sends
+  // tick_end (lib/plugins/physics.js), so installing our old wrapper
+  // on top would send it TWICE per tick. Skip the wrapper when the
+  // fork is in use (EFFECTIVE_VERSION === '26.3' with native data).
+  // Fallback only: if we ever fall back to npm 26.1, install the wrapper.
+  if (EFFECTIVE_VERSION === '26.3') {
+    log('native 26.3 fork: tick_end handled by physics loop, wrapper skipped')
+  } else {
   try {
     const origWrite = bot._client.write.bind(bot._client)
     bot._client.write = (name, packet) => {
@@ -175,6 +195,7 @@ function createBot () {
     }
     log('26.3 fix on: sending tick_end after every move packet')
   } catch (e) { log('tick_end fix could not be installed: ' + e.message) }
+  }
 
   try {
     if (bot.autoEat) {
@@ -193,7 +214,7 @@ function createBot () {
     loggedIn = false
     loginTried = false
     try {
-      const mcData = require('minecraft-data')(bot.version)
+      const mcData = mcDataFor(bot.version)
       const movements = new Movements(bot, mcData)
       movements.allowParkour = false
       movements.canDig = true
@@ -539,7 +560,7 @@ function createBot () {
       const haveMatch = req.match(/(?:do you have|how much|how many)\s+(.+)/)
       if (haveMatch) {
         const { itemName } = parseItemAndCount(haveMatch[1].replace(/\b(do|you|have|got)\b/g, ' '))
-        const mcData = require('minecraft-data')(bot.version)
+        const mcData = mcDataFor(bot.version)
         const item = mcData.itemsByName[itemName] || mcData.blocksByName[itemName]
         if (!item) { say(`i dont know what ${itemName} is`); return }
         const count = bot.inventory.count(item.id, null)
@@ -667,7 +688,7 @@ function createBot () {
   async function farmOnce (cropName, center) {
     if (!farming || !bot.entity) return
     const crop = CROPS[cropName]
-    const mcData = require('minecraft-data')(bot.version)
+    const mcData = mcDataFor(bot.version)
     if (!mcData.blocksByName[crop.block]) { say('i dont know that crop on this version'); stopFarming(); return }
     const blocks = bot.findBlocks({
       matching: (b) => b.name === crop.block && b.metadata === crop.maxAge,
@@ -734,7 +755,7 @@ function createBot () {
     // if we already have it, just bring it to you
     const have = bot.inventory.items().find(i => i.name === itemName)
     if (have && have.count >= count) { await tossItem(itemName, count); return }
-    const mcData = require('minecraft-data')(bot.version)
+    const mcData = mcDataFor(bot.version)
     // item name -> block name: "oak log" is a block, "iron pickaxe" is not
     const blockName = itemName.replace(/_log$/, '_log')
     const block = bot.findBlock({ matching: b => b.name === blockName || b.name === itemName, maxDistance: 32 })
@@ -750,7 +771,7 @@ function createBot () {
   }
 
   async function doCraft (itemName, count) {
-    const mcData = require('minecraft-data')(bot.version)
+    const mcData = mcDataFor(bot.version)
     const item = mcData.itemsByName[itemName]
     if (!item) { say(`i dont know ${itemName}, try another name`); return }
     const recipes = bot.recipesFor(item.id, null, 1, null)
