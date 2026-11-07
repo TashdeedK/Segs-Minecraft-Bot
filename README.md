@@ -1,11 +1,112 @@
-# Segs — Free Minecraft Bot — v8 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v9.1 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
 
-**v8 is v7 + bed = spawn point, a permanent home with room chests, grave
-recovery, pickup + store items, enemy evade, and hunger-based sprint.**
+**v9 is v8 + smart sorting into a 16-column storage unit, a base map it
+remembers, paper auto-crafting, and sort jobs you can stop and resume.**
 Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+
+## What's new in v9.1
+
+Tash built the real storage unit (16 columns, 10 DOUBLE chests each) and
+asked for three things. All three are built and simulation-proven.
+
+1. **ONLY OrewaSegs can command Segs.** It was already true for orders
+   (sort, farm, tp, teach...), but the immediate "stop" handler in the
+   chat listener had NO owner check — any player could say "Segs stop"
+   and cancel Segs' walk / pause a sort mid-way. Fixed: the immediate
+   stop now only fires for the owner. A stranger who tries gets nothing
+   (the sort keeps going); an owner order from anyone else still gets
+   "sorry <name>, only OrewaSegs can tell me what to do". Small talk
+   (hi, thanks, who are you) still works for anyone — that's just
+   being friendly, not taking orders.
+
+2. **Bottom-first fill, gradually up.** Every column now fills from
+   the bottom chest first, then the next one up when the one below is
+   full. The old tools top-first reversal is gone — tools fill
+   bottom-up like everything else. (The "best tools at the top" tier
+   idea is dropped unless Tash says he wants it back as a strict
+   tier-to-chest rule.)
+
+3. **Double-chest columns work.** A double chest is two blocks sharing
+   one 54-slot inventory — Segs now records ONE chest per double chest
+   (a 10-double-chest column is 10 chests, not 20), so it doesn't open
+   the same inventory twice per level. The column scan also reaches
+   the whole 10-tall column now (search radius 6 -> 12, height range
+   -2..+10 -> -10..+10), so teaching from the ground floor finds the
+   top chest, and teaching from any floor finds the bottom ones.
+
+## What's new in v9
+
+**Smart sorting — the storage unit.** Your base's big room becomes the
+storage unit: one **column** per type of item, each column up to 10 chests
+tall with stairways so Segs can climb. Teach it once by walking Segs to a
+column and saying `Segs this is the ore column` — it records every chest
+in that column and remembers which item goes in which chest, so next time
+it doesn't re-check, it just goes straight there.
+
+**The 16 columns.** Yours: flowers, building blocks, ores (raw, ingot or
+block), tools (best to worst, top to bottom), foods (raw or cooked), farm
+items (wheat, potato and carrot ONLY), paper, woods (logs and planks).
+Plus 8 more: redstone, mob drops, nether, valuables (diamond, emerald,
+netherite, ancient debris, lapis, amethyst), brewing/potions, armor, seeds
+& plants, misc (everything else). Build the 16 columns first, then teach
+them. If a category has no column yet and a whole column is empty, Segs
+claims that empty column for the category and starts using it.
+
+**Sort your room.** `Segs sort my room` — Segs takes everything out of
+your room's chests and moves it, sorted, into the storage unit columns.
+`Segs move the ores to the ore column` sorts just one category. Say it
+however you like — `Segs sort my room and move to storage unit`, `Segs
+move out and sort stuff` — it understands the idea, not one exact phrase.
+Teach your room first: stand in it and say `Segs this is my room`.
+
+**Paper, made on its own.** The paper column is special: Segs takes
+sugarcane from the sugarcane farm chests (teach them with `Segs this is
+the sugarcane farm chest`), crafts it into paper at a crafting table, and
+puts the paper in the paper column. `Segs make paper` does it by hand.
+Leftover cane goes into the paper column as stock.
+
+**Tools, best to worst.** The tools column fills top-down: netherite at
+the top, then diamond, iron, gold, stone, wood at the bottom. (Tell Mu if
+gold should sit somewhere else — that order is a guess.)
+
+**Junk, enchanted, shulkers.** Junk goes to the trash chest if you taught
+one (`Segs this is the trash chest`), otherwise Segs drops it on the ground
+and tells you: rotten flesh, arrows, and non-enchanted wood/stone/iron/
+gold tools, weapons and armour. **Enchanted anything is never junk** — it
+goes to the misc column, even if it's a wooden sword, so you never lose a
+good item. **Shulker boxes are never touched** — Segs doesn't open them,
+doesn't move them, just reports them and leaves them alone. Any other
+chest or barrel it can open.
+
+**Stop and continue.** Say `Segs stop` mid-sort and Segs puts back what
+it was carrying, saves exactly how far it got, and stops. Say `Segs
+continue last sorting` and it reports first — `last sorting was your
+whole room from my room — i moved N stacks, M left. do you want to
+continue this one, or do another sorting?` — and waits for you to confirm
+(`continue`, `yes`, or just say which other sort). A fresh sort starts
+from the beginning but skips anything already sorted.
+
+**Base map.** Segs remembers the whole base area, not just chests. Walk it
+to a place and name it — `Segs this is the trading hall`, `Segs this is
+the storage unit` (the storage unit is also its permanent home and the
+centre of the map) — and it remembers it. `Segs go to the trading hall`
+walks there. `Segs list places` / `Segs list columns` shows what it knows.
+`Segs where is the ore column` gives you the coords. It knows about 10
+chunks around the base, so it doesn't have to re-check nearby blocks for
+every job.
+
+**Climbing.** The storage columns are tall, so Segs now climbs stairways
+(it couldn't before — the pathfinder refused to jump up steps). If a
+column's upper chests have no stairs yet, Segs says it can't reach them
+instead of wandering off.
+
+**It ignores your `/commands`.** If you type a server command that
+mentions Segs (like `/enchant Segs sharpness 3`) Segs no longer answers it
+with "i didn't get that" — a line starting with `/` is a command, not
+chat to Segs.
 
 ## What's new in v8
 
@@ -63,7 +164,8 @@ instead and says so honestly.
 
 **`/sethome` reply listening.** After `/sethome <name>` Segs listens to
 what the server says back. If the server refuses (same name already set,
-or the 3-home limit — the message is in Spanish on your server) Segs says
+or the 3-home limit — the message is in French on your server, e.g.
+`Vous n'avez pas la permission d'ajouter un autre home !`) Segs says
 so in chat and does **not** pretend the home was set. Every reply is also
 written to `logs/` so you can see the exact wording.
 

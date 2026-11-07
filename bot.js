@@ -124,7 +124,7 @@ function pruneLogs () {
 }
 pruneLogs()
 // stats: cumulative counters, saved so they survive restarts
-let stats = { started: new Date().toISOString(), tasksDone: 0, chatsAnswered: 0, cropsFarmed: 0, itemsCrafted: 0, blocksDug: 0, deaths: 0, foodEaten: 0, chestsChecked: 0, smeltsDone: 0, timesHungry: 0 }
+let stats = { started: new Date().toISOString(), tasksDone: 0, chatsAnswered: 0, cropsFarmed: 0, itemsCrafted: 0, blocksDug: 0, deaths: 0, foodEaten: 0, chestsChecked: 0, smeltsDone: 0, timesHungry: 0, itemsSorted: 0, sortsDone: 0 }
 try { if (fs.existsSync(LOG_DIR + '/stats.json')) stats = { ...stats, ...JSON.parse(fs.readFileSync(LOG_DIR + '/stats.json', 'utf8')) } } catch (e) {}
 function saveStats () { try { fs.writeFileSync(LOG_DIR + '/stats.json', JSON.stringify(stats, null, 2)) } catch (e) {} }
 function bumpStat (key, n = 1) { stats[key] = (stats[key] || 0) + n; saveStats() }
@@ -219,7 +219,7 @@ function aliasItem (name) {
 // "Segs this is the smoker" / "Segs this is the furnace" — Segs stores the
 // block + position, then USES it on its own when it needs food or smelting.
 // Landmark types: farm (with a crop), chest, furnace, smoker, bed, table.
-let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {}, landmarks: {}, serverHomes: [], permanentHome: null, spawnBed: null, pendingSpawnBed: null, roomChests: [], lastGrave: null }
+let brain = { home: null, farm: null, lastTask: null, lastPos: null, bases: {}, facts: [], macros: {}, deaths: [], found: {}, landmarks: {}, serverHomes: [], permanentHome: null, spawnBed: null, pendingSpawnBed: null, roomChests: [], lastGrave: null, columns: {}, areas: {}, itemChest: {}, sortJob: null, trashChest: null, sugarcaneChests: [], myRoom: null }
 try {
   if (fs.existsSync('./brain.json')) brain = { ...brain, ...JSON.parse(fs.readFileSync('./brain.json', 'utf8')) }
 } catch (e) {}
@@ -238,6 +238,13 @@ if (!('spawnBed' in brain)) brain.spawnBed = null
 if (!('pendingSpawnBed' in brain)) brain.pendingSpawnBed = null
 if (!brain.roomChests) brain.roomChests = []
 if (!('lastGrave' in brain)) brain.lastGrave = null
+if (!brain.columns) brain.columns = {}
+if (!brain.areas) brain.areas = {}
+if (!brain.itemChest) brain.itemChest = {}
+if (!('sortJob' in brain)) brain.sortJob = null
+if (!('trashChest' in brain)) brain.trashChest = null
+if (!brain.sugarcaneChests) brain.sugarcaneChests = []
+if (!('myRoom' in brain)) brain.myRoom = null
 let lastSetHome = null // name of the most recent /sethome, so the permanent home can link to it
 let pendingSethome = null // { name, at } — waiting for the server's reply to /sethome
 let pendingHome = null // { name, at, started, cancelled } — waiting for the /home warmup messages
@@ -245,6 +252,9 @@ let connected = false // true only while actually on the server; loops must not 
 let pathMovements = null // the Movements object, so sprint + danger-avoid can be tuned live
 let lastEvadeSay = 0
 let lastEvadeAt = 0
+let sortStopRequested = false // set when the owner says stop during a sort
+let sortPausedByStop = false // the sort already reported the pause; the queued stop handler stays quiet
+let pendingContinue = null // { job } — Segs asked "continue this sorting or another one?" and waits for the answer
 let recoveringGrave = false
 function saveBrain () { try { fs.writeFileSync('./brain.json', JSON.stringify(brain, null, 2)) } catch (e) {} }
 // Save the last ACTION task (not questions like "what time is it") so "do it again" works.
@@ -349,7 +359,12 @@ function createBot () {
     try {
       const mcData = mcDataFor(bot.version)
       const movements = new Movements(bot, mcData)
-      movements.allowParkour = false
+      // v9: allowParkour MUST be true — the storage columns are up to
+      // 10 chests tall with stairways, and Segs has to climb those stairs
+      // to reach the upper chests (each stair is a 1-block jump up).
+      // With it false, every goto to an upper chest timed out and Segs
+      // wandered off the platform. (Run 41e/41f proved it.)
+      movements.allowParkour = true
       movements.canDig = true
       movements.allow1by1towers = false
       // v8: danger blocks. Lava + fire are already in the default
@@ -414,7 +429,11 @@ function createBot () {
     // v6 fix: Paper broadcasts command feedback as chat from the command
     // sender, e.g. "Applied effect Hunger to Segs]". That is NOT the owner
     // talking - ignore system/command-feedback lines or Segs answers them.
-    if (/^(applied|gave|set|teleported|enchanted|summoned|filled|changed|cleared|removed|killed|spawned|granted|revoked)\b/i.test(msg)) return
+    // v9: a line starting with / is a server command the owner typed
+    // (e.g. /enchant Segs sharpness 3), not chat to Segs — ignore it or
+    // Segs answers its own owner's commands with "i didn't get that".
+    if (msg.startsWith('/')) return
+    if (/^(applied|gave|set|teleported|enchanted|summoned|filled|changed|cleared|removed|replaced|killed|spawned|granted|revoked)\b/i.test(msg)) return
     if (msg.endsWith(']') && !msg.toLowerCase().includes('segs ')) return
     log(`<${username}> ${msg}`)
     logChat(username, msg)
@@ -428,9 +447,16 @@ function createBot () {
     // v7: "stop" must interrupt a running walk NOW, not wait behind it in
     // the queue — cancel the movement immediately, then let the queued
     // handler say "ok stopped" when its turn comes.
-    const stopReq = msg.toLowerCase().replace(/^segs\s+/, '')
-    if (/^(stop|stay|wait|wait here|stay here|chill|hold on)$/.test(stopReq) || stopReq === 'stop following' || stopReq === 'stop follow' || stopReq.includes('stop farm') || stopReq.includes('stop afk') || stopReq.includes('stop guard') || stopReq.includes('stop protecting')) {
-      stopAllMovement()
+    // v9: ONLY the owner may stop Segs. Without this check any player
+    // could say "Segs stop" and cancel its walk / pause a sort mid-way
+    // (that is a griefing hole — the queued handler already gates orders
+    // on isOwner, but this immediate stop bypassed it).
+    if (isOwner(username)) {
+      const stopReq = msg.toLowerCase().replace(/^segs\s+/, '')
+      if (/^(stop|stay|wait|wait here|stay here|chill|hold on)$/.test(stopReq) || stopReq === 'stop following' || stopReq === 'stop follow' || stopReq.includes('stop farm') || stopReq.includes('stop afk') || stopReq.includes('stop guard') || stopReq.includes('stop protecting')) {
+        if (/^(stop|stay|wait|wait here|stay here|chill|hold on)$/.test(stopReq)) sortStopRequested = true
+        stopAllMovement()
+      }
     }
     queueTalk(username, msg)
   })
@@ -597,6 +623,24 @@ function createBot () {
       msg = msg.slice(1).replace(/_/g, ' ')
     }
 
+    // v9: answering the "continue this sorting or another one?" question.
+    // Segs just asked it, so the owner's reply ("continue", "yes", or a
+    // different sort) is an answer even WITHOUT the "Segs" prefix — check
+    // it BEFORE the addressed gate, or a bare "continue" is dropped and
+    // the paused job never resumes. (Run 42 proved it.)
+    if (pendingContinue && isOwner(username)) {
+      const pc = pendingContinue
+      pendingContinue = null
+      const ans = lower.replace(/^(hey|hi)\s+segs\s+/, '').replace(/\bsegs\b/g, ' ').replace(/[?.!,]/g, ' ').replace(/\s+/g, ' ').trim()
+      if (/^(continue|yes|yeah|yep|continue this|go on|continue sorting|resume|do it)$/.test(ans) || ans.includes('continue this') || ans.includes('continue the sorting')) {
+        say('ok, continuing it')
+        await sortItems({ category: pc.job.category === 'all' ? null : pc.job.category })
+        return
+      }
+      // not a yes — fall through; the message is handled normally below
+      // (a different sort, or anything else), the question is cleared.
+    }
+
     const addressed = lower.includes('segs') || isWhisper || msg.startsWith('!')
     if (!addressed) return // ignore normal player chat, dont spam
 
@@ -713,7 +757,7 @@ function createBot () {
 
     // help
     if (req.includes('help') || req.includes('what can you do')) {
-      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs sethome mine, segs go to mine, segs list homes, segs forget home mine, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop, segs set this bed as your bed, segs remember this is your permanent home, segs pick up the items, segs keep these items at your base, segs check for enemies, segs get your stuff')
+      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs sethome mine, segs go to mine, segs list homes, segs forget home mine, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop, segs set this bed as your bed, segs remember this is your permanent home, segs pick up the items, segs keep these items at your base, segs check for enemies, segs get your stuff, segs this is the ore column, segs this is my room, segs this is the trading hall, segs sort my room, segs move the ores to the ore column, segs make paper, segs continue last sorting, segs list columns, segs list places, segs go to the trading hall')
       return
     }
 
@@ -768,6 +812,62 @@ function createBot () {
     if (isOwner(username) && req.startsWith('this is the')) {
       const name = req.replace(/^this is the\s*/, '').trim()
       if (name) {
+        // ---- v9: columns, rooms, areas, trash/sugarcane chests ----
+        // These are NOT landmarks (farm/chest/furnace/...) — intercept
+        // them before the landmark type detection below.
+        const here = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
+        if (name.includes('column')) {
+          let cat = null
+          for (const [word, c] of Object.entries(COLUMN_WORDS)) { if (name.includes(word)) { cat = c; break } }
+          const chests = scanColumnChests(new Vec3(here[0], here[1], here[2]))
+          if (!chests.length) { say('i cant see any chest or barrel in this column — stand right next to it and try again'); return }
+          const chestPos = chests.map(p => [p.x, p.y, p.z])
+          if (cat) {
+            brain.columns[cat] = { category: cat, name: cat + ' column', chests: chestPos, pos: here, taughtAt: Date.now() }
+            saveBrain()
+            logLearn('column', `${cat} column at ${here.join(', ')} (${chests.length} chests)`)
+            say(`ok, this is the ${cat} column — ${chests.length} chests, i will remember it`); return
+          }
+          // no type word: a blank column Segs can claim later for a
+          // category that has no column yet
+          brain.columns['blank-' + here.join(',')] = { category: null, name: 'blank column', chests: chestPos, pos: here, taughtAt: Date.now() }
+          saveBrain()
+          logLearn('column', `blank column at ${here.join(', ')} (${chests.length} chests)`)
+          say(`ok, noted this column (${chests.length} chests) — i will use it for a category that has no column yet`); return
+        }
+        if (name.includes('trash chest') || name === 'trash') {
+          const near = bot.findBlock({ matching: b => isContainer(b), maxDistance: 8 })
+          if (!near) { say('i cant see a chest or barrel here for trash'); return }
+          brain.trashChest = [near.position.x, near.position.y, near.position.z]; saveBrain()
+          logLearn('trash', `trash chest at ${brain.trashChest.join(', ')}`)
+          say('ok, this is the trash chest — junk goes here'); return
+        }
+        if (name.includes('sugarcane') && name.includes('chest')) {
+          const near = bot.findBlock({ matching: b => isContainer(b), maxDistance: 8 })
+          if (!near) { say('i cant see a chest here for the sugarcane'); return }
+          brain.sugarcaneChests.push([near.position.x, near.position.y, near.position.z]); saveBrain()
+          logLearn('sugarcane', `sugarcane chest at ${near.position.x}, ${near.position.y}, ${near.position.z}`)
+          say('ok, noted this sugarcane chest — i will take cane from here to make paper'); return
+        }
+        if (name.includes('storage unit')) {
+          brain.areas['storage unit'] = { name: 'storage unit', pos: here }
+          if (!brain.permanentHome) {
+            const roomChests = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 8, count: 6 })
+            brain.permanentHome = { pos: here, serverHome: lastSetHome || null, setAt: Date.now() }
+            brain.roomChests = roomChests.map(p => [p.x, p.y, p.z])
+          }
+          saveBrain()
+          logLearn('area', `storage unit at ${here.join(', ')}`)
+          say('ok, this is the storage unit — my permanent home, and the centre of my base map'); return
+        }
+        // named places (trading hall, a room, another player's home) — the
+        // base map. Landmarks below handle farm/chest/furnace/smoker/bed/table.
+        if (!name.includes('farm') && !name.includes('chest') && !name.includes('smoker') && !name.includes('furnace') && !name.includes('bed') && !name.includes('table')) {
+          brain.areas[name] = { name, pos: here }
+          saveBrain()
+          logLearn('area', `${name} at ${here.join(', ')}`)
+          say(`ok, got it, this is the ${name}. i will remember it on the base map`); return
+        }
         let type = 'place'
         let crop = null
         if (name.includes('farm')) { type = 'farm'; crop = ['potato', 'wheat', 'carrot', 'beetroot'].find(c => name.includes(c)) || 'wheat' }
@@ -798,6 +898,19 @@ function createBot () {
         say(`ok, got it, this is the ${name}. i will remember it`); return
       }
     }
+    if (isOwner(username) && req === 'this is my room') {
+      const here = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
+      const all = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 5, count: 12 })
+      // never count a column's chests as room chests (the room sits next
+      // to the storage unit, so the scan would catch the columns too)
+      const colSet = new Set()
+      for (const c of Object.values(brain.columns || {})) { for (const p of (c.chests || [])) colSet.add(p.join(',')) }
+      const chests = all.filter(p => !colSet.has([p.x, p.y, p.z].join(',')))
+      brain.myRoom = { pos: here, chests: chests.map(p => [p.x, p.y, p.z]) }
+      saveBrain()
+      logLearn('room', `my room at ${here.join(', ')} (${chests.length} chests)`)
+      say(`ok, this is your room — ${chests.length} chests, i will sort from here`); return
+    }
     if (req.includes('what is here') || req.includes('show me around') || req.includes('what do you know here') || req.includes('list landmarks')) {
       const marks = Object.values(brain.landmarks || {})
       if (!marks.length) { say('i dont know this place yet, show me around: stand next to something and say segs this is the ...'); return }
@@ -823,7 +936,10 @@ function createBot () {
     if (req.includes('stop afk')) { stopAfk(); say('afk off'); return }
     if (req.includes('stop guard') || req.includes('stop protecting')) { guardMode = false; try { bot.pvp.stop() } catch (e) {}; say('ok, guard off'); return }
     if (/^(stop|stay|wait|wait here|stay here|chill|hold on)$/.test(req) || req === 'stop following' || req === 'stop follow') {
-      stopAllMovement(); say(pick(['ok stopped', 'got it, staying here', 'ok, waiting here'])); return
+      sortStopRequested = true
+      stopAllMovement()
+      if (sortPausedByStop) { sortPausedByStop = false; return } // the sort already said it stopped + put things back
+      say(pick(['ok stopped', 'got it, staying here', 'ok, waiting here'])); return
     }
 
     // tp / come to me — v7: REAL teleport via /tpa (the server has a TPA
@@ -879,6 +995,41 @@ function createBot () {
     if (req.includes('enemies') || req.includes('enemy') || req.includes('is it safe') || (req.includes('safe') && req.includes('here'))) { checkEnemies(); return }
     // ---- v8: go back to the grave ("get your stuff", "go to your grave") ----
     if ((req.includes('grave') || req.includes('your stuff')) && (req.includes('get') || req.includes('go') || req.includes('recover') || req.includes('fetch'))) { await recoverGrave(true); return }
+
+    // ---- v9: SORTING ----
+    // "Segs sort my room" / "sort my room and move to storage unit" /
+    // "move out and sort" (whole room) — or one category: "Segs move the
+    // ores to the ore column" / "Segs sort the ores". Any wording like
+    // these works. (Placed after "sort yourself out" -> survive above,
+    // so that phrase still means "take care of yourself".)
+    if (req.includes('continue') && req.includes('sort')) { await askContinueSorting(); return }
+    if (req.includes('make paper') || req.includes('craft paper')) { await makePaper(); return }
+    if (req.includes('sort') || req.includes('move out') || (req.includes('move') && (req.includes('column') || req.includes('storage')))) {
+      let cat = null
+      for (const [word, c] of Object.entries(COLUMN_WORDS)) { if (req.includes(word)) { cat = c; break } }
+      // "sort my room" has no category word -> full sort. But watch out:
+      // "sort the farm items" contains 'farm' -> farm category, good.
+      // "sort the woods" contains 'wood' -> woods, good.
+      await sortItems({ category: cat }); return
+    }
+    if (req.includes('list columns') || req.includes('what columns') || req.includes('show columns') || req.includes('my columns')) {
+      const cols = Object.values(brain.columns || {}).filter(c => c.category)
+      const blanks = Object.values(brain.columns || {}).filter(c => !c.category)
+      if (!cols.length && !blanks.length) { say('i dont know any columns yet — take me to one and tell me: segs this is the ore column'); return }
+      say('columns: ' + cols.map(c => `${c.category} (${c.chests.length} chests)`).join(', ') + (blanks.length ? ` | ${blanks.length} blank column(s) waiting for a category` : '')); return
+    }
+    if (req.includes('list places') || req.includes('what places') || req.includes('my places') || req.includes('list areas')) {
+      const areas = Object.values(brain.areas || {})
+      if (!areas.length) { say('i dont know any places yet — walk me somewhere and tell me: segs this is the trading hall'); return }
+      say('places i know: ' + areas.map(a => `${a.name} at ${a.pos.join(', ')}`).join(' | ')); return
+    }
+    if ((req.includes('where is') || req.includes('where')) && (req.includes('column') || req.includes('trading hall') || req.includes('storage unit'))) {
+      let found = null
+      for (const [word, c] of Object.entries(COLUMN_WORDS)) { if (req.includes(word)) { found = columnFor(c); break } }
+      if (!found) { for (const [name, a] of Object.entries(brain.areas || {})) { if (req.includes(name)) { found = a; break } } }
+      if (!found) { say('i dont know that place yet'); return }
+      say(`${found.name || found.category + ' column'} is at ${(found.pos || found.chests[0]).join(', ')}`); return
+    }
 
     // ---- v7: SERVER HOMES (HomePlugin, overworld only, max 3 per player) ----
     // "Segs sethome mine" sets a server home (instant teleport later).
@@ -952,6 +1103,15 @@ function createBot () {
       if (place && brain.bases[place]) {
         stopAllMovement(); say(`going to ${place}`)
         if (await gotoPos(new Vec3(brain.bases[place][0], brain.bases[place][1], brain.bases[place][2]))) say(`at ${place}`)
+        return
+      }
+      // v9: named areas on the base map (trading hall, a room, another
+      // player's home, the storage unit). Taught by walking Segs there:
+      // "Segs this is the trading hall".
+      if (place && brain.areas[place]) {
+        const a = brain.areas[place]
+        stopAllMovement(); say(`going to ${place}`)
+        if (await gotoPos(new Vec3(a.pos[0], a.pos[1], a.pos[2]))) say(`at ${place}`)
         return
       }
       // old single-home field (kept for backwards compat with older brain.json)
@@ -1055,7 +1215,7 @@ function createBot () {
 
     // v6: "Segs stats" — show what it has done (from logs/stats.json)
     if (req === 'stats' || req.includes('show stats') || req.includes('your stats')) {
-      say(`my stats: ${stats.cropsFarmed} crops farmed, ${stats.itemsCrafted} items crafted, ${stats.blocksDug} blocks dug, ${stats.foodEaten} times fed, ${stats.chestsChecked} chests checked, ${stats.smeltsDone} smelts, ${stats.deaths} deaths, ${stats.timesHungry} times hungry, ${stats.itemsPicked || 0} items picked up, ${stats.itemsStored || 0} items stored, ${stats.graves || 0} graves recovered`)
+      say(`my stats: ${stats.cropsFarmed} crops farmed, ${stats.itemsCrafted} items crafted, ${stats.blocksDug} blocks dug, ${stats.foodEaten} times fed, ${stats.chestsChecked} chests checked, ${stats.smeltsDone} smelts, ${stats.deaths} deaths, ${stats.timesHungry} times hungry, ${stats.itemsPicked || 0} items picked up, ${stats.itemsStored || 0} items stored, ${stats.graves || 0} graves recovered, ${stats.itemsSorted || 0} items sorted, ${stats.sortsDone || 0} sorts done`)
       return
     }
     // status
@@ -1393,6 +1553,476 @@ function createBot () {
   // ---- v8: store items in the room's chests ----
   // Keeps its tools (pickaxe, sword, etc.) — those stay in its hands.
   // Everything else goes into the room chests.
+
+  // ---- v9: SORT ENGINE ----
+  // Deposit into one specific chest (used to return items to their
+  // source chest when a sort is stopped). Returns true if it went in.
+  async function depositIntoChest (chestPos, item) {
+    const block = bot.blockAt(chestPos)
+    if (!block || !isContainer(block)) return false
+    try {
+      if (!(await gotoPos(chestPos))) return false
+      const chest = await bot.openChest(block)
+      try { await chest.deposit(item.type, item.metadata, item.count) } catch (e) { chest.close(); return false }
+      chest.close()
+      return true
+    } catch (e) { return false }
+  }
+  // Junk goes to the trash chest if one was taught ("Segs this is the
+  // trash chest"), else Segs drops it on the ground and says so.
+  async function trashItem (item) {
+    if (brain.trashChest) {
+      if (await depositIntoChest(new Vec3(brain.trashChest[0], brain.trashChest[1], brain.trashChest[2]), item)) return 'trashed'
+    }
+    try { await bot.toss(item.type, item.metadata, item.count); return 'dropped' } catch (e) { return 'kept' }
+  }
+  // Paper column: sugarcane -> paper. 3 cane = 3 paper, needs a crafting
+  // table (3-wide recipe). Returns how many paper were ACTUALLY made
+  // (counted from the inventory, not assumed — bot.craft with a count
+  // above 1 does not reliably craft that many times in this fork, so
+  // craft one at a time and count what really appears).
+  async function craftPaper (caneCount) {
+    const crafts = Math.floor(caneCount / 3)
+    if (crafts < 1) return 0
+    let table = null
+    // v9: radius 16, not 10 — when the sort processes sugarcane last,
+    // Segs is already at a far column (~11 blocks from the table) and a
+    // 10-block search misses it. (Run 41j proved it.)
+    try { table = bot.findBlock({ matching: b => b.name === 'crafting_table', maxDistance: 16 }) } catch (e) { log('craftPaper findBlock error: ' + e.message) }
+    if (!table) { say('i need a crafting table near me to make paper'); return 0 }
+    const mcData = mcDataFor(bot.version)
+    const paperId = mcData.itemsByName.paper.id
+    const countPaper = () => bot.inventory.items().filter(i => i.type === paperId).reduce((a, i) => a + i.count, 0)
+    try {
+      if (!(await gotoPos(table.position))) return 0
+      const before = countPaper()
+      let made = 0
+      for (let i = 0; i < crafts; i++) {
+        // v9: re-fetch the recipe AND the table every step. The fork's
+        // bot.craft only ever makes paper on the FIRST call in a loop —
+        // later calls return without throwing but make nothing (run 41n:
+        // 9 cane yielded 3 paper). A fresh recipe + table each step
+        // makes every craft actually happen.
+        let recipe = null
+        try { recipe = bot.recipesFor(paperId, null, 1, table)[0] || bot.recipesFor(paperId, null, 1, null)[0] } catch (e) {}
+        if (!recipe) { log('paper craft step ' + (i + 1) + ': no recipe, stopping'); break }
+        try { await bot.craft(recipe, 1, table) } catch (e) { log('paper craft step ' + (i + 1) + ' failed: ' + e.message); break }
+        await sleepMs(200)
+        made = countPaper() - before
+        if (made >= (i + 1) * 3) continue
+        // this step made nothing — stop, don't spin on a dead recipe
+        if (countPaper() === before) break
+      }
+      // v9: the inventory can lag a tick behind the last craft, so the
+      // count above can read 6 when 9 paper are actually there — then the
+      // deposit only moves 6 and 3 paper strand in Segs' inventory.
+      // Wait a beat and recount so `made` is the true paper count.
+      // (Run 41l proved it: 6 in the paper column, 3 still carried.)
+      await sleepMs(300)
+      made = countPaper() - before
+      if (made > 0) logEvent('craft', `made ${made}x paper from ${made}x sugarcane`)
+      return made
+    } catch (e) { log('paper craft failed: ' + e.message); return 0 }
+  }
+  // Route ONE carried stack to its destination. Returns 'stored' | 'trashed' | 'dropped' | 'failed' | 'paper'.
+  async function routeCarried (item) {
+    if (item.enchanted || itemIsEnchanted(item)) {
+      if (await depositIntoColumn('misc', item)) return 'stored'
+      say('the misc column is full or missing, keeping ' + item.name); return 'failed'
+    }
+    if (isJunk(item)) return await trashItem(item)
+    const cat = categoryOf(item.name)
+    // sugarcane is paper input: craft it instead of storing the cane
+    if (item.name === 'sugar_cane') {
+      const made = await craftPaper(item.count)
+      if (made > 0) {
+        const paper = { type: mcDataFor(bot.version).itemsByName.paper.id, metadata: 0, count: made, name: 'paper' }
+        // the crafted paper is already in Segs' inventory — deposit it
+        const ok = await depositIntoColumn('paper', paper)
+        // any cane the craft did not use stays in Segs' inventory — put
+        // it in the paper column as stock, don't leave it carried
+        const left = item.count - made
+        if (left > 0) {
+          const cane = { type: item.type, metadata: item.metadata, count: left, name: 'sugar_cane' }
+          await depositIntoColumn('paper', cane)
+        }
+        return ok ? 'paper' : 'failed'
+      }
+      // no table / could not craft: store the cane in the paper column as stock
+      if (await depositIntoColumn('paper', item)) return 'stored'
+      return 'failed'
+    }
+    let col = columnFor(cat)
+    if (!col) {
+      col = claimBlankColumn(cat)
+      if (col) say(`no ${cat} column yet — made this column the ${cat} column`)
+      else {
+        // nowhere to put it: misc is the overflow
+        if (await depositIntoColumn('misc', item)) return 'stored'
+        return 'failed'
+      }
+    }
+    if (await depositIntoColumn(cat, item)) return 'stored'
+    // column full: try misc as overflow
+    if (cat !== 'misc' && await depositIntoColumn('misc', item)) return 'stored'
+    return 'failed'
+  }
+  // The sort itself. opts: { category (null = everything), source ('room' or null) }.
+  // Works in batches: withdraw from one source chest, carry it, deposit
+  // it, repeat. Stops cleanly when the owner says stop (moveToken bump):
+  // it puts back whatever it is carrying and saves the job as paused.
+  let sortingNow = false
+  async function sortItems (opts) {
+    if (sortingNow) { say('im already sorting, say stop first if you want me to stop'); return }
+    const category = (opts && opts.category) || null
+    // source chests: the taught room, else any container near Segs
+    let sourceChests = []
+    if (brain.myRoom && brain.myRoom.chests && brain.myRoom.chests.length) sourceChests = brain.myRoom.chests.map(p => new Vec3(p[0], p[1], p[2]))
+    else { try { sourceChests = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 8, count: 8 }) } catch (e) {} }
+    if (!sourceChests.length) { say('i cant see any chests to sort from — stand in your room and tell me: segs this is my room'); return }
+    if (!brain.permanentHome && !Object.keys(brain.columns || {}).length) { say('i dont know your storage unit yet — take me there and tell me: segs this is your permanent home, then teach me the columns'); return }
+    // (No trip to the storage unit up front — the sort starts at the
+    // source chests in the room, and each deposit walk takes Segs to the
+    // columns as needed. One less walk.)
+    const tok = moveToken
+    sortStopRequested = false
+    sortingNow = true
+    // (re)start or resume the job record: moved stays cumulative, total
+    // is re-scanned so left = what is actually still in the source.
+    let job = brain.sortJob
+    const sameJob = job && job.status !== 'done' && job.category === (category || 'all') && job.kind === (category ? 'category' : 'full')
+    if (!sameJob) job = { kind: category ? 'category' : 'full', category: category || 'all', source: brain.myRoom ? 'my room' : 'nearby chests', moved: 0, movedItems: 0, total: 0, totalItems: 0, status: 'running', startedAt: Date.now() }
+    job.status = 'running'
+    brain.sortJob = job; saveBrain()
+    say(category ? `sorting the ${category} into the ${category} column` : 'sorting your room into the storage unit columns')
+    logEvent('sort', `started ${job.kind} sort (${job.category}) from ${job.source}`)
+    // count the work first, so "left" is honest in the continue report.
+    // On a resume, moved stays cumulative and total = moved + remaining.
+    {
+      let remStacks = 0, remItems = 0
+      for (const sc of sourceChests) {
+        if (sortStopRequested || tok !== moveToken) break
+        const block = bot.blockAt(sc)
+        if (!block || !isContainer(block)) continue
+        try {
+          if (!(await gotoPos(sc))) continue
+          const chest = await bot.openChest(block)
+          for (const it of chest.containerItems()) {
+            if (!it || it.name.includes('shulker')) continue
+            if (category && categoryOf(it.name) !== category && !(category === 'paper' && it.name === 'sugar_cane')) continue
+            remStacks++; remItems += it.count
+          }
+          chest.close()
+        } catch (e) {}
+      }
+      job.total = job.moved + remStacks
+      job.totalItems = job.movedItems + remItems
+      brain.sortJob = job; saveBrain()
+      if (!remStacks) { say('nothing to sort here — the chests are empty or already sorted'); job.status = 'done'; brain.sortJob = job; saveBrain(); sortingNow = false; return }
+    }
+    let carried = [] // { type, metadata, count, name, fromPos }
+    let skippedShulkers = 0
+    let failed = 0
+    const interrupted = () => sortStopRequested || tok !== moveToken
+    // scan + move, one source chest at a time
+    for (const sc of sourceChests) {
+      if (interrupted()) break
+      const block = bot.blockAt(sc)
+      if (!block || !isContainer(block)) continue
+      let chest
+      try { if (!(await gotoPos(sc))) continue; chest = await bot.openChest(block) } catch (e) { continue }
+      let items = []
+      try { items = chest.containerItems().filter(i => i) } catch (e) { items = [] }
+      // plan this chest's work list (skip shulkers entirely)
+      const work = []
+      for (const it of items) {
+        if (it.name.includes('shulker')) { skippedShulkers++; continue }
+        if (category && categoryOf(it.name) !== category && !(category === 'paper' && it.name === 'sugar_cane')) continue
+        work.push(it)
+      }
+      // withdraw in batches (leave inventory room for the trip back)
+      for (const it of work) {
+        if (interrupted()) { log('sort: withdraw loop interrupted (stop=' + sortStopRequested + ' tok=' + (tok !== moveToken) + ')'); break }
+        if (bot.inventory.items().length >= 30) { log('sort: inventory full (' + bot.inventory.items().length + ' stacks), depositing batch'); break } // full — deposit this batch first
+        const take = Math.min(it.count, 64)
+        try {
+          await chest.withdraw(it.type, it.metadata, take)
+          carried.push({ type: it.type, metadata: it.metadata, count: take, name: it.name, fromPos: sc, enchanted: itemIsEnchanted(it) })
+        } catch (e) { log('sort: withdraw ' + it.name + ' failed: ' + e.message) }
+      }
+      try { chest.close() } catch (e) {}
+      // deposit the batch we just took from this chest — tools first,
+      // best tier first, so the tools column fills top-down best-to-worst
+      carried.sort((a, b) => {
+        const ta = TOOL_SUFFIX.test(a.name) ? toolTier(a.name) : 99
+        const tb = TOOL_SUFFIX.test(b.name) ? toolTier(b.name) : 99
+        return ta - tb
+      })
+      for (const item of [...carried]) {
+        if (interrupted()) break
+        const res = await routeCarried(item)
+        carried.splice(carried.indexOf(item), 1)
+        if (res === 'stored' || res === 'trashed' || res === 'dropped' || res === 'paper') { job.moved++; job.movedItems += item.count }
+        else {
+          failed++
+          // nowhere to put it: back where it came from, don't strand it in Segs' inventory
+          await depositIntoChest(item.fromPos, item)
+        }
+      }
+      brain.sortJob = job; saveBrain()
+      if (interrupted()) break
+      // if the inventory filled mid-chest, loop the same chest again
+      // (the outer loop moves on; the chest will be re-scanned next sort)
+    }
+    // done or interrupted — put back anything still carried
+    if (carried.length) {
+      for (const item of [...carried]) {
+        let back = await depositIntoChest(item.fromPos, item)
+        if (!back) { for (const sc of sourceChests) { if (await depositIntoChest(sc, item)) { back = true; break } } }
+        if (!back) say(`couldnt put back ${item.count}x ${item.name}, still carrying it`)
+        carried.splice(carried.indexOf(item), 1)
+      }
+    }
+    sortingNow = false
+    if (interrupted()) {
+      job.status = 'paused'
+      brain.sortJob = job; saveBrain()
+      sortPausedByStop = true
+      sortStopRequested = false
+      say(`stopped sorting — put back what i was carrying. moved ${job.moved} stacks, ${failed} couldnt go anywhere${skippedShulkers ? `, left ${skippedShulkers} shulker boxes alone` : ''}. say "segs continue last sorting" when you want me to pick it up again`)
+      logEvent('sort', `paused: moved ${job.moved} stacks, ${failed} failed`)
+      return
+    }
+    job.status = 'done'
+    brain.sortJob = job; saveBrain()
+    bumpStat('itemsSorted', job.movedItems); bumpStat('sortsDone', 1)
+    say(`done sorting — moved ${job.moved} stacks (${job.movedItems} items)${failed ? `, ${failed} stacks couldnt go anywhere (no column and no misc)` : ''}${skippedShulkers ? `, left ${skippedShulkers} shulker boxes alone` : ''}`)
+    logEvent('sort', `done: moved ${job.moved} stacks (${job.movedItems} items), ${failed} failed`)
+  }
+  // "Segs continue last sorting" — report first, wait for the answer.
+  async function askContinueSorting () {
+    const job = brain.sortJob
+    if (!job || job.status === 'done' || (!job.moved && job.status !== 'paused')) { say('i dont have a sorting job to continue — tell me what to sort: segs sort my room'); return }
+    if (job.status === 'running') { say('im already sorting that one, wait a bit or say stop'); return }
+    const left = Math.max(0, (job.total || 0) - job.moved)
+    say(`last sorting was ${job.kind === 'category' ? 'the ' + job.category : 'your whole room'} from ${job.source} — i moved ${job.moved} stacks, ${left} left. do you want me to continue this one, or do another sorting? if another one, which one?`)
+    pendingContinue = { job }
+    logEvent('sort', `asked to continue: ${job.kind} ${job.category}, ${job.moved} moved, ${left} left`)
+  }
+  // "Segs make paper" — take sugarcane from the sugarcane farm chests,
+  // craft paper, put it in the paper column.
+  async function makePaper () {
+    if (!columnFor('paper')) { say('i dont know the paper column yet — take me there and tell me: segs this is the paper column'); return }
+    let caneChests = (brain.sugarcaneChests || []).map(p => new Vec3(p[0], p[1], p[2]))
+    if (!caneChests.length) {
+      const mark = Object.values(brain.landmarks || {}).find(l => l.type === 'chest' && l.name.includes('sugarcane'))
+      if (mark) caneChests = [new Vec3(mark.pos[0], mark.pos[1], mark.pos[2])]
+    }
+    if (!caneChests.length) { try { caneChests = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 8, count: 4 }) } catch (e) {} }
+    if (!caneChests.length) { say('i cant see any chest with sugarcane — show me the sugarcane farm chests first'); return }
+    let totalCane = 0
+    for (const cp of caneChests) {
+      const block = bot.blockAt(cp)
+      if (!block || !isContainer(block)) continue
+      try {
+        if (!(await gotoPos(cp))) continue
+        const chest = await bot.openChest(block)
+        const cane = chest.containerItems().find(i => i && i.name === 'sugar_cane')
+        if (cane) {
+          const take = Math.min(cane.count, 27)
+          try { await chest.withdraw(cane.type, cane.metadata, take); totalCane += take } catch (e) {}
+        }
+        chest.close()
+      } catch (e) {}
+      if (totalCane >= 27) break
+    }
+    if (!totalCane) { say('no sugarcane in the chests'); return }
+    const made = await craftPaper(totalCane)
+    if (!made) return // craftPaper already said why
+    const paper = { type: mcDataFor(bot.version).itemsByName.paper.id, metadata: 0, count: made, name: 'paper' }
+    if (await depositIntoColumn('paper', paper)) say(`made ${made}x paper and put it in the paper column`)
+    else say(`made ${made}x paper but the paper column is full or missing, still carrying it`)
+  }
+
+
+  // ================= v9: SORTING + COLUMNS + BASE MAP =================
+  // One COLUMN = one category (16 categories). A column is a vertical
+  // stack of chests/barrels, up to 10 tall, taught once by walking Segs
+  // there ("Segs this is the ore column"). Segs records the chests and
+  // remembers item -> chest, so the next sort goes straight there.
+  const SORT_CATEGORIES = ['flowers', 'building', 'ores', 'tools', 'foods', 'farm', 'paper', 'woods', 'redstone', 'mob drops', 'nether', 'valuables', 'brewing', 'armor', 'seeds', 'misc']
+  // What the owner says -> category. "the ore column" -> ores, "the tool column" -> tools, ...
+  const COLUMN_WORDS = { flower: 'flowers', building: 'building', block: 'building', ore: 'ores', tool: 'tools', food: 'foods', farm: 'farm', paper: 'paper', wood: 'woods', redstone: 'redstone', drop: 'mob drops', mob: 'mob drops', nether: 'nether', valuable: 'valuables', treasure: 'valuables', brew: 'brewing', potion: 'brewing', armor: 'armor', seed: 'seeds', plant: 'seeds', misc: 'misc' }
+  // A container Segs may open: chest / trapped chest / barrel. NEVER a
+  // shulker box (the owner's private storage — off limits without his
+  // explicit permission) and never an ender chest (that's per-player).
+  function isContainer (b) {
+    if (!b || !b.name) return false
+    if (b.name.includes('shulker') || b.name === 'ender_chest') return false
+    return b.name.includes('chest') || b.name === 'barrel'
+  }
+  // Is this item enchanted? prismarine-item exposes .enchants; fall back
+  // to the raw NBT (26.3 uses lowercase `enchantments`). Enchanted items
+  // ALWAYS go to Misc and are NEVER thrown away — the owner might have
+  // kept netherite gear in a chest and losing it would be a big issue.
+  function itemIsEnchanted (item) {
+    if (!item) return false
+    try { if (item.enchants && item.enchants.length) return true } catch (e) {}
+    try {
+      const n = item.nbt && item.nbt.value
+      if (n) {
+        const enc = n.enchantments || n.Enchantments
+        if (enc) { const list = enc.value && enc.value.value ? enc.value.value : enc.value; if (list && list.length) return true }
+      }
+    } catch (e) {}
+    return false
+  }
+  // Junk = thrown away (trash chest, else dropped on the ground): rotten
+  // flesh, arrows, and NON-enchanted low-tier tools/weapons/armor
+  // (wood/stone/iron/gold/leather). Diamond/netherite is never junk.
+  const JUNK_NAMES = new Set(['rotten_flesh', 'arrow', 'spectral_arrow', 'tipped_arrow'])
+  function isJunk (item) {
+    if (!item || itemIsEnchanted(item)) return false
+    if (JUNK_NAMES.has(item.name)) return true
+    const m = item.name.match(/^(wooden|stone|iron|golden|leather)_(.+)$/)
+    if (m && /^(pickaxe|axe|shovel|hoe|sword|bow|crossbow|helmet|chestplate|leggings|boots)$/.test(m[2])) return true
+    return false
+  }
+  // Tool tier for the tools column: best at the TOP chest, worst at the
+  // bottom. (Owner's order; gold sits between iron and stone — correct
+  // him if he wants it elsewhere.)
+  function toolTier (name) {
+    if (name.startsWith('netherite_')) return 0
+    if (name.startsWith('diamond_')) return 1
+    if (name.startsWith('iron_')) return 2
+    if (name.startsWith('golden_')) return 3
+    if (name.startsWith('stone_')) return 4
+    if (name.startsWith('wooden_')) return 5
+    return 2 // no material in the name (bow, crossbow, fishing rod, shears, trident, mace) — mid
+  }
+  // Which column does an item belong in? Order matters: exact farm items
+  // first (potato/carrot are also foods), redstone before building
+  // ('redstone' contains 'stone'), woods before nether (warped planks
+  // are wood). Anything unmatched -> misc.
+  const TOOL_SUFFIX = /_(pickaxe|axe|shovel|hoe|sword)$|^bow$|^crossbow$|^fishing_rod$|^shears$|^flint_and_steel$|^trident$|^mace$/
+  const ARMOR_SUFFIX = /_(helmet|chestplate|leggings|boots)$|^shield$|^elytra$|_horse_armor$/
+  function categoryOf (name) {
+    if (!name) return 'misc'
+    if (name === 'wheat' || name === 'potato' || name === 'carrot') return 'farm'
+    if (name === 'paper' || name === 'book' || name === 'writable_book' || name === 'sugar_cane') return 'paper'
+    if (TOOL_SUFFIX.test(name)) return 'tools'
+    if (ARMOR_SUFFIX.test(name)) return 'armor'
+    if (/^(cooked_|baked_)/.test(name) || /_stew$/.test(name) || ['bread', 'apple', 'golden_apple', 'melon_slice', 'pumpkin_pie', 'cookie', 'cake', 'mushroom_stew', 'suspicious_stew', 'beetroot_soup', 'rabbit_stew', 'honey_bottle', 'milk_bucket', 'chorus_fruit', 'sweet_berries', 'glow_berries', 'dried_kelp', 'beetroot', 'cod', 'salmon', 'tropical_fish', 'poisonous_potato'].includes(name)) return 'foods'
+    if (/_log$|_planks$|_wood$/.test(name) || name === 'stick' || name === 'ladder' || name === 'bamboo') return 'woods'
+    if (/^raw_(iron|gold|copper)$/.test(name) || /^(iron|gold|copper|coal)_ingot$/.test(name) || /^(iron|gold|copper|coal)_block$/.test(name) || name === 'coal' || name === 'charcoal' || name === 'flint') return 'ores'
+    if (['diamond', 'emerald', 'netherite_ingot', 'netherite_scrap', 'ancient_debris', 'lapis_lazuli', 'amethyst_shard', 'echo_shard', 'heart_of_the_sea', 'dragon_egg', 'totem_of_undying', 'nether_star', 'eye_of_ender'].includes(name) || /^(diamond|emerald|netherite|lapis|amethyst)_block$/.test(name)) return 'valuables'
+    if (/redstone|repeater|comparator|piston|observer|hopper|dropper|dispenser|_rail$|lever|button|pressure_plate|daylight_detector|target|lightning_rod|tripwire_hook|note_block|jukebox|sculk_sensor/.test(name)) return 'redstone'
+    if (['nether_wart', 'blaze_rod', 'blaze_powder', 'ghast_tear', 'magma_cream', 'fermented_spider_eye', 'sugar', 'glistering_melon_slice', 'golden_carrot', 'pufferfish', 'glass_bottle', 'dragon_breath'].includes(name) || /_potion$/.test(name)) return 'brewing'
+    if (['bone', 'string', 'gunpowder', 'spider_eye', 'ender_pearl', 'slime_ball', 'phantom_membrane', 'rabbit_hide', 'rabbit_foot', 'ink_sac', 'glow_ink_sac', 'prismarine_shard', 'prismarine_crystals', 'nautilus_shell', 'scute', 'wither_skeleton_skull', 'skeleton_skull', 'zombie_head', 'creeper_head', 'dragon_head', 'piglin_head'].includes(name)) return 'mob drops'
+    if (/^(netherrack|nether_quartz|quartz|glowstone|soul_sand|soul_soil|basalt|blackstone|nether_brick|nether_wart_block|warped_|crimson_)/.test(name) || name === 'glowstone_dust') return 'nether'
+    if (/stone|brick|concrete|terracotta|glass|sand|gravel|dirt|stairs|slab|wall|pillar|andesite|diorite|granite|deepslate|tuff|calcite|prismarine|purpur|end_stone|obsidian|crying_obsidian|clay|mud|packed_mud|ice|snow|wool|carpet|torch|lantern|candle|chain|fence|door|trapdoor|sign|banner|flower_pot|cauldron|anvil|grindstone|smithing_table|stonecutter|loom|composter|barrel|chest|bookshelf|lectern|enchanting_table|beacon|conduit|respawn_anchor|lodestone/.test(name)) return 'building'
+    if (/poppy|dandelion|tulip|orchid|allium|cornflower|lily|rose|sunflower|peony|lilac|daisy|oxeye|wither_rose|torchflower|pitcher|blue_orchid|azure_bluet/.test(name)) return 'flowers'
+    if (/seed|sapling|mushroom|kelp|vine|cactus|chorus_plant|chorus_flower|azalea|spore_blossom|hanging_roots|glow_lichen|moss|fern|grass|tall_grass|dead_bush/.test(name)) return 'seeds'
+    return 'misc'
+  }
+  // Scan the chests/barrels of one column: everything within 2 blocks
+  // horizontally of the taught spot, from 2 below it to 10 above (a
+  // column is a vertical stack, up to 10 tall, with stairways).
+  function scanColumnChests (pos) {
+    let found = []
+    try { found = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 12, count: 40 }) } catch (e) {}
+    const inCol = found.filter(p => Math.abs(p.x - pos.x) <= 2 && Math.abs(p.z - pos.z) <= 2 && p.y >= pos.y - 10 && p.y <= pos.y + 10)
+      .sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z) // bottom to top
+    // a double chest is two adjacent blocks sharing one 54-slot
+    // inventory — keep only the first half, or Segs opens the same
+    // inventory twice per level.
+    const kept = []
+    const seen = new Set()
+    for (const p of inCol) {
+      const key = p.x + ',' + p.y + ',' + p.z
+      if (seen.has(key)) continue
+      const west = (p.x - 1) + ',' + p.y + ',' + p.z
+      const north = p.x + ',' + p.y + ',' + (p.z - 1)
+      if (seen.has(west) || seen.has(north)) continue // second half of a double chest
+      seen.add(key)
+      kept.push(p)
+    }
+    return kept
+  }
+  function columnFor (category) { return (brain.columns || {})[category] || null }
+  // A column taught with no type word ("Segs this is a column") is a
+  // blank column. When a sort needs a column for a category that has
+  // none, Segs claims the first blank one for it.
+  function claimBlankColumn (category) {
+    const cols = brain.columns || {}
+    for (const key of Object.keys(cols)) {
+      const c = cols[key]
+      if (!c.category) {
+        c.category = category
+        delete cols[key]
+        cols[category] = c
+        saveBrain()
+        logLearn('column', `claimed blank column at ${c.pos.join(', ')} for ${category}`)
+        return c
+      }
+    }
+    return null
+  }
+  // Deposit one item stack into a column's chests. BOTTOM-FIRST for
+  // every column, then gradually up: Segs fills the bottom chest, and
+  // only moves to the next one up when the one below is full. (Tash's
+  // rule, 2026-11-07 — the old tools top-first reversal is gone.)
+  // Uses the remembered item -> chest first (it goes straight there if
+  // that chest still has room), else scans the column's chests in
+  // order. Returns true if it got in somewhere.
+  async function depositIntoColumn (category, item) {
+    const col = columnFor(category)
+    if (!col || !col.chests || !col.chests.length) return false
+    const order = col.chests // bottom to top (scanColumnChests sorts by y)
+    const tryChests = []
+    // v9: only trust the remembered chest if it is actually IN this
+    // column. The index is keyed by item name, so an enchanted diamond
+    // sword would otherwise inherit the plain diamond sword's remembered
+    // chest (the tools column) and land in tools instead of misc.
+    // (Run 41k proved it: the [ENCH] sword went to the tools top chest.)
+    const remembered = (brain.itemChest || {})[item.name]
+    if (remembered && col.chests.some(c => c[0] === remembered[0] && c[1] === remembered[1] && c[2] === remembered[2])) tryChests.push(new Vec3(remembered[0], remembered[1], remembered[2]))
+    for (const cp of order) tryChests.push(new Vec3(cp[0], cp[1], cp[2]))
+    const seen = new Set()
+    for (const cp of tryChests) {
+      const key = cp.x + ',' + cp.y + ',' + cp.z
+      if (seen.has(key)) continue
+      seen.add(key)
+      const block = bot.blockAt(cp)
+      if (!block || !isContainer(block)) continue
+      try {
+        if (!(await gotoPos(cp))) continue
+        const chest = await bot.openChest(block)
+        try { await chest.deposit(item.type, item.metadata, item.count) } catch (e) { chest.close(); continue }
+        chest.close()
+        brain.itemChest[item.name] = [cp.x, cp.y, cp.z]
+        saveBrain()
+        return true
+      } catch (e) { log('deposit: chest at ' + cp + ' failed: ' + e.message) }
+    }
+    return false
+  }
+  // Take one stack out of a chest. Returns how many were actually taken.
+  async function withdrawFromChest (chestPos, item) {
+    const block = bot.blockAt(chestPos)
+    if (!block || !isContainer(block)) return 0
+    try {
+      if (!(await gotoPos(chestPos))) return 0
+      const chest = await bot.openChest(block)
+      const have = chest.containerItems().find(i => i && i.type === item.type && i.metadata === item.metadata)
+      if (!have) { chest.close(); return 0 }
+      const take = Math.min(item.count, have.count)
+      try { await chest.withdraw(item.type, item.metadata, take) } catch (e) { chest.close(); return 0 }
+      chest.close()
+      return take
+    } catch (e) { log('withdraw: chest at ' + chestPos + ' failed: ' + e.message); return 0 }
+  }
+
   const KEEP_ITEMS = ['pickaxe', 'axe', 'shovel', 'sword', 'hoe', 'fishing_rod', 'bow', 'crossbow', 'shield', 'helmet', 'chestplate', 'leggings', 'boots', 'elytra', 'trident']
   async function storeItems () {
     if (!brain.permanentHome) { say('i dont have a permanent home yet — stand in my room and tell me: segs remember this is your permanent home'); return }
@@ -1731,10 +2361,12 @@ function createBot () {
     updateSprint() // sprint when fed, walk when hungry — before every walk
     const tok = moveToken
     const stopped = () => tok !== moveToken
+    const from = bot.entity ? bot.entity.position.clone() : null
     try {
       await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2))
       return true
     } catch (e) {
+      log(`gotoPos FAIL: from ${from} to ${pos.x},${pos.y},${pos.z}: ${e.message} (still at ${bot.entity ? bot.entity.position : '?'})`)
       if (stopped()) return false // cancelled by a stop command, not a failure
       log('goto failed, retrying in stages: ' + e.message)
     }

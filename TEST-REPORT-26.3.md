@@ -640,3 +640,182 @@ Test server: local Paper 26.3 build 244, port 25569, same harness as v7
 - Long wild cross-country walks (unchanged from v7).
 - Lava/magma routing around a strip (see runs 32-36 above) and the
   /home warmup teleport on real HomePlugin.
+
+## v9 appendix (2026-11-07) — smart sorting, base map, paper, stop/resume
+
+Test world: the same Paper 26.3 server (port 25569), but the terrain
+fought back harder than in v8. The ground between the room and the
+columns varies y=68..71 with 2-block steps the fork's pathfinder cannot
+climb, so every sort walk timed out at first. The fix was a flat stone
+platform (`/fill -155 70 150 -128 70 162 stone` + air above) with the
+columns in two rows 6 blocks apart and the room chests 8 blocks east.
+Layout (all on the slab, walking surface y=71): row z=158 — ore (-144,
+3 chests), food (-148, 2), tools (-152, 3); row z=152 — misc (-144, 2),
+paper (-148, 2), farm (-152, 2). Room chests (-136,71,156) and
+(-135,71,156). Trash chest (-134,71,150). Crafting table (-140,71,158).
+Sugarcane chest (-130,71,158). Teach spots 1 block from each column.
+
+### Run 37 — build + teach (original y=70 layout): SUCCESS
+Storage unit, room, all 6 columns (3/2/3/2/2/2 chests), trash chest,
+sugarcane chest and the trading hall area all taught and listed
+correctly. Lesson: "this is my room" at maxDistance 8 caught 5 chests
+including the permanent-home chests — tightened to 5 + exclude any chest
+already recorded in a column.
+
+### Run 38g — full sort: PROVEN
+"done sorting — moved 25 stacks (130 items), 1 stacks couldnt go
+anywhere (no column and no misc), left 1 shulker boxes alone". Verified
+chest-by-chest with verify.js: room empty; ore col gold/iron/coal;
+food col bread/beef; farm col wheat/potato/carrot; misc col correctly
+took every category with no taught column (diamond, redstone, oak log,
+planks, poppy, bone, string, netherrack, glass bottle, lapis); trash
+chest got the junk (iron pickaxe, stone sword, wooden pickaxe, iron
+helmet, rotten flesh, arrows); the shulker box was left alone in the
+room. The "1 failed" stack was sugarcane — the craftPaper count bug
+(see below). The item→chest index populated correctly (19 items).
+
+### Run 41 — paper retest + enchanted + tools order: PROVEN (run 41o)
+After the fixes below, run 41o: "done sorting — moved 7 stacks
+(15 items)", 0 failed, 0 goto timeouts. Verified: room empty; **paper
+column = paper x9** ("[craft] made 9x paper from 9x sugarcane", no
+stranded cane); **misc column = the enchanted Sharpness diamond sword**
+([ENCH] marker); **tools top chest = netherite pickaxe, netherite
+sword, diamond pickaxe, diamond sword, bow** — best first, top-down.
+Segs ended carrying only the test-artifact diamond sword (the
+/item replace from-entity copy left one in its hand; not a bot bug).
+
+### Run 42b — stop / resume: PROVEN
+20 stacks in the room (~60s sort). "Segs stop" at ~20s: "stopped
+sorting — put back what i was carrying. moved 1 stacks, 0 couldnt go
+anywhere. say \"segs continue last sorting\" when you want me to pick
+it up again". "Segs continue last sorting": "last sorting was your
+whole room from my room — i moved 1 stacks, 19 left. do you want to
+continue this one, or do another sorting? if another one, which one?"
+A bare "continue" (no "Segs" prefix) resumed it: "ok, continuing it",
+then "done sorting — moved 20 stacks (108 items)". Room empty, brain
+sortJob status done, moved 20 / total 20 (cumulative count correct).
+
+### Run 43 — category sort: PROVEN
+Room held ores + food mixed. "Segs move the ores to the ore column":
+moved 4 stacks (20 items) — iron, gold, raw iron, coal — into the ore
+column. The food (bread, cooked beef, apple) stayed in the room, and
+the food column stayed empty. Only the named category moves.
+
+### Bugs found and fixed during v9 testing
+- **Segs answered the owner's `/commands`.** `<OrewaSegs> /enchant Segs
+  sharpness 3` passed the addressed check and got "hmm, i didn't get
+  that". Fix: the chat handler ignores any message starting with `/`.
+  Also added "replaced" to the Paper command-feedback filter (the
+  "Replaced 1 slot(s) on Segs with [Diamond Sword]]" broadcast was
+  answered the same way).
+- **craftPaper made 3 paper from 9 cane.** `bot.craft(recipe, 3, table)`
+  does not reliably craft 3 times in this fork. Rewrote to craft one at
+  a time, counting real paper before/after — but then only the FIRST
+  craft in the loop made paper (later calls returned without throwing
+  and made nothing). Fix: re-fetch the recipe (and re-find the table)
+  every step, plus a 200ms pause. Run 41o: 9 cane → 9 paper.
+- **craftPaper could not find the table.** The table at (-140,71,158)
+  was destroyed by the platform air fill (run 39), and later the search
+  radius (10) was too small — when the sort processes cane last, Segs
+  is already at a far column ~11 blocks from the table. Fix: re-place
+  the table in the test setup; radius 10 → 16.
+- **Enchanted sword went to tools, not misc.** Two causes. (1) The sort
+  builds a plain carried object {type, metadata, count, name} that
+  drops the item's enchant data, so itemIsEnchanted() always returned
+  false mid-sort. Fix: store `enchanted: itemIsEnchanted(it)` when
+  withdrawing, and check the flag in routeCarried. (2) Even after that,
+  the sword still landed in tools: depositIntoColumn tries the
+  remembered item→chest first, and brain.itemChest['diamond_sword']
+  pointed at the tools top chest (from the plain sword). Fix: only
+  trust the remembered chest if it is actually in the target column's
+  chest list.
+- **Segs could not climb to upper column chests.** The tools/ore
+  columns are 3 chests tall (top chest y=73) and the pathfinder had
+  `allowParkour = false`, so every goto to an upper chest timed out
+  (25s + 20s staged retry) and Segs wandered off the platform into a
+  dip at y=69, where it got stuck. Fix: `allowParkour = true` (the
+  columns have stairways by design, Segs must climb them) + wide 3x2
+  step platforms (top y=72) south of the 3-tall columns instead of
+  narrow 1-wide stairs Segs kept falling off + a y=69 valley-floor fill
+  so a fall lands 1 block down, not in a trap. Run 41o/42b/43: 0 goto
+  timeouts.
+- **Sort moved 0 stacks (run 41g).** Segs' inventory was polluted with
+  32 stacks left over from earlier failed test sorts, and the withdraw
+  guard (`>= 30` stacks) refused to take anything. Test fix: `/clear
+  Segs` before the fill. (On the real server this is the correct
+  behaviour — a full inventory cannot sort; Segs says so in chat.)
+- **Bare "continue" was ignored (run 42).** handleTalk's addressed
+  gate (`must contain "segs"`) runs before the pendingContinue check,
+  so replying "continue" to Segs' "do you want me to continue?" was
+  dropped. Fix: the pendingContinue check now runs BEFORE the
+  addressed gate, for the owner only.
+- **Paper count lag (run 41l).** The inventory can lag a tick behind
+  the last craft, so the paper count read 6 when 9 were actually there
+  and 3 paper stranded in Segs' inventory. Fix: 300ms pause + recount
+  before returning the made count.
+
+### v9.1 — runs 44–45 (owner-only stop, bottom-first fill, double-chest columns)
+
+Tash built the real storage unit: 16 columns, 10 DOUBLE chests each,
+beside the base area, with Segs' own room to be built there too (a
+factory/warehouse). He asked for three things: bottom-first fill, and
+only OrewaSegs can command Segs. Three changes, all tested.
+
+Run 44 (double-chest column + bottom-first tools): PROVEN.
+- Built a column of 10 double chests (20 blocks) at (-140/-139,
+  y71-80, z158) with /fill and taught it: "ok, this is the valuables
+  column — 10 chests, i will remember it". 10, not 20 — the double-
+  chest dedup works, and the widened scan (radius 12, y -10..+10)
+  reached the top chest (y=80) from the ground floor.
+- Sorted 3 tools into the tools column. verify.js: bottom chest
+  (y=71) = netherite_pickaxe x1, diamond_pickaxe x1; mid and top
+  EMPTY. Bottom-first, not top-first (run 41o put them in the top).
+  The wooden_pickaxe went to the trash chest (it is junk — non-
+  enchanted wooden tool — the junk rule still holds).
+
+Run 45 (non-owner stop): PROVEN.
+- A "Stranger" bot (not OrewaSegs) said "Segs stop" mid-sort (20
+  stacks in the room) and then "Segs sort my room". Segs IGNORED
+  both and the sort finished: "done sorting — moved 20 stacks
+  (108 items), 0 failed". verify.js: room empty; ores filled the
+  bottom chest first then overflowed to the mid chest (bottom-first
+  confirmed for a multi-chest fill too).
+
+Bugs found in v9.1 (all fixed in the shipped bot.js):
+1. Owner-only hole: the chat listener's immediate "stop" had no
+   owner check — any player could cancel Segs' walk and pause a
+   sort. Now gated on isOwner(username). (The queued order handler
+   already had the gate; only this immediate path was open.)
+2. Column scan could not reach a 10-tall column: findBlocks
+   maxDistance was 6 (the top chest is ~10 blocks above the ground
+   floor) and the y filter was -2..+10 (missed the bottom when
+   taught from a higher floor). Now maxDistance 12, y -10..+10,
+   count 40.
+3. Double chests were counted twice (two blocks, one inventory).
+   scanColumnChests now keeps only the first half of each double
+   chest (skips a block whose west or north neighbour at the same
+   y is already kept).
+
+### What is still NOT proven (v9)
+- The real youniga.deployd.sh server — Tash must test it (unchanged).
+  In particular: real-server sorting (his room ↔ storage unit
+  distances on flat built ground, stairway climbing to upper column
+  chests — proven in simulation on a platform, not on his build yet),
+  and whether the 10-block column height works with his stairways.
+- SimpleGraves' real grave block type + shift+right-click take-all
+  (unchanged from v8).
+- The exact /home warmup teleport on real HomePlugin and the real
+  French messages arriving as system chat (unchanged from v8).
+- Long wild cross-country walks (unchanged from v7/v8). Sort walks are
+  short by design (room ↔ columns within one base), but if Tash's room
+  is far from the storage unit the walks inherit this limit — the sort
+  says so honestly ("i cant reach there") rather than pretending.
+- The tools tier order (netherite > diamond > iron > gold > stone >
+  wood) is a guess Tash has not corrected yet.
+- Auto-create column (claiming a blank column for an untaught category)
+  is built but not simulation-tested (no blank column was taught in
+  the test runs). Same for "Segs make paper" as a standalone command
+  (paper crafting itself is proven via the sort).
+- v9.1 changed tools to bottom-first like every other column. The
+  "best tools at the top" tier-to-chest rule is dropped unless Tash
+  says he wants it back — asked in the v9.1 delivery message.
