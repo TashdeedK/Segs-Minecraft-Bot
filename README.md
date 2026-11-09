@@ -1,11 +1,394 @@
-# Segs — Free Minecraft Bot — v9.4 (NATIVE 26.3, no ViaVersion)
+# Segs — Free Minecraft Bot — v10.5.3 (NATIVE 26.3, no ViaVersion)
 
 100% free. No paid account, no AI chat. Runs on Node.js 22+.
 Talk to it like a person. No `!` needed.
 
-**v9 is v8 + smart sorting into a 16-column storage unit, a base map it
-remembers, paper auto-crafting, and sort jobs you can stop and resume.**
-Same native 26.3 fork build (Misty4119 six-repo Mineflayer fork, protocol 777).
+## What's new in v10.5.3 (2026-11-09) — the full pathfinding sweep: idle-jump A/B proof, water prevention, walking sweep, creeper bow, stuck timeout
+
+All simulation-tested on the Paper 26.3 test server (port 25569). Runs 141–163, plus the full regression set (72, 74, 75, 99, 101–105, 109–112, 119–121, 123, 124, 127–133, 136–140) re-run on the final bot: **26 PASS, 2 FAIL (both fixed and retested PASS below), 2 INCONCLUSIVE** (123 and 137 — food never dropped in the window; auto-eat proven by 137–140).
+
+- **Idle jump — A/B PROVEN (runs 141–142).** The v10.5.1 fix was never A/B-proved, so this sweep did it: a scratch copy with the fix reverted (jumpPulse step-gate removed, stopJumpPulse removed from the direct-OK return) jumped **27 times in 60s** on flat land after a goto (run 141); the fixed bot on the same geometry jumped **0 times in 60s** (run 142). The fix is the cause, not luck.
+- **Legit jumps — all retested and PASS.** 1-block ledge up (run 143: "here", arrived (-85.3,72,158.5) on the ledge, hp 20/20 — the first attempt's script sent "follow me" instead of "go to", so it proved the ledge climb in follow mode; fixed and re-run as a goto), 2-high wall sidestep on flat land (run 144: "gotoPos OK (final step) at (-89.68,71,170.39)", hp 20/20), dip climb (run 145: "gotoPos OK (after climb assist) at (-127.45,71,160.50)", hp 20/20), stairs UP + DOWN + wall sidestep (run 146: up "gotoPos OK (after climb assist) at (-91.5,74,160.5)", down "gotoPos OK (direct)" in 1s, wall "gotoPos OK (after early sidestep) at (-103.53,71,159.5)", hp 20/20). **Two fixes on the way:** the cancelled UP climb assist used to LEAK and keep driving Segs after a cancel (the original run 146 failure) — climbAssist now captures the goto token and checks it at every step; and the wall leg first failed on the LEFTOVER run-148 river (the bot correctly refused the water) — the test setup now clears it to stone first.
+- **Water climb-out — IMPROVED to flaky, NOT fixed (runs 147 + 148).** Honest verdict: 2 OUTs in the last 4 attempts (run 148's climb-out in 8s, run 147-retest's 2nd attempt in 3s; the other two failed with feet pinned at 70.40–70.51). Paper decompile proves why it is a coin flip: the server's player sim never sets `jumping` from the client (ServerPlayer.java has no `jumping` reference at all; `handlePlayerInput` only stores `lastClientInput`, which nothing reads), so the server trusts the client's positions within tolerance and snaps Segs back when his rise is too fast. The fork's climb rise caps at feet ~70.4–70.7 vs the 71.0 shore top — inside the 0.6 step-up range, so it sometimes makes it and sometimes does not. The honest fallback stands (dry detour first, 60s water cap, stop + /tpa offer). **What IS fixed: prevention.** Run 148 (no dry route) now PASSES end-to-end: the A* refuses water (two new fork patches — head-water and no-water-landing), the climb assist bails on liquid (see below), the goto fails honestly instead of reporting "here" in the river, and Segs says "i cant reach there — the way goes through water..." in 18s while staying dry on the west bank at y=71, hp 20/20. Run 149 (dry detour) PASS, zero water lines. **Root causes found on the way (7 attempts):** the test platform was a 1-thick slab over a natural under-slab cave the A* routed into (sealed with an under-fill in the test setup); `bot.blockAt(...).liquid` is ALWAYS undefined (prismarine-block has no `.liquid` property — every climbAssist liquid check was a silent no-op until it was replaced with a name-based `isLiquid` check); and the fork's `goto()` resolved an EMPTY path as SUCCESS (a no-path result from a start with zero neighbours is `[]`) — fixed by a fork patch that only resolves when the goal is actually reached.
+- **Walking sweep — all PASS (runs 150–157).** Flat goto 25 blocks in 4s (run 150), lava detour hp 20/20 (run 151), long walk + 3-block drop (run 152), fence barrier (run 153), trees obstacle — routes around, zero logs/leaves broken (run 154), follow-through-door — door opened not broken, through the door (run 155), fast follow — 33 blocks in ≤16s (≥2.1 blocks/s), ends 2 behind, tpa offer sent (run 157). **Two honest limits:** run 156 (60s stuck timeout) first failed twice for test-design reasons — Segs was tp'd INTO the glass floor, then the A* dug through the breakable glass wall (which is what a real player would do). With a BEDROCK box (unbreakable) it PASSES: "i cant reach there, too far or blocked. want me to tp to you?" in 16s, stayed in the box, hp 20/20, never auto-tpa. The non-water "cant reach there" message now offers /tpa too (it used to only offer on water). And run 157's tpa LANDING could not be verified on the test server — it has no working tpa plugin (the /tpaccept produced no teleport); Segs' side is proven (he sent /tpa, the server logged it) and /tpa is already proven on real Youniga (Tash confirmed it in v9.3).
+- **Creeper bow — final bot 8/9 arena PASS, zero hits in the 8 wins (runs 158–160, creeper5 + creeper6 + creeper7).** The flake (a release that consumes NO arrow, then Segs takes the explosion) reproduced in 2 of the 5 iterations on the way here and was chased properly: the sprint theory was DISPROVED by diagnostics (charges started while sprinting back consumed fine, 8/8), and the fork's `bot.usingHeldItem` flag is always false in this fork so it cannot tell whether the bow use registered. The mechanism is still unknown — the 8/9 is a clean result on the final bot, not a proven fix for the flake (0/26 consumed:NO shots since creeper3). What the final bot does have: the pending release timer is cancelled when the creeper gets inside fuse range (so a flee never races a release), the release is guarded on the bow still being the held item (so a mid-charge weapon swap can never fire a release on a sword), and a **flee-isn't-working detector** — when Segs has been fleeing a creeper for 500ms without moving more than 0.5 blocks (cornered at a wall), he fights it with the sword instead of standing still; two sword hits kill a creeper before its fuse finishes. The detector fired correctly once (creeper6-160) but 1s was too slow — the 500ms threshold went 3/3 in creeper7 with zero hits taken. Two fixes tried and REVERTED on the way because they made things worse: a charge-start distance gate (starved the offense when cornered) and a no-charge-while-sprinting gate (blocked the killing 3rd shot twice — creeper4 went 0/3 with it, 3/3 without it).
+- **Regression caught two real bugs, both fixed and retested PASS.** (1) **Run 127 — the water prevention blocked grave recovery:** Segs died in a river and the recovery goto refused the underwater grave. Fix: a grave-only water exemption (`gotoPos(pos, { allowWater: true })` — the only caller is `recoverGrave`), backed by a fifth fork patch (`pathfinder-allow-water`) that lets the A* swim through water for that one goto only, plus gates on the climbAssist liquid checks, the water watchdog and the progress timer. Clean retest PASS: "got my stuff back from my grave (18 items)" in 24s, hp 20/20, exact items. (2) **Run 75 — cornered creeper:** the flee-detector above, 3/3 in creeper7. **Run 148 note:** the clean re-runs "arrived" in 6s with zero water lines — not a prevention failure. Mid-goto probes showed Segs going around the river's SOUTH end on natural terrain (z>170) — the river only spans the artificial platform, so a dry detour exists and Segs correctly took it. The no-dry-route refusal is still proven by attempt 7 (stayed west, reported in 18s).
+- **Five new fork patches ship in this zip** (applied by setup-26.3.sh/.bat + link-prismarine.js, alongside the two v10.5.1 patches): `mineflayer-player-input` (sends the full input state via `player_input` on control change, 26.3 only), `pathfinder-head-water` (water at feet or head level is never a route), `pathfinder-no-water-landing` (never plan a drop into water), `pathfinder-goto-empty-path` (an empty A* path is a failure, not a success), `pathfinder-allow-water` (lets the A* swim through water when — and only when — the bot asks for it, for grave recovery).
+
+## What's new in v10.5.2 (2026-11-09) — ONE bug: the eat-drop, packet-proven and fixed
+
+All simulation-tested on the Paper 26.3 test server (port 25569). Runs 134–140, plus the full v10.5.1 regression set re-run (72, 74, 75, 99, 101–105, 109–112, 119–121, 123, 124, 127–133).
+
+- **The eat-drop — FIXED (runs 134–140).** Tash's real-server log showed it: at 18:53:26 he said "segs eat" and Segs said "yum, done" — while the log line right before it read `eating cooked_beef (food 20/20, deficit=0)`. Eating at FULL hunger is impossible in vanilla; the beef was DROPPED, not eaten. Packet trace (run 134) proved it: every eat sent `block_dig status=5` (DROP_ITEM in 26.3) and left exactly 1 Steak on the ground; server-side `/data get` proved beef 10 → 9 → 8 across two eats at full hunger (run 135). **Root cause:** the v10.4 `deactivateItem` override (status 6 = release) was installed in `createBot()`'s synchronous body, but every plugin — including inventory, which re-assigns the fork's status-5 `deactivateItem` — is only injected at `inject_allowed` (setTimeout 0, AFTER createBot returns). The inject overwrote the override, so the auto-eat plugin's `eat()` called the fork's DROP_ITEM on every eat. (This overturns the v10.5.1 run-122c claim that the drop was not via `deactivateItem` — that claim was wrong; the override was simply dead.) **Fix:** the override is re-installed in `bot.once('spawn')`, after injection, so it survives. **Also fixed:** `eatBestFood()` now refuses at full hunger ("im already full" — a real player cannot eat at 20/20), verifies food actually rose before saying "yum, done" or counting `foodEaten`, and logs beef/food before and after every eat (the old log never did, so the −1 beef was invisible). The health handler, combat retreat, and all six `survive()` eat sites go through one guarded `tryEatOnce()` helper. **Proof:** run 136 — "Segs eat" at food 20/20 says "im already full", beef 10 → 10, 0 dropped; run 137 — three manual beef eats, each food 19 → 20, beef −1 exactly, 0 dropped; run 138 — bread/porkchop/chicken, same, 0 dropped each, plus auto-eat with no command (2 beef eaten, 0 dropped). **Wart found and fixed on the way (run 138 leg E):** when the plugin's own auto-eat was already mid-meal, `tryEatOnce()` hit the plugin's `Already eating!` throw and wrongly said "i tried to eat but my hunger didnt go up" while the meal then restored hunger anyway. It now waits out an in-progress eat (`isEating`) and polls for the rise; runs 139–140 (dense "Segs survive" races) show zero false-failure lines. Honest caveat: the exact wait-out branch was not captured in a run — in both race runs survive() always started at food 19 and ate first. The false line's last occurrence anywhere is run 138 leg E.
+- **Test-setup finding:** Paper 26.3 blocks `/data merge` on players ("Unable to modify player data"), so test food levels are set with a hunger effect instead; `/data get` works and is the ground-truth read. Client-side inventory counts are NOT reliable after a drop (the client's window never resyncs when nothing is consumed) — server-side `/data get` is what proves counts.
+
+## What's new in v10.5.1 (2026-11-08) — the 4 leftovers from v10.5, fixed at all cost
+
+All simulation-tested on the Paper 26.3 test server (port 25569). Runs 114+.
+
+- **Water climb-out — STILL FAILS live (runs 114-117), timeboxed after genuine investigation.** The fork's water physics was analysed and patched (a landing-spot check + a 10-tick out-of-liquid boost, gated to 26.3 only, 42/42 fork tests pass) and the patch SHIPS in this zip (patches/ + an applier run by setup-26.3.sh/.bat and link-prismarine.js). In the pure simulation the patched physics climbs out at tick 45; live on Paper it got out once (feet 72.00, x<-95, tick 335) and the server pulled it straight back into the pond. Decompiled Paper source shows why: the server runs its own player simulation with zero movement input (it never sets `jumping` from the client's input, its Motion stays 0), so its `jumpOutOfFluid` never fires and it corrects every client-side rise back to its float level (70.24-70.67). Segs survives (hp 20/20), does not drown, and asks for help after 20s; "Segs tp to me" is the honest fallback. Two fork patches ship and are vanilla-parity correct: the water-climb patch and a mineflayer collision-sync patch (real hasHorizontalCollision flag + position-sync preservation — the last one also fixes the run-107 corner freeze). The per-tick player_input send that was in the first version of the mineflayer patch was DROPPED after a bisection: it degrades creeper-bow combat in combination with hasHorizontalCollision, and the water climb-out fails either way.
+- **2-high wall sidestep — PASS (run 107 retest).** The edge watchdog was NOT the blocker (zero `[edge]` events). The real blockers: the climb assist sprinted into the 2-high wall for 6s per run-up because its step check needs the block ABOVE the step to be air (a 2-high wall never qualifies), and the sidestep ran LAST so the run's stop cut it off. Fixes: the climb assist bails immediately on a 2-high wall, and gotoPos now runs the wall sidestep (routeSafe-checked, safe/inland side first) right after the door assist, BEFORE the climb assist. Result: "gotoPos OK (after early sidestep) at (-103.53,71,159.5)" in 3s, hp 20/20, no fall, wall intact. The direct diagonal cut around the corner still stalls (server snap-back, run 118) — the sidestep is the working answer and is tried first.
+- **Autobuild house — PASS, 65/65 (run 113 retests).** Fixes: stale pathfinder goal cancelled after each stand move, settle before EVERY place, 3 place attempts with a fresh lookAt + 200ms pause (so the server receives the look before the place fires), never place against a container (a chest/furnace opens instead of placing — the floor cell above the mats chest was refused for this), ref search re-tried after 500ms (the client's world lags the server), one build at a time (a second "build house here" used to start a second loop and neither finished), unstuck watchdog skips during a build, and the chest walk is capped at 6s (the mats chest ends up UNDER the built floor, so an unbounded walk hung the second build for 54s). Result: first build "built house: 65/65 blocks placed, 0 skipped, 0 wrong", all five block checks fired; second build "built house: 0/65 blocks placed, 65 skipped, 0 wrong" — nothing broken, nothing re-placed. Honest note: a 65-block house takes about 5 minutes (~4.7s/block — stand moves + settles dominate).
+- **Follow-through-door — PASS (run 57 retest).** The A* will not route through an open door (it routes around the house), and the follow loop's 2s re-path had a bug that capped stuckMs at ~4500 so the 6s door assist never fired. Fixes: separate throttles for the jump pulse and the re-path (lastMove now accumulates to 6s), door-assist search radius 4 -> 6 blocks, stage to 1.5 blocks in front of the door via the pathfinder first (tight 0.3-block radius — the open door's panel is a thin slab at the block's west edge, so Segs must be centred on the doorway's clear part), through-direction computed from the door toward the goal (not Segs' approach), and the walk runs until Segs is 0.5+ blocks PAST the door centre (land first, sprint, re-assert controls). Result: "door assist: moved 5.7 blocks, beyond door 1.4 — through door at (-90, 71, 155)", Segs ended at (-89.50,71,160.5), exactly 2 blocks behind the owner, door verified OPEN (not broken), no "im stuck".
+- **Idle jump — PASS (runs 119-121).** Segs jumped every 1-2s while idling on plain flat land. Root cause: a LEAKED gotoPos jumpPulse interval — three return paths (direct-OK, cancelled, after-door-assist) never called stopJumpPulse(), so after ANY successful walk the interval jumped Segs every 2s forever. Fixed (stopJumpPulse on every return) and both jump pulses are now gated on a real 1-block step ahead — no step, no jump, ever. Runs 119 (no command), 120 (following, owner still), 121 (after a goto): **ZERO jumps in 60s each**.
+- **Auto-eat — PASS (run 123).** Two bugs: the threshold was 13-14 (now <19: autoEat minHunger 19, health handler ≤18, hunger watchdog <19, 60s cooldown, fires whenever hungry not only when idle), and — the real one — **auto-eat was NEVER ENABLED**. Mineflayer's plugin_loader only runs plugins after `inject_allowed` fires (after login), so `bot.autoEat` was undefined when the old enableAuto() call ran at startup and it silently never ran. The setup now runs in `bot.once('spawn')`. Run 123: food 20/20 → 19/20 → Segs auto-ate on his own (no command) → food 20/20, beef x10 → x8. **Known issue, FIXED in v10.5.2 (runs 134–140, see above):** eating dropped 1 steak per eat (run 123: 1 steak on the ground, 2 beef consumed for 1 point of food). The v10.5.1 note's claim that the drop was "NOT via `bot.deactivateItem`" was wrong — the override was dead on arrival because plugin injection overwrote it; v10.5.2 re-installs it on spawn and the drop is gone (0 dropped in every eat run since).
+- **River / water routing — PASS (run 124).** Segs chose the straight path through a river and sat stuck 5 minutes. Root cause: water cost 1 and water not in blocksToAvoid, so a 20-block swim looked cheaper than a 40-block dry detour — but the fork cannot climb out of water onto a vertical shore, so it routed INTO a trap; the unstuck watchdog resets on any >0.5-block jiggle (swimming/bobbing) so it never fired. Fixes: water in blocksToAvoid + liquidCost 10 (dry detour wins), a 60s progress timeout (no walk may sit stuck silently — it stops and reports where and why), a 60s water climb-out cap (then it stops and offers /tpa, never loops), and a water-entry wait in gotoPos. Run 124: Segs took the dry detour, "gotoPos OK (direct) at (-91.57, 71, 160.68)", zero water lines, hp 20/20.
+- **Grave recovery — fixed in code, retest pending (run 127).** Sneak+right-click take-all is now PRIMARY (was a fallback after openChest), the search scans a radius-8 cube around the DEATH SPOT (was 5 blocks around Segs) and logs every solid block nearby when it finds nothing (so the next real-server failure is diagnosable), "cant see grave" no longer marks the grave recovered (it retries until the 10-minute expiry, reporting time left), canDig=false for the whole recovery (never digs the riverbank), and the auto-recovery timer now fires from the death handler (it used to live only in the login handler, so a mid-session death never auto-recovered).
+- **Inventory / status — PASS (run 128).** Status showed only the first 5 stacks, per-stack counts never summed, and `bot.inventory.items()` silently excludes the offhand (slot 45) and armor (slots 5-8). Fixed: status and inventory now read all 46 slots directly and sum by item name, splitting into multiple chat lines instead of dropping items. Run 128: wheat x152, wheat_seeds x182, cooked_beef x7, baked_potato x64, iron_ingot x15, stick x14, iron_axe x1, totem_of_undying x1 — status and inventory agree exactly.
+- **Chest scan — PASS (run 129).** `findNearbyContainers` had no `count` option so the fork's findBlocks defaulted to 1 — Segs only ever saw ONE chest. Fixed: count 100, radius 32, double-chest dedup, a remembered container map in brain (pos + type, not contents) so cook/craft/smelt/sort search remembered containers too, and "Segs list chests" / "Segs check the chests" commands. Run 129: 3 double chests (potato, coal, iron ore 20 blocks away) — "Segs cook potato 4" found potato in A + coal in B; "Segs smelt iron ore 2" walked to the far chest C.
+- **Command queue — PASS (runs 130-133).** Tash's log proved commands queued behind each other for 27-94s (go-home result 68s late, sleep 50s late, stop 27s late, three replies bursting at once). Root cause: a serial talkQueue — every command waited for the previous command's ENTIRE execution. Fixed: LATEST COMMAND WINS (a generation token cancels the running command silently), STOP jumps the queue and confirms <1s, queries (status/stats/inventory/help) answer immediately even during a long cook, only ONE /tpa outstanding (a new "tp to me" dedups instead of sending a 2nd/3rd), and the ack is honest ("dropping X, doing Y"). Runs 130 (3 commands 10s apart during a 105-block goto), 131 (the exact 19:03:25 log scene: go-home + tp x3 + stop), 132 (status <2s while cooking 64 potatoes), 133 (aliases) — all PASS, no stale burst. Whole-log sweep aliases added: "segs autoeat", "take items from this chest", "segs deathchest", "segs tp home", "Segs go home a" (checks server homes), "Segs column", "stop jumping" / "start jumping" (60s hold).
+- **Guide PDF rebuilt** for v10.5.1: 22 pages, 16 sections (Autobuild now 65/65, water limit updated, follow-through-door note in section 7, idle-jump / auto-eat / river / grave / inventory / chest-scan / command-queue fixes added).
+
+## What's new in v10.5 (2026-11-08) — Tash's "100% at all cost" round: pathfinding sweep, fast follow, instant ack, craft/cook/smelt from chests, view distance 7, Autobuild v1
+
+All simulation-tested on the Paper 26.3 test server (port 25569). Runs 104+.
+
+- **Pathfinding — dip climb FIXED, proven (run 104g).** The known fail (runs 32-35): Segs fell in a dip and could not climb out — the pathfinder timed out. Root cause, found with bare-client probes: at the dip's east edge the bounding box overlaps the wall by ~0.02 while the feet sit exactly at the block's bottom Y, so onGround never latches and a held jump never fires. Fix: climb assist now backs up ~0.7s, then runs at the wall with NO jump until a 1-block step appears 1.5 blocks ahead (checked every 50ms), then jumps — the apex lands OVER the wall instead of at its foot. Run 104g: Segs said "here", hp 20/20 at (-128,71,160), arrived within 2 of (-126,71,160). Stairs UP also fixed the same way (hop-step mode, runs 107c/107d: "gotoPos OK (after climb assist) at (-91.6,74,160)"); stairs DOWN was already fine.
+- **Lava detour — PASS (run 105).** Segs went AROUND a lava strip (x=-130, z=171..179), never into lava, "at lavatest", hp 20/20 at (-135,71,175). The pathfinder's blocksToAvoid (lava) works.
+- **Long walk + 3-block drop — PASS (run 108).** 50-block flat walk arrived (-101.6,71,160.5), "here"; 3-block drop retest arrived (-90.5,73,169.4), "here", hp 20/20.
+- **Water climb-out — STILL FAILS (runs 106/106b). Honest limit, evidence-backed.** Segs swims to the shore and does not drown (hp 20/20), but cannot climb a 2-high wall from the water. Root cause, from the fork source (prismarine-physics): `isInWater` uses a bounding box contracted 0.401 from the bottom, so the water jump stops applying once the feet rise above ~70.6; the feet cap at ~70.68 even with no wall contact, and the shore top is 72.0 — a 0.72-block gap no bot-level control (jump/forward/sprint/strafe, all tried) can bridge. The fork also never models the swimming pose (player height always 1.8). A fork edit would be needed, but fork edits do not ship to Tash (setup re-clones the fork). Segs survives and asks for help after 20s instead of dying.
+- **2-high wall sidestep — FAILS (runs 107/107b/107c/107d/107e).** Segs falls off the v9 platform's north edge (z=150) to y=63 while routing around the wall. The edge watchdog was sped up (500ms -> 150ms, lookahead 1.5 -> 3 blocks) and made to check two points ahead (a thin natural ledge 1-2 below fooled the single-point check), and it now fires — but too late to stop the fall once Segs' momentum carries it off. Stairs UP/DOWN in the same run PASS. The go-around-a-wall behaviour itself is proven by the lava detour (run 105).
+- **Fast follow — PASS (run 109).** The follow loop now re-paths ONLY when the owner moved >3 blocks, the owner entity changed, or there is no goal (the old 500ms re-path restarted the pathfinder constantly — run 82 crawled at ~0.6 blocks/s). Measured from the owner log: Segs covered 33 blocks in ~16s (>=2.1 blocks/s, 3.5x run 82's speed — a lower bound, it may have arrived sooner between status samples), ending exactly 2 blocks behind the owner at (-107,71,160). If the owner teleports >30 blocks and Segs is stuck >15s, it now offers /tpa ("looks like you teleported far away, want me to tpa to you?") and sends /tpa only when told — proven in run 109 (Segs sent /tpa, owner accepted, Segs landed at (-143,71,160)).
+- **Instant ack — PASS (run 110).** Every command now gets an instant short ack ("on it", "coming", "got it", "ok — doing it") before the work starts, then the result follows. Measured in the owner log: "Segs status" said 13:39:27.637, ack "doing it now" at 13:39:27.664 (27ms), result right after; "Segs go to -100 71 160" acked in 5ms and Segs said "here" 1.5s later. Bot-side ack log: 0-1ms. Acks are owner-only, never for greetings/thanks, never twice.
+- **Craft from chests — PASS (run 111c).** "Segs craft torch 4" with coal+stick+wheat in a chest: Segs took 1x stick + 1x coal, "here you go, 4x torch ready", torch x4 in inventory. "Segs craft bread 2": took 6x wheat, "here you go, 2x bread ready", bread x2. "Segs craft diamond sword" (no diamond anywhere): honest "i need 2x diamond for 1x diamond_sword — i checked 1 chest(s) nearby". Two real bugs found and fixed on the way: (1) a torch takes coal OR charcoal — the first version gave up on the charcoal variant instead of trying the coal one; (2) the craft reported the ASKED count, not the real one (bot.craft can silently do fewer crafts than asked — it now crafts one at a time with a 500ms settle and reports the real output count).
+- **Cook / smelt from chests — PASS (run 112e).** "Segs cook beef 4" with beef+coal in a chest and a smoker nearby: took 4x beef + 1x coal, "got 4x cooked_beef", cooked_beef x4 in inventory. "Segs smelt iron ore 4" with a blast furnace: "got 4x iron_ingot", iron_ingot x4. "Segs smelt gold ore" (none anywhere): honest "i dont have any gold_ore — i checked 1 chest(s) nearby and found none". Three bugs found and fixed: (1) the smelt loop broke after the FIRST output (got 1x iron_ingot from 4x ore — it now polls until all n are out); (2) the chest search only saw loaded chunks, so right after a teleport it found 0 chests (it now retries up to 3 times); (3) the bot used the item name `raw_beef`, which does not exist in Minecraft 1.13+ — the raw item is just `beef` (same for porkchop/chicken/mutton/rabbit/cod/salmon). The owner test script had the same wrong name, so the chest never actually contained beef until both were fixed.
+- **View distance 7 / simulation distance 7 — DONE (test server).** server.properties set to 7/7, server restarted, Segs runs fine. Bot side: Mineflayer does send a view-distance client setting, and the bot now sets it to 7. Honest distinction: on Youniga, view/simulation distance is the SERVER owner's setting — Segs cannot change it from the bot.
+- **Autobuild schematic tool v1 — PARTIAL (run 113e: 46/65 placed, 0 wrong).** "Segs this is the build site" marks the origin; "Segs build house here" reads schematics/house.json (5x3x5, 65 blocks), gathers mats from chests within 16 blocks (crafting raw mats where it can), reports the exact missing list and STOPS if anything is missing, then builds layer-by-layer at 1 block per tick from outside the footprint, never breaking an existing block. Best run: 46/65 placed, 19 skipped, 0 wrong; WALL-OK, ROOF-OK, DOOR-GAP-OK and FLOOR2-OK verified, FLOOR-OK (the corner cell) not. The remaining failures are on the edge where Segs starts (the corner it stands on) — the place is refused while it is still settling from the step-out — plus Segs getting wedged at the site corner. Fixes applied across runs 113-113e: build-from-outside (never stand in the footprint), 6s cap per stand move, equip-wait (the equip packet resolves before the held item updates — 16 wall blocks lost to that), and a place retry. A second build after re-stocking places 0 and skips 65 — it never breaks or replaces a block that is already right.
+- **Regressions re-run (2026-11-08):** Parkour 3-block drop run 101 PASS ("gotoPos OK (direct) at (-90.5,73,169.3)", hp 20/20); Parkour 4-block drop run 103 PASS (pathfinder refused, manual drop-down landed (-90.5,72,170.5), hp 20/20); respawn-in-place run 102 PASS (died at (-90,71,160), status at the same spot hp 20/20, no reconnect); drop fix run 72 PASS (cooked_beef x10 held, zero dropped); AutoChat gate run 74 PASS (no key -> "ai is on but i have no groq key", 0 req / 0 tokens, injection refused); creeper bow run 75 PASS ("[combat] killed creeper", hp 20/20, zero hits). Doors run 57: the door was OPENED not broken ("[door] opened oak_door at (-90,71,155)"), but Segs then got stuck following through it at (-95,71,154) and said "im stuck following you" — the follow loop does not re-plan after a door it just opened. That is a follow-through-door gap, not a door-breaking regression.
+- **Guide PDF rebuilt** for v10.5: 22 pages, 16 sections (new section 16 Autobuild), plus the craft-from-chests, fast follow/instant ack, climb-assist and water-limit updates.
+
+## What's new in v10.4.1 (2026-11-08) — the two v10.4 honest limits, fixed + guide rebuilt
+
+- **Parkour 3-block drop — FIXED, proven (runs 101 + 103).** The v10.4
+  honest limit is gone. Root cause: the fork pathfinder measures a drop
+  against the landing BLOCK's y, so a 3-block feet drop is a 4-block
+  difference and only just passes, and a 4-block drop can never be routed.
+  The edge watchdog also scanned only 3 blocks below the feet, so it
+  never saw the landing of a real 3-block drop. Fixes: watchdog scan
+  extended to 4 below (drop = d-1, jump only if drop <= 3, and it skips
+  while a manual drop is in progress), plus a manual drop-down fallback
+  in gotoPos/followLoop — no pathfinder goal, walk forward off the edge
+  and let gravity do it (walk, never jump: a jump adds ~1.25 blocks of
+  height). Run 101: 3-block drop, pathfinder routed it, hp 20/20, no
+  damage, "here". Run 103: 4-block drop, pathfinder refused, manual
+  drop-down landed at (-90,72,168) in 2s, hp 19 at landing (exactly the
+  1 hp a 4-block fall costs), "here".
+- **AutoRespawn in place — FIXED, proven (run 102).** The v10.4 honest
+  limit is gone. Root cause, found by decompiling Paper 26.3's
+  ServerGamePacketListenerImpl: Paper disconnects with
+  "Invalid move player packet" if a SECOND position-bearing packet
+  arrives in one server tick; the per-tick flag is reset ONLY by
+  client_tick_end. The fork's delayed respawn reply (1500ms after the
+  server's respawn teleport) is sent outside its physics loop with no
+  tick_end after it, so the next physics tick's position packet lands
+  in the same server tick and Segs is kicked. Fix (in bot.js, 26.3
+  only): for 10s after a death, every position/position_look packet is
+  immediately followed by a tick_end, so the server's flag is reset
+  before any next position packet can arrive. Run 102: /kill Segs ->
+  respawn packet sent -> Segs answered status at the same spot,
+  hp 20/20, ONE connect in the whole bot.log, no reconnect, no kick.
+- **Water watchdog bug — FIXED (found while testing run 103).** The
+  water watchdog cleared jump/forward/sprint on EVERY tick whenever
+  Segs was NOT in water, silently killing every other manual walk
+  (drop-down, door assist, flee). Fix: a waterDriving flag — controls
+  are only cleared when the watchdog itself is actually driving a swim.
+  This also explains the slow long-distance follow in run 82.
+- **"here" honesty — FIXED.** A second go-to-coords handler said "here"
+  unconditionally after gotoPos without checking its return value. It
+  now says "here" only if gotoPos returns true, else "i cant reach
+  there, too far or blocked". gotoPos now logs its outcome.
+- **Guide PDF rebuilt** for v10.4: 21 pages, 15 sections, all 13
+  NiceWurst picks covered by name, plus the creeper bow kill, the
+  status-6 bow release fix, the AutoEat plugin drop fix, the Parkour
+  drop-down and the respawn-in-place fix.
+
+## What's new in v10.4 (2026-11-08) — the 13 NiceWurst picks, one by one
+
+Tash picked 13 features from the NiceWurst mod (decompiled 2026-11-08) and
+said build them one by one, rechecking every situation until the outcome is
+absolute. This version implements all 13. The headline is the **creeper bow
+kill, finally proven with zero hits taken** — after the bow was proven to
+fire (status 6 release, not status 5) and the aim was proven on a stationary
+target, the moving creeper still would not die. The root cause, found by
+testing Segs standing still vs moving: **moving (back + strafe) while the bow
+is charging makes the arrows miss 10/10** — the eye moves while the look is
+sent in 8.6 deg/tick baby steps, so the server's rotation lags the aim. The
+fix is human: **plant your feet to shoot** (stand still while charging, move
+between shots). Proven (run 75 arena, run 99 open field): creeper hp 20 -> 0
+in 3-4 arrows, Segs hp 20/20, zero hits taken. Skeleton bow kill also proven
+(run 87, 2 arrows, zero hits).
+
+- **AutoChat (Groq AI, owner-only).** "Segs enable AI" / "Segs disable AI" /
+  "Segs ai status". Groq OpenAI-compatible, gpt-oss-20b primary,
+  gpt-oss-120b fallback. Key lives ONLY in config.json on your PC
+  (config.example.json has the placeholder, never a real key). Reply only
+  when mentioned or whispered; canned local replies for status/where/what
+  questions (no API call); min 3s between AI replies, 10s unsolicited, 30s
+  per person; last 5 chat lines, max 64 tokens out, 140-char cap; de-dup vs
+  last 8 replies; injection lines replaced with [Filtered]; never admits it
+  is a bot. Daily budget guard (80% of 1000 req/day or 200k tokens/day),
+  429 back-off 60s then 5min. Tested WITHOUT a real key (run 74): gate,
+  cooldown, canned fallback, enable/disable all proven in bot.log, 0 Groq
+  calls made.
+- **AimAssist + KillauraLegit discipline ONLY.** No auto-aim/auto-attack.
+  Capped rotation 600 deg/s (slowLookAt), LOS gate via canSeeMob, verify
+  facing before strike (isFacing, 15 deg), +-100ms Gaussian jitter on the
+  attack cooldown, bow ballistics from the decompiled BowAimbot (g=0.006,
+  lead = distance * 1/3 so lead time = flight time, pitch solved from the
+  vanilla formula, direct aim fallback). Creeper + skeleton bow kills proven
+  (runs 75/99/87, zero hits). Zombie 1v1 retest (run 86): killed in 12s,
+  zero hits.
+- **AutoEat.** Saturation-first ranking (cooked_beef 12.8 > cooked_porkchop
+  12.8 > bread 6 > apple 2.4...), eat at food < 13, injured eats uncapped,
+  poison food (rotten_flesh etc) never eaten. Tested (run 76): Segs chose
+  cooked_beef over bread/apple and never touched rotten_flesh; background
+  auto-eat ate 2 beef when hungry and restored food to 20/20. Fixed a real
+  bug found while testing: the auto-eat plugin calls bot.deactivateItem()
+  (status 5 = DROP_ITEM) before every eat — bot.deactivateItem is now
+  overridden to the safe status-6 release so no plugin can drop the held item.
+- **AutoArmor.** Score = armor*5 + Protection*3 + toughness, 1 piece per
+  tick, 2-tick gap, only while still. Tested (run 77): iron_helmet (10) beat
+  leather (5), iron_chestplate (30) beat leather (15), diamond_leggings (32),
+  golden_boots (5) — all best pieces worn. Fixed a real bug: armorSlotOf
+  returned 'boots' but the loop uses 'feet', so boots were never equipped.
+- **AutoTotem.** Polls the off-hand every 500ms; a totem is held in the
+  off-hand ALWAYS when Segs has one (a totem only saves Segs from a one-shot
+  if it is already there — the first health-gate version left Segs holding
+  the shield at full health and it died to lethal damage). If it pops, the
+  spare is re-equipped. Shield is the fallback only when there is no totem.
+  Tested (run 78): totem held at hp 20, lethal damage popped it, Segs
+  survived at hp 2-4, spare re-equipped. (Known wart: one false "totem
+  popped" message at startup in the test harness, from /clear removing a
+  kept totem from the previous run — not a real pop.)
+- **AntiBreak.** Before digging/attacking, if the held tool has <=10% (or 5
+  uses) left, swap to the next best tool of the same kind or empty hand and
+  say so. Tested (run 79): iron_pickaxe at 5/250 swapped to stone_pickaxe,
+  stone dug with the stone pickaxe, iron pickaxe unbroken. Fixed a real bug:
+  equipForBlock re-equipped the iron pickaxe after the swap — the check now
+  runs AFTER each equip.
+- **AutoFarm.** Replant FIRST then harvest, nearest-first, 1 action per
+  tick, seed-per-spot remembered (brain.farmSpots), never bone-meals while
+  farming. Tested (run 80): 9 potato spots replanted (spot remembered),
+  27 potatoes + 1 poisonous potato harvested.
+- **AutoMine.** Normal-speed bot.dig with the correct tool per block
+  (mineflayer-tool plugin), no super-fast mode. Tested (run 81): dirt dug
+  with iron_shovel, stone dug with iron_pickaxe. The no-tool rule still
+  applies (stone without a pickaxe is refused).
+- **Follow.** Re-targets the owner BY NAME when the entity goes stale
+  (resolveOwnerEntity), re-paths every 10 ticks (500ms), stops at exactly 2
+  blocks (horizontal distance). Tested (run 82): Segs ended 2 blocks behind
+  after the first teleport, and kept following toward the owner after a
+  35-block teleport (re-targeted by name). Long-distance follow is slow
+  (~0.6 blocks/s over 35 blocks in this run) — a known wart.
+- **Parkour.** Auto-jump at a drop ahead ONLY when a goto/follow goal is
+  beyond it AND the landing is safe (ground within 3 blocks below, no
+  lava/water). The edge watchdog still stops Segs when idle or when there is
+  no safe landing. Tested (run 83): 1-block ledge down, Segs walked down to
+  y=71 and said "here". v10.4.1: the 3-block drop is now proven (run 101,
+  pathfinder routed it, hp 20/20, no damage) and a 4-block drop is proven
+  via the manual drop-down fallback (run 103, landed hp 19 — exactly the
+  1 hp a 4-block fall costs). The old v10.4 honest limit (run 100) is
+  fixed; see "What's new in v10.4.1" above.
+- **AutoRespawn.** Respawn packet + 500ms retries + 10s reconnect. Tested
+  (run 84): /kill Segs -> respawn packet sent, Segs answered status again
+  after reconnect. v10.4.1: respawn IN PLACE is now proven (run 102) — the
+  old "fork limit" was wrong. Root cause was Paper's one-position-packet-
+  per-server-tick rule vs the fork's delayed respawn reply with no tick_end
+  after it; fixed by sending tick_end after every position packet for 10s
+  after a death. The 10s reconnect stays as the fallback if a kick ever
+  happens for another reason.
+- **PacketRate.** Outgoing packets counted per second, rate logged every 10s
+  to bot.log (avg, peak 1s window, total). If the rate exceeds ~100/s
+  sustained, only CHAT packets are throttled (queued 1 per 500ms) — movement
+  and physics packets are never throttled. Tested (run 85 + all runs): idle
+  ~22/s, combat peak 63-76/s, never near 100/s, so the throttle is a safety
+  net that has not needed to fire.
+
+The v10.3.1 drop fix still holds (run 72 retest: cooked_beef x10 through
+"tp to me", "sleep", "stop" — zero dropped). The guide PDF is rebuilt in
+v10.4.1 (21 pages, 15 sections, all 13 NiceWurst picks by name).
+
+## What's new in v10.3.1 (2026-11-08) — the drop bug, found for real
+Tash nailed it down: Segs held BEEF in its RIGHT hand, "tp to me"
+dropped 1-3 beef, "sleep" dropped beef. Root cause found in the code:
+my v10.3 edit left a SECOND `deactivateItem()` call in stopCombat
+(after the log line) — it fired on EVERY stop, and on Paper that
+packet drops the held item. It is removed for real now. Tested (run
+72): Segs held cooked_beef, got "tp to me", "sleep" and "stop" — kept
+all 10 beef, zero dropped.
+
+- **Land 1-block jump + walls.** "He cant jump up 1 block" on LAND
+  too, and "blocked by a 1-2 block wall even tho just at his right or
+  left there is open space". Two fixes: gotoPos now pulses jump when
+  Segs has not moved in 2s (like follow already did), and a WALL
+  SIDESTEP — when the direct path and the staged path both fail, Segs
+  tries 4 blocks left, then 4 blocks right, and retries from there.
+  Tested (run 73): a 2-high wall across the path, Segs sidestepped
+  around it and said "here" at the target.
+- **Follow trigger is horizontal distance** (was 3D): if you are 1
+  block above Segs, it now jumps up to you instead of standing below
+  you forever. Tested (run 71): Segs jumped onto a 1-high ledge and
+  ended 2 blocks behind.
+- **"beef" now means cooked_beef** (so "Segs hold beef" works).
+- **Guide PDF rebuilt** — 20 pages, 15 sections, properly sorted:
+  setup, talking, teaching, sorting, columns, paper, moving, junk,
+  farming/food, pickup/store, COMBAT (new), crafting, logs,
+  troubleshooting, quick reference.
+
+## What's new in v10.3 (2026-11-08) — Tash's real-server bug report
+Built from Tash's logs + screenshots on the real youniga server (2026-11-08).
+Every fix below is proven in simulation (runs 60-71); the one honest limit
+is the water climb-out on a vertical 1-block wall (fork physics).
+
+- **Drop fixed.** "Segs drop seeds" now drops ALL the seeds (was 1).
+  "Segs drop 1 seeds" drops just 1. "Segs drop all seeds", "drop seeds
+  x64", "drop 64x wheat_seeds" and "drop everything" all work now (they
+  all said "i dont have ..." before — the parser treated "all"/"x64" as
+  part of the item name). "Drop everything" drops the whole inventory.
+- **No more dropping items on any command.** The `deactivateItem()`
+  packet sent on every stop is removed (it was the prime suspect for
+  Segs throwing the held item when Tash gave any command).
+- **Chat is more versatile.** "Segs equip axe" works now (was "didn't
+  get that"). "Segs craft yourself an axe" works (was "i dont know
+  yourself_axe" — filler words like "yourself" are stripped). "Segs
+  this is food chest" / "Segs this is Storage unit" work WITHOUT "the"
+  (the old handler required "this is the", so those failed twice).
+  "Segs keep wheat in this chest" / "Segs store iron in this chest"
+  works (stores the item in the nearest chest). Typos get a suggestion:
+  "Segs top" → 'did you mean "segs stop"?'.
+- **Food chain fixed.** Wheat is not edible and not cookable, so Segs
+  farmed wheat and then said "the farm had nothing ripe to eat" while
+  HOLDING 24 wheat. Now it crafts BREAD from wheat (3 wheat = 1 bread)
+  and eats it — in the survival routine and when it already holds wheat.
+- **Pickup fixed.** "Segs pick up" now VERIFIES it actually got the
+  item (says "got it" or "i cant reach that one"). Farming picks up
+  each crop drop BEFORE moving to the next crop (so harvested wheat
+  does not sit on the ground looking like Segs threw it).
+- **Auto-jump + follow.** Segs now pulses jump when it has not moved
+  for 2s while following (a 1-block step it was stuck on), and the
+  follow trigger uses HORIZONTAL distance (so it jumps up onto a ledge
+  when you are above it). If it is stuck 15s while following, it says
+  so and stops (instead of standing there silently).
+- **Mob sense — no X-ray.** Segs only reacts to mobs it can SEE: same
+  level (within 4 blocks up/down) AND a clear line of sight (raycast).
+  A zombie in a cave 10 blocks below no longer makes Segs say "mobs
+  are there" and try to fight in daytime when nothing is on the surface.
+- **Water.** Drowning is fixed (swims up, no death). Segs swims to the
+  shore. HONEST LIMIT: the fork's physics cannot jump a full 1 block
+  out of water onto a vertical shore, so Segs stalls at the edge. After
+  20s stuck in the water it SAYS so and asks you to come get it
+  (instead of struggling silently). A gradual riverbank is easier than
+  a vertical wall, but the climb-out is not proven.
+
+## What's new in v10.2
+
+**Bow re-aim during charge.** The bow used to aim once, then charge for
+1s — during that 1s a moving target walks ~4 blocks, so the arrow went
+where it WAS. Now Segs re-aims every 100ms during the charge, tracking
+the target's current position (and the live entity by name, not the
+stale stored id — the same stale-entity bug that caused the 92% sword
+miss rate). This makes the bow hit moving targets, not just standing
+skeletons.
+
+**Creeper: bow dropped, melee hit-and-run instead.** Six bow approaches
+were tried for the creeper (chest aim, lead, re-aim during charge, closer
+range, sprint-back kiting, live-entity fix) — 5–21 arrows per fight, 0
+kills. A creeper walks toward Segs, so a 1s bow charge means the aim is
+always stale. The sword hit-and-run is now used instead: hit once
+(knockback), SPRINT away immediately (fuse resets when Segs is >3 blocks
+away), re-approach, hit again. Segs survives creepers safely (0–1 hits
+taken, never dies to one), but a reliable zero-hit creeper KILL is still
+not proven — the creeper disappears (despawns or explodes at a safe
+distance) without Segs landing the killing blow. This is the one
+remaining item that is not zero. Segs is safe from creepers; it just
+does not reliably kill them yet.
+
+## What's new in v10.1
+
+**Bow combat — Segs shoots from range.** If Segs has a bow + arrows and the
+target is a skeleton, creeper, witch, blaze or pillager, it keeps 10–14
+blocks, strafes fast (direction flips every 300–500ms so return fire
+misses), aims at the target's chest (y + 1.0, no lead — skeletons stand
+still while shooting, and a lead made the arrows miss), charges the bow
+1s (full charge = max damage) and releases. **Skeleton: ZERO hits taken,
+proven** (run 52 retest — Segs shot it and killed it without taking a
+hit). **Creeper: Segs shoots it from range** (it is a combat target only
+when Segs has a bow + arrows; without a bow Segs still flees creepers).
+Creeper kills are not yet reliable — the creeper walks toward Segs and
+the arrows miss it more often than the standing skeleton; it is the
+hardest bow target. **Horde: funnel** — when 2+ hostiles are near, Segs
+backs to the nearest wall (within 10 blocks) so the horde can only come
+from the front, and shoots zombies from range too while backing up.
+Best horde result so far: 1 kill, 4 hits taken (was 5–7). A 5-zombie
+horde in the OPEN arena is still not zero hits — on the real server
+Segs fights near walls/doors, which is the funnel it wants.
+
+**Plan items 6–12 — all built.**
+- **Unstuck:** if Segs has a goal but has not moved >0.5 blocks in 10s,
+  it jumps, turns 90° and walks, jumps again. NEVER breaks a block.
+  After 3 tries it says so and waits for you.
+- **Creeper rule:** when fleeing a creeper, Segs flees AWAY from you
+  and from the permanent home — never leads one to you or the house.
+- **Night behaviour:** at night, if Segs is idle, it goes to its
+  permanent home (or near you). If you are offline, it goes home and
+  waits there — it does not wander alone.
+- **Mob-by-mob flee:** skeleton/witch zigzag (their shots are aimed);
+  enderman look DOWN and walk away slowly (never look at it, never
+  sprint); spider sprint (it is fast).
+- **Water & drowning:** if Segs is in water and its air is low, it
+  swims STRAIGHT UP first (head above water), then moves to shore.
+  Proven: Segs no longer drowns (run 59 — air restored, no death).
+  Climbing out onto shore in the test pond is still unreliable
+  (floating-platform test setup); the drowning part is fixed.
+- **Trapdoors & fence gates:** the door opener now also opens
+  trapdoors and fence gates (same rule: open, never break).
+- **The rest:** farmland is in blocksToAvoid (Segs never walks on
+  crops); animals are never attacked (combat only targets hostiles);
+  owner-offline idle (see night behaviour).
+
+## What's new in v10
+
+**Combat — Segs fights like a PvP god.** Threat-prioritised targeting (creeper
+first — but creepers are fled from, not meleed, see below), cooldown-timed hits
+(sword 650ms, axe ~1050ms, never spam), crits on fresh/tough targets, sword
+sweep for hordes, kiting at 2.5–3.0 blocks vs melee (Segs hits from 3, the
+zombie can only hit from ~2), sprint-jump close-in + random strafing +
+point-blank attack vs ranged (a skeleton backs away at ~5 blocks/s, plain
+sprint ~5.6 barely gains — sprint-jumping is ~7), shield equip in off-hand,
+surroundings check (never surrounded — it breaks out through the gap), retreat
+to heal below 8 health, no weapon = flee + say so (never fight with fists).
+Give Segs a sword or an axe (or tell it to make one from your base) and it
+keeps it equipped. Combat stats in "Segs stats" (kills / hits taken / hits
+landed). PROVEN in simulation: **1v1 zombie — PASS, zero hits taken** (run 51
+clean retest). 1v1 skeleton — best 1 hit, killed (not zero yet; the shield
+block is unreliable in this Mineflayer fork). **Creepers are fled from, not
+fought in melee** — the fuse (1.5s) beats a sword kill (3 hits, ~2s), so
+meleeing one means it explodes on Segs; a bow is the correct tool for them.
+A 5-zombie horde in the open arena still overwhelms Segs (honest limit — it
+needs a doorway/wall funnel).
+
+**Doors properly — Segs never breaks your house to reach you.** While
+following, `canDig` is FALSE — Segs opens doors or says it cannot get there,
+it never digs the block above a door. Every follow tick it proactively opens
+a closed wooden door within 3 blocks (no 6s wait), then re-sets the follow
+goal so the pathfinder routes through the open doorway. Iron doors: it presses
+a nearby plate/button/lever; if none, it says so and does not break it.
+PROVEN in run 57: Segs opened the door, walked through, the cobblestone above
+it stayed intact, and Segs ended 2 blocks behind the owner.
+
+**Follow 2 blocks behind.** The follow loop now corrects the moment Segs is
+more than 2 blocks behind (was 3), so it stays right behind you, not 4–5
+blocks back. PROVEN in run 57.
+
+**Edge awareness for ALL movement.** The flee loop already had an edge check
+(v9.4). Now a global edge watchdog runs every 500ms: it reads Segs' velocity,
+checks the ground 1.5 blocks ahead, and stops ALL movement at once on a drop
+— follow, goto, farming, combat kiting, everything.
+
+**No-tool rule.** Segs never digs stone/ore by hand. "Segs dig stone" with no
+pickaxe → it refuses ("i need a pickaxe to dig stone — i wont dig it by
+hand"). The pathfinder also never digs stone/ore/obsidian (added to
+blocksCantBreak). PROVEN in run 58.
 
 ## What's new in v9.4
 

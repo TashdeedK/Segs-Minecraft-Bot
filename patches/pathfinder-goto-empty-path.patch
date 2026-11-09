@@ -1,0 +1,25 @@
+diff --git a/lib/goto.js b/lib/goto.js
+--- a/lib/goto.js	2026-11-09 05:19:29.588346225 +0000
++++ b/lib/goto.js	2026-11-09 05:19:29.691467421 +0000
+@@ -21,7 +21,20 @@
+ 
+     function noPathListener (results) {
+       if (results.path.length === 0) {
+-        cleanup()
++        // v10.5.3 Segs: an empty path does NOT mean "arrived". The A*
++        // returns an empty path both when the bot is already at the
++        // goal AND when no move is possible from the start (e.g. Segs
++        // standing in water with every move rejected as liquid — run
++        // 148: goto() resolved while Segs stood in the river 13 blocks
++        // short, so gotoPos said "here" while he was in the water).
++        // Only resolve when the goal is actually reached.
++        let atGoal = false
++        try { atGoal = bot.entity && goal.isEnd(bot.entity.position.floored()) } catch (e) {}
++        if (atGoal) {
++          cleanup()
++        } else {
++          cleanup(error('NoPath', 'No path to the goal!'))
++        }
+       } else if (results.status === 'noPath') {
+         cleanup(error('NoPath', 'No path to the goal!'))
+       } else if (results.status === 'timeout') {

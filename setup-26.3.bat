@@ -13,6 +13,12 @@ if not exist prismarine-chunk git clone --depth 1 https://github.com/Misty4119/p
 if not exist prismarine-item git clone --depth 1 https://github.com/Misty4119/prismarine-item.git prismarine-item
 if not exist prismarine-physics git clone --depth 1 https://github.com/Misty4119/prismarine-physics.git prismarine-physics
 if not exist minecraft-data git clone --depth 1 https://github.com/Misty4119/minecraft-data.git minecraft-data
+REM v10.5.1: patch the cloned prismarine-physics so the water climb-out ships (idempotent)
+node "%~dp0patches\apply-prismarine-physics-patch.js" "%CD%\prismarine-physics"
+REM v10.5.1: patch the cloned mineflayer so Paper sees the full player input (jump held) (idempotent)
+node "%~dp0patches\apply-mineflayer-collision-sync-patch.js" "%CD%\mineflayer"
+REM v10.5.3: patch the cloned mineflayer to send full player_input (jump/shift/forward) on control changes (idempotent)
+node "%~dp0patches\apply-mineflayer-player-input-patch.js" "%CD%\mineflayer"
 cd mineflayer
 call npm install --no-audit --no-fund
 cd ..\..

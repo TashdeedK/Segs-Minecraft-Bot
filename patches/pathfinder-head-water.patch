@@ -1,0 +1,24 @@
+diff --git a/lib/movements.js b/lib/movements.js
+index a7e3505..4bdf069 100644
+--- a/lib/movements.js
++++ b/lib/movements.js
+@@ -283,6 +283,19 @@ class Movements {
+     let cost = 0
+     cost += this.exclusionStep(block) // Is excluded so can't move or break
+     cost += this.getNumEntitiesAt(block.position, 0, 0, 0) * this.entityCost
++    // v10.5.3 Segs: liquid blocks (water/lava) are NOT breakable --
++    // without this, the A* treated a water block as dig-through-cheap
++    // (safeToBreak passes it: not in blocksCantBreak, digTime 0), so
++    // it routed Segs straight into river trenches (feet on stone,
++    // water at head level) that the bot cannot climb out of (run 125:
++    // Segs walked down into the trench at y=67, then y=62, and timed
++    // out with no water message). Water is already in blocksToAvoid;
++    // making it impassable here means NO move routes through liquid at
++    // feet or head level. The pathfinder is never used for swimming
++    // (the water watchdog drives climb-out), and dropping into a pool
++    // via the A* is blocked too, by design -- Segs reports the water
++    // and offers /tpa instead of walking into a trap.
++    if (block.liquid) return 100
+     if (block.safe) return cost
+     if (!this.safeToBreak(block)) return 100 // Can't break, so can't move
+     toBreak.push(block.position)

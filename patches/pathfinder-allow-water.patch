@@ -1,0 +1,79 @@
+--- a/lib/movements.js	2026-11-09 07:43:42.956901511 +0000
++++ b/lib/movements.js	2026-11-09 07:47:36.629989922 +0000
+@@ -29,6 +29,7 @@
+     this.dontCreateFlow = true
+     this.dontMineUnderFallingBlock = true
+     this.allow1by1towers = true
++    this.allowWater = false // v10.5.3 Segs: when true the A* may route through liquid (grave recovery only — the grave can be underwater, run 127). Default false: water is impassable (run 148 prevention).
+     this.allowFreeMotion = false
+     this.allowParkour = true
+     this.allowSprinting = true
+@@ -295,7 +296,10 @@
+     // (the water watchdog drives climb-out), and dropping into a pool
+     // via the A* is blocked too, by design -- Segs reports the water
+     // and offers /tpa instead of walking into a trap.
+-    if (block.liquid) return 100
++    if (block.liquid) {
++      if (!this.allowWater) return 100
++      return cost // v10.5.3: grave recovery — water is a medium to swim through, not a block to break (canDig=false during recovery, so safeToBreak would refuse it)
++    }
+     if (block.safe) return cost
+     if (!this.safeToBreak(block)) return 100 // Can't break, so can't move
+     toBreak.push(block.position)
+@@ -497,7 +501,7 @@
+ 
+     const blockLand = this.getLandingBlock(node, dir)
+     if (!blockLand) return
+-    if (blockLand.liquid) return // v10.5.3: never drop into water — Segs cannot climb out (run 148)
++    if (blockLand.liquid && !this.allowWater) return // v10.5.3: never drop into water — Segs cannot climb out (run 148)
+     if (!this.infiniteLiquidDropdownDistance && ((node.y - blockLand.position.y) > this.maxDropDown)) return // Don't drop down into water
+ 
+     cost += this.safeOrBreak(blockB, toBreak)
+@@ -507,7 +511,7 @@
+     cost += this.safeOrBreak(blockD, toBreak)
+     if (cost > 100) return
+ 
+-    if (blockC.liquid) return // dont go underwater
++    if (blockC.liquid && !this.allowWater) return // dont go underwater (unless allowWater — grave recovery)
+ 
+     cost += this.getNumEntitiesAt(blockLand.position, 0, 0, 0) * this.entityCost // add cost for entities
+ 
+@@ -523,12 +527,12 @@
+ 
+     const blockLand = this.getLandingBlock(node, { x: 0, z: 0 })
+     if (!blockLand) return
+-    if (blockLand.liquid) return // v10.5.3: never drop into water — Segs cannot climb out (run 148)
++    if (blockLand.liquid && !this.allowWater) return // v10.5.3: never drop into water — Segs cannot climb out (run 148)
+ 
+     cost += this.safeOrBreak(block0, toBreak)
+     if (cost > 100) return
+ 
+-    if (this.getBlock(node, 0, 0, 0).liquid) return // dont go underwater
++    if (this.getBlock(node, 0, 0, 0).liquid && !this.allowWater) return // dont go underwater (unless allowWater — grave recovery)
+ 
+     cost += this.getNumEntitiesAt(blockLand.position, 0, 0, 0) * this.entityCost // add cost for entities
+ 
+@@ -601,12 +605,12 @@
+ 
+       if (blockC.safe) cost += this.getNumEntitiesAt(blockC.position, 0, 0, 0) * this.entityCost
+ 
+-      if (ceilingClear && blockB.safe && blockC.safe && blockD.physical && !blockB.liquid && !blockC.liquid) { // v10.5.3: never walk into water
++      if (ceilingClear && blockB.safe && blockC.safe && blockD.physical && (this.allowWater || (!blockB.liquid && !blockC.liquid))) { // v10.5.3: never walk into water (unless allowWater — grave recovery)
+         cost += this.exclusionStep(blockB)
+         // Forward
+         neighbors.push(new Move(blockC.position.x, blockC.position.y, blockC.position.z, node.remainingBlocks, cost, [], [], true))
+         break
+-      } else if (ceilingClear && blockB.safe && blockC.physical && !blockB.liquid) { // v10.5.3: never jump up into water
++      } else if (ceilingClear && blockB.safe && blockC.physical && (this.allowWater || !blockB.liquid)) { // v10.5.3: never jump up into water (unless allowWater — grave recovery)
+         // Up
+         if (blockA.safe && d !== 4) { // 4 Blocks forward 1 block up is very difficult and fails often
+           cost += this.exclusionStep(blockA)
+@@ -615,7 +619,7 @@
+           neighbors.push(new Move(blockB.position.x, blockB.position.y, blockB.position.z, node.remainingBlocks, cost, [], [], true))
+           break
+         }
+-      } else if ((ceilingClear || d === 2) && blockB.safe && blockC.safe && blockD.safe && floorCleared && !blockD.liquid) { // v10.5.3: never step down into water
++      } else if ((ceilingClear || d === 2) && blockB.safe && blockC.safe && blockD.safe && floorCleared && (this.allowWater || !blockD.liquid)) { // v10.5.3: never step down into water (unless allowWater — grave recovery)
+         // Down
+         const blockE = this.getBlock(node, dx, -2, dz)
+         if (blockE.physical) {

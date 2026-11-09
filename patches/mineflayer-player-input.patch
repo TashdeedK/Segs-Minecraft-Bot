@@ -1,0 +1,38 @@
+diff --git a/lib/plugins/physics.js b/lib/plugins/physics.js
+index 81a589b..c0f5622 100644
+--- a/lib/plugins/physics.js
++++ b/lib/plugins/physics.js
+@@ -272,6 +272,33 @@ function inject (bot, { physicsEnabled, maxCatchupTicks }) {
+     assert.ok(typeof state === 'boolean', `invalid state: ${state}`)
+     if (controlState[control] === state) return
+     controlState[control] = state
++    // v10.5.3 Segs: send the FULL input state via player_input on any
++    // control change (26.3+, newPlayerInputPacket). Paper stores it as
++    // lastClientInput and applies it every server tick -- without this,
++    // the server NEVER sees jump=true from this client (the fork only
++    // ever sent player_input for sneak and vehicles), so the server's
++    // swim-up / jumpFromGround logic never fires for Segs and Paper
++    // snaps him back down in water (runs 106, 114-117: feet oscillate
++    // 70.05-70.39, server corrections every 3rd tick). Change-triggered
++    // only: setControlState early-returns when the state is unchanged,
++    // so no per-tick sends -- the per-tick variant degraded bow combat
++    // in v10.5.1 and was dropped. The sneak branch below is kept for
++    // older versions; on 26.3+ this send already covers shift.
++    if (bot.supportFeature('newPlayerInputPacket')) {
++      try {
++        bot._client.write('player_input', {
++          inputs: {
++            forward: controlState.forward,
++            backward: controlState.back,
++            left: controlState.left,
++            right: controlState.right,
++            jump: controlState.jump,
++            sprint: controlState.sprint,
++            shift: controlState.sneak
++          }
++        })
++      } catch (e) {}
++    }
+     if (control === 'jump' && state) {
+       bot.jumpQueued = true
+     } else if (control === 'sprint') {

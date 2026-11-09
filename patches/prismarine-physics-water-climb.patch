@@ -1,0 +1,258 @@
+diff --git a/index.js b/index.js
+index 4320efb..0202c34 100644
+--- a/index.js
++++ b/index.js
+@@ -471,6 +471,56 @@ function Physics (mcData, world) {
+     return !getSurroundingBBs(world, pBB).some(x => pBB.intersects(x)) && getWaterInBB(world, pBB).length === 0
+   }
+ 
++  // v10.5.1 Segs (shipped patch) — swimming climb-out. A vanilla
++  // player climbs a 1-block shore because its swimming pose is 0.6
++  // high; this engine always uses a 1.8-high box, so the old test —
++  // "does the full box fit 0.6 above the feet?" — could never pass
++  // against a 1-high shore (the box at +0.6 still overlaps the shore
++  // block), and the impulse only fired on ticks when horizontal
++  // velocity happened to be ~0, bobbing the feet to ~71.6 and back
++  // (probe-physics-water, run-106 pond). Test the LANDING instead:
++  // the top of the blocking block ahead, with a full 1.8 of headroom
++  // above it. A 1-high shore passes; a ceiling above the landing
++  // fails. (A 2-high wall also passes the headroom test, but the
++  // impulse cannot lift the feet 2 blocks, so it just bobs there —
++  // same as before, and the bot's water watchdog strafes away.)
++  function canClimbOutOfLiquid (world, pos, vel, entity) {
++    // Direction Segs is pressing: velocity while moving, facing (yaw)
++    // when velocity is ~0 — which is exactly the state when pressed
++    // against a wall, so the check must not pass by default there.
++    let dx, dz
++    const speed = Math.hypot(vel.x, vel.z)
++    if (speed >= 0.01) {
++      dx = vel.x / speed
++      dz = vel.z / speed
++    } else {
++      const yaw = Math.PI - entity.yaw
++      dx = -Math.sin(yaw)
++      dz = Math.cos(yaw)
++    }
++    // Blocking column 0.6 ahead: scan up from feet level through any
++    // air, then through the consecutive solid stack. The landing is
++    // the top of that stack. It must be within reach — a 1-high shore
++    // from the surface is ~1.4 blocks above the feet, a 2-high wall
++    // ~2.4 — and have a full 1.8 of headroom above it (the box shifted
++    // toward the wall, as it will be once Segs moves forward).
++    const bx = Math.floor(pos.x + dx * 0.6)
++    const bz = Math.floor(pos.z + dz * 0.6)
++    const baseY = Math.floor(pos.y)
++    let top = -1
++    for (let dy = 0; dy <= 3; dy++) {
++      const b = world.getBlock(new Vec3(bx, baseY + dy, bz))
++      if (b && b.boundingBox === 'block') {
++        top = baseY + dy + 1
++        continue
++      }
++      if (top > 0) break
++    }
++    if (top < 0) return false
++    if (top - pos.y > 1.6) return false
++    return doesNotCollide(world, new Vec3(pos.x + dx * 0.6, top, pos.z + dz * 0.6))
++  }
++
+   function moveEntityWithHeading (entity, world, strafe, forward) {
+     const vel = entity.vel
+     const pos = entity.pos
+@@ -504,7 +554,7 @@ function Physics (mcData, world) {
+       vel.x *= horizontalInertia
+       vel.z *= horizontalInertia
+ 
+-      if (entity.isCollidedHorizontally && doesNotCollide(world, pos.offset(vel.x, vel.y + 0.6 - pos.y + lastY, vel.z))) {
++      if (entity.isCollidedHorizontally && (supportFeature('waterClimbOutLanding') ? canClimbOutOfLiquid(world, pos, vel, entity) : doesNotCollide(world, pos.offset(vel.x, vel.y + 0.6 - pos.y + lastY, vel.z)))) {
+         vel.y = physics.outOfLiquidImpulse // jump out of liquid
+       }
+     } else if (entity.elytraFlying) {
+@@ -611,6 +661,23 @@ function Physics (mcData, world) {
+       vel.y *= physics.airdrag
+       vel.x *= inertia
+       vel.z *= inertia
++
++      // v10.5.1 Segs: spend the out-of-liquid boost (see simulatePlayer).
++      // Only while horizontally collided — i.e. pressed against the
++      // shore — so a normal jump on land is unaffected.
++      // NOTE (live probe run 117): a gentler 0.1 sustained rise was
++      // tried and is WORSE live (maxFeet 71.00, never out) than the
++      // 0.3 impulse (feet 72.00, x<-95, OUT at tick 335, then pulled
++      // back by the server). The server's sim is the authority and
++      // will not sustain the climb either way — its `jumping` is
++      // never set from the input, its Motion stays 0, its own
++      // jumpOutOfFluid never fires (its zero-length move wipes
++      // horizontalCollision before the check). Keep the 0.3 impulse:
++      // it is the only version that gets Segs out at all live, and
++      // it is proven in isolation (fork tests) and in the pure sim.
++      if (entity.waterExitBoost > 0 && entity.isCollidedHorizontally && canClimbOutOfLiquid(world, pos, vel, entity)) {
++        vel.y = Math.max(vel.y, physics.outOfLiquidImpulse)
++      }
+     }
+   }
+ 
+@@ -720,6 +787,25 @@ function Physics (mcData, world) {
+     entity.isInWater = isInWaterApplyCurrent(world, waterBB, vel)
+     entity.isInLava = isMaterialInBB(world, lavaBB, lavaIds)
+ 
++    // v10.5.1 Segs: out-of-liquid boost window. The impulse in the
++    // water branch stops the moment isInWater flips false (feet
++    // ~70.6), and land gravity then pulls Segs back down before it
++    // reaches a 1-high shore top (72.0). Keep a 10-tick window after
++    // the last in-water tick; the land branch spends it below.
++    // Arm it on ANY body contact with water, not just isInWater:
++    // isInWater uses a BB contracted 0.401 from the bottom, so a
++    // player floating at the surface (feet ~70.6, body still in the
++    // water — the server floats it there and pins it) reads as NOT
++    // in water and the boost never arms (live probe run 117: feet
++    // 70.59-70.67, inW=false from tick 1, boost 0 the whole run).
++    // The full 1.8-high BB still touches the water up to the surface
++    // (70.889), so that is the arming condition. On dry land the body
++    // never touches water and the boost never arms.
++    if (supportFeature('waterClimbOutLanding')) {
++      if (entity.isInWater || getWaterInBB(world, getPlayerBB(pos)).length > 0) entity.waterExitBoost = 10
++      else if (entity.waterExitBoost > 0) entity.waterExitBoost--
++    }
++
+     // Reset velocity component if it falls under the threshold
+     if (Math.abs(vel.x) < physics.negligeableVelocity) vel.x = 0
+     if (Math.abs(vel.y) < physics.negligeableVelocity) vel.y = 0
+diff --git a/lib/features.json b/lib/features.json
+index c20914c..2320174 100644
+--- a/lib/features.json
++++ b/lib/features.json
+@@ -38,5 +38,10 @@
+     "name": "climbableTrapdoor",
+     "description": "Trapdoors placed directly above ladders become climbable",
+     "versions": ["1.9", "1.10", "1.11", "1.12", "1.13", "1.14", "1.15", "1.16", "1.17", "1.18", "1.19", "1.20", "26.3"]
++  },
++  {
++    "name": "waterClimbOutLanding",
++    "description": "Out-of-liquid impulse tests the landing top (with headroom) instead of a 0.6-high full-box fit, and persists a few ticks after the feet leave the water, so a swimming player can climb a 1-high shore with the engine's 1.8-high box",
++    "versions": ["26.3"]
+   }
+ ]
+diff --git a/test/water-climb.test.js b/test/water-climb.test.js
+new file mode 100644
+index 0000000..e08920a
+--- /dev/null
++++ b/test/water-climb.test.js
+@@ -0,0 +1,117 @@
++/* eslint-env mocha */
++
++// v10.5.1 Segs regression test — swimming climb-out onto a 1-high
++// shore. Before the fix the out-of-liquid impulse only fired on ticks
++// when horizontal velocity happened to be ~0 (the old gate tested
++// whether the full 1.8-high box fit 0.6 above the feet, which can
++// never pass against a 1-high shore), and it stopped entirely once
++// the feet rose above ~70.6 because isInWater flips false there —
++// so the player bobbed to ~71.6 and fell back forever (run-106 pond).
++// The fix tests the landing (top of the blocking block + headroom)
++// and keeps the impulse for 10 ticks after the feet leave the water.
++const { Physics, PlayerState } = require('prismarine-physics')
++const { Vec3 } = require('vec3')
++const expect = require('expect')
++
++const mcData = require('minecraft-data')('26.3')
++const Block = require('prismarine-block')('26.3')
++
++const STONE = mcData.blocksByName.stone.id
++const WATER = mcData.blocksByName.water.id
++const AIR = mcData.blocksByName.air.id
++
++// Pond matching run 106: floor stone y69, water y70 (x -95..-85),
++// shore stone y71 (top 72) west of x=-95, air above.
++function pondWorld (shoreHeight) {
++  return {
++    getBlock: (pos) => {
++      let type = AIR
++      if (pos.y === 69) type = STONE
++      if (pos.y === 70 && pos.x >= -95 && pos.x <= -85 && pos.z >= 155 && pos.z <= 165) type = WATER
++      if (pos.x < -95 && pos.y >= 71 && pos.y < 71 + shoreHeight && pos.z >= 150 && pos.z <= 170) type = STONE
++      const b = new Block(type, 0, 0)
++      b.position = pos
++      return b
++    }
++  }
++}
++
++function fakePlayer (pos) {
++  return {
++    entity: {
++      position: pos,
++      velocity: new Vec3(0, 0, 0),
++      onGround: false,
++      isInWater: false,
++      isInLava: false,
++      isInWeb: false,
++      isCollidedHorizontally: false,
++      isCollidedVertically: false,
++      elytraFlying: false,
++      yaw: Math.PI / 2, // forward = west, into the shore
++      pitch: 0,
++      effects: {}
++    },
++    jumpTicks: 0,
++    jumpQueued: false,
++    fireworkRocketDuration: 0,
++    version: '26.3',
++    inventory: { slots: [] }
++  }
++}
++
++function swimAtShore (world, ticks) {
++  const physics = Physics(mcData, world)
++  const controls = { forward: true, back: false, left: false, right: false, jump: true, sprint: true, sneak: false }
++  const player = fakePlayer(new Vec3(-90, 70, 160.5))
++  const state = new PlayerState(player, controls)
++  let maxFeet = -Infinity
++  for (let i = 0; i < ticks; i++) {
++    physics.simulatePlayer(state, world).apply(player)
++    maxFeet = Math.max(maxFeet, player.entity.position.y)
++    if (player.entity.position.y >= 72 && player.entity.position.x < -95) return { player, maxFeet, outAt: i }
++  }
++  return { player, maxFeet, outAt: -1 }
++}
++
++function swimAtShoreFromFloat (world, ticks) {
++  // Live case (run 117): Segs arrives at the wall already floating at
++  // the surface (feet 70.61), where the fork's contracted-BB isInWater
++  // check already reads false — the boost must still arm (body contact
++  // with water) and climb Segs out.
++  const physics = Physics(mcData, world)
++  const controls = { forward: true, back: false, left: false, right: false, jump: true, sprint: true, sneak: false }
++  const player = fakePlayer(new Vec3(-94.7, 70.61, 160.5))
++  const state = new PlayerState(player, controls)
++  let maxFeet = -Infinity
++  for (let i = 0; i < ticks; i++) {
++    physics.simulatePlayer(state, world).apply(player)
++    maxFeet = Math.max(maxFeet, player.entity.position.y)
++    if (player.entity.position.y >= 72 && player.entity.position.x < -95) return { player, maxFeet, outAt: i }
++  }
++  return { player, maxFeet, outAt: -1 }
++}
++
++describe('Water climb-out (v10.5.1 Segs)', () => {
++  it('climbs a 1-high shore out of 1-deep water', () => {
++    const { player, maxFeet, outAt } = swimAtShore(pondWorld(1), 400)
++    expect(outAt).toBeGreaterThanOrEqual(0)
++    expect(player.entity.position.y).toBeGreaterThanOrEqual(72)
++    expect(player.entity.position.x).toBeLessThan(-95)
++    expect(maxFeet).toBeGreaterThanOrEqual(72)
++  })
++
++  it('does not climb a 2-high wall out of the water', () => {
++    const { player, maxFeet } = swimAtShore(pondWorld(2), 400)
++    expect(player.entity.position.y).toBeLessThan(73)
++    expect(maxFeet).toBeLessThan(73)
++  })
++
++  it('climbs a 1-high shore when starting at the surface float (feet 70.61)', () => {
++    const { player, maxFeet, outAt } = swimAtShoreFromFloat(pondWorld(1), 400)
++    expect(outAt).toBeGreaterThanOrEqual(0)
++    expect(player.entity.position.y).toBeGreaterThanOrEqual(72)
++    expect(player.entity.position.x).toBeLessThan(-95)
++    expect(maxFeet).toBeGreaterThanOrEqual(72)
++  })
++})

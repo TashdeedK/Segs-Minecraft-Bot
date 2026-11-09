@@ -6,6 +6,7 @@
 #   segs-26.3/mineflayer, node-minecraft-protocol, prismarine-chunk, ...
 #   Segs-Minecraft-Bot/bot.js  (this repo)
 set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$(dirname "$0")/.."
 PIN_MINEFLAYER=af53e8744eb46e1a56bf45c5b2b03f4bb8ed973d
 PIN_PROTOCOL=cc1bfca769d36e90f8941138c1f63144e55d3403
@@ -26,6 +27,12 @@ clone_pin prismarine-chunk "$PIN_CHUNK"
 clone_pin prismarine-item "$PIN_ITEM"
 clone_pin prismarine-physics "$PIN_PHYSICS"
 clone_pin minecraft-data "$PIN_DATA"
+echo "== applying Segs water-climb patch to prismarine-physics (v10.5.1) =="
+node "$SCRIPT_DIR/patches/apply-prismarine-physics-patch.js" ./prismarine-physics || true
+echo "== applying Segs collision+sync patch to mineflayer (v10.5.1) =="
+node "$SCRIPT_DIR/patches/apply-mineflayer-collision-sync-patch.js" ./mineflayer || true
+echo "== applying Segs player-input patch to mineflayer (v10.5.3) =="
+node "$SCRIPT_DIR/patches/apply-mineflayer-player-input-patch.js" ./mineflayer || true
 echo "== installing fork mineflayer (this takes a minute) =="
 cd mineflayer && npm install --no-audit --no-fund && cd ..
 echo "== verifying native 26.3 data =="

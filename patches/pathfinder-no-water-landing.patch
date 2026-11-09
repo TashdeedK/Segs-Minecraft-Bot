@@ -1,0 +1,43 @@
+diff --git a/lib/movements.js b/lib/movements.js
+--- a/lib/movements.js	2026-11-09 05:02:25.315023633 +0000
++++ b/lib/movements.js	2026-11-09 05:02:25.317735285 +0000
+@@ -497,6 +497,7 @@
+ 
+     const blockLand = this.getLandingBlock(node, dir)
+     if (!blockLand) return
++    if (blockLand.liquid) return // v10.5.3: never drop into water — Segs cannot climb out (run 148)
+     if (!this.infiniteLiquidDropdownDistance && ((node.y - blockLand.position.y) > this.maxDropDown)) return // Don't drop down into water
+ 
+     cost += this.safeOrBreak(blockB, toBreak)
+@@ -522,6 +523,7 @@
+ 
+     const blockLand = this.getLandingBlock(node, { x: 0, z: 0 })
+     if (!blockLand) return
++    if (blockLand.liquid) return // v10.5.3: never drop into water — Segs cannot climb out (run 148)
+ 
+     cost += this.safeOrBreak(block0, toBreak)
+     if (cost > 100) return
+@@ -599,12 +601,12 @@
+ 
+       if (blockC.safe) cost += this.getNumEntitiesAt(blockC.position, 0, 0, 0) * this.entityCost
+ 
+-      if (ceilingClear && blockB.safe && blockC.safe && blockD.physical) {
++      if (ceilingClear && blockB.safe && blockC.safe && blockD.physical && !blockB.liquid && !blockC.liquid) { // v10.5.3: never walk into water
+         cost += this.exclusionStep(blockB)
+         // Forward
+         neighbors.push(new Move(blockC.position.x, blockC.position.y, blockC.position.z, node.remainingBlocks, cost, [], [], true))
+         break
+-      } else if (ceilingClear && blockB.safe && blockC.physical) {
++      } else if (ceilingClear && blockB.safe && blockC.physical && !blockB.liquid) { // v10.5.3: never jump up into water
+         // Up
+         if (blockA.safe && d !== 4) { // 4 Blocks forward 1 block up is very difficult and fails often
+           cost += this.exclusionStep(blockA)
+@@ -613,7 +615,7 @@
+           neighbors.push(new Move(blockB.position.x, blockB.position.y, blockB.position.z, node.remainingBlocks, cost, [], [], true))
+           break
+         }
+-      } else if ((ceilingClear || d === 2) && blockB.safe && blockC.safe && blockD.safe && floorCleared) {
++      } else if ((ceilingClear || d === 2) && blockB.safe && blockC.safe && blockD.safe && floorCleared && !blockD.liquid) { // v10.5.3: never step down into water
+         // Down
+         const blockE = this.getBlock(node, dx, -2, dz)
+         if (blockE.physical) {

@@ -9,7 +9,7 @@
     "mineflayer-tool": "^1.2.0",
     "vec3": "^0.1.8"
   },
-  "description": "Segs - free Minecraft bot for native 26.3 servers, no ViaVersion. Custom Misty4119 fork build, low RAM (view distance 5).",
+  "description": "Segs - free Minecraft bot for native 26.3 servers, no ViaVersion. Custom Misty4119 fork build, low RAM (view distance 7).",
   "engines": {
     "node": ">=22"
   },
@@ -21,5 +21,5 @@
     "setup-26.3": "bash setup-26.3.sh",
     "start": "node bot.js"
   },
-  "version": "9.4.0"
+  "version": "10.5.3"
 }
