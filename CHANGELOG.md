@@ -1,4 +1,4 @@
-# Segs — CHANGELOG (v10 → v10.5.3)
+# Segs — CHANGELOG (v10 → v10.6)
 
 > **How to read this file.** One section per version, newest last in the file's
 > history but listed in release order below. Every claim comes from
@@ -703,6 +703,82 @@ gotoPos, combatTick, and two chat lines). Runs 141–162.
 
 ---
 
+## v10.6 — 2026-11-14 — package 10.6.0
+
+Zero-setup storage-unit learning ("look and learn") + the live-bug round
+from Tash's Youniga session (2026-11-14, Segs v10.5.3): silent follow
+freeze, open door not entered, farm slowness + skip spam, dual drivers,
+double replies, false seed warnings, packetrate dual timer, serpentine
+farming, eat false-failures, harvest over-counting, silent farm end,
+pickup, sleep fake-fast, typos, store phrasings. Simulation runs 164–181.
+
+### Changed
+- Storage-unit scan: "Segs this is the storage unit" + aliases (scan /
+  learn / map / see phrasings). Radius 160 blocks, count 600, client
+  view-distance 10. Wall sliced into 2-block columns; each column
+  classified from sign hints (known categories only) + 1–2 chest
+  samples via the existing `categoryOf`; stored in the taught-column
+  format; empty columns asked about once and claimed on answer. Scan
+  never sets `permanentHome`. Sort auto-scans when no columns are
+  known (runs 164–167, 170).
+- Container dedup rewritten (found by run 164): blockstate-aware
+  left/right pairing in `findNearbyContainers` and
+  `sameChestInventory`/`mergeChestLists` — a continuous wall of
+  single chests is no longer collapsed (run 164b/c → 164d).
+- Follow freeze root-caused and fixed: Paper rubber-bands every
+  movement packet when the client starts flush against a block face
+  (probe-flush: frozen at x=-98.3/-98.32, climbs from -98.5). New
+  `tryStepClimb` (back up ~1 block, continuous sprint+forward+jump,
+  chains steps) + net-progress stuck detection + a `forcedMove`
+  rubber-band detector so future pins log instead of staying silent
+  (runs 168, 181). Door assist handles already-open doors, logs every
+  interaction, and re-plans after passing (run 168).
+- Farm rewritten to serpentine row-major (boustrophedon): rows from
+  the layout's longer axis, alternating direction, harvest + replant
+  in passing, move only when >3.2 away, break-verified counting,
+  replant pass, pickup sweep after each row + final, sweep summary
+  said in chat, honest waiting line when nothing is ripe. False
+  "need X to replant" warnings deleted (runs 169, 172, 175, 178).
+  Farm rate on the 4×6 test plot: 23.4 crops/min (v10.5.3, 172a) →
+  32/min full sweep / 38/min harvest-only (172b), 60/min clean
+  (175b, 181b).
+- Latest-wins enforced: farm stops follow and vice versa, sort stops
+  follow (run 169). Packetrate single timer after reconnect
+  (run 173). Eat verification bulletproofed: always polls for the
+  food rise even after a throw, verdict logged with before/after,
+  never reports failure when food rose (run 171). Sleep contract:
+  "morning" only after a real daytime wake, daytime refusal, honest
+  "something woke me up" (run 176).
+- Server-home amnesia fixed (live 2026-11-14): duplicate-name
+  refusals (French + English) teach the brain the home exists;
+  "go home \<name\>" tries `/home` even for unknown names and learns
+  on success; "segs home \<name\>" alias added; no-such-home replies
+  reported honestly (run 182, fake-responder — the real `/home`
+  teleport needs the live Youniga check).
+- Replies: one command = one reply path. Whole-word acks, teaches and
+  queries never acked, `tp here` handler added, multi-word landmark
+  names kept whole, chat dedup guard for echo duplicates (runs 170,
+  177). Typo table + Levenshtein fuzzy crop match; the silent wheat
+  default is gone — unclear crops ask (run 178). Store phrasings
+  ("put X is/in Y chest", "store X in the Y chest") route to the
+  store code with landmarks+areas lookup (runs 177, 179). Drop-all
+  exact counts preserved (run 180).
+
+### Honest limits
+- All simulation-only. Needs Tash's Youniga test: the real
+  160-double-chest wall scan, real-server eat/door/farm under
+  latency, real night sleep/wake, the real SimpleGraves grave block
+  type, the farm/pickup step-climb recovery end-to-end (integrated,
+  never triggered in simulation — runs 175b/181), tpa landing.
+- The early night wake (18.9s, still night, run 176) is unexplained
+  — same unknown as the live 0.7s/5s wakes; only the message
+  contract is fixed.
+- Scan bounded by what the server sends (view-distance request 10);
+  largest-connected-run clustering ignores a second wall; signs
+  override only for known categories.
+
+---
+
 ## Standing limits (all versions, unchanged)
 
 - Water climb-out onto a vertical 1-block shore: flaky live, not fixed.
@@ -712,8 +788,11 @@ gotoPos, combatTick, and two chat lines). Runs 141–162.
   (best 1 kill / 4 hits, v10.1).
 - Creeper bow `consumed:NO` flake: mechanism unknown, not reproduced
   since creeper3.
-- Sleep fake-fast (5 s "morning"), survive-routine contradictory
-  messages, hp 20 → 16 unexplained drop in Tash's log: still
-  uninvestigated.
+- Sleep fake-fast message contract FIXED in v10.6 (run 176): "morning"
+  only after a real daytime wake. The early-wake CAUSE (live 0.7s/5s,
+  simulation 18.9s, still night) is still unexplained.
+- Survive-routine contradictory messages (partly addressed by
+  v10.6 eat-verdict logging), hp 20 → 16 unexplained drop in Tash's
+  log: still uninvestigated.
 - Everything above is simulation proof only. Real-server testing on
-  Youniga by Tash is still pending for v10–v10.5.3.
+  Youniga by Tash is still pending for v10–v10.6.

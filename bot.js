@@ -103,6 +103,19 @@ let afkMode = false
 let afkTimer = null
 let guardMode = false
 let stopping = false
+// v10.6 INTERVAL REGISTRY (live bug 7: packetrate dual timer — two
+// interleaved 10s reporters, one frozen at total 15082). createBot()
+// runs again on every auto-reconnect, and every watchdog/packetrate
+// setInterval created inside it (or inside bot.once('spawn')) LEAKED:
+// the old interval kept running against a dead client/closure while
+// a new one started. The old per-function guards (let edgeWatchdog
+// etc.) were createBot-LOCALS, so they reset to null on every
+// reconnect and guarded nothing. ALL long-lived intervals register
+// HERE, at module level: watchdogs skip re-start when one is already
+// running (their closures read module-level `bot`, so the first
+// interval keeps working against the new bot); the packetrate
+// reporter is cleared + restarted (it counts a per-client wrapper).
+const _watchdogTimers = {}
 
 // ---- v6: LOG SYSTEM — how Segs "learns" day by day ----
 // Everything Segs does is written to a logs/ folder next to bot.js:
@@ -211,6 +224,21 @@ const CROPS = {
   beetroot: { block: 'beetroots', maxAge: 3, seed: 'beetroot_seeds' },
 }
 
+// v10.6: Levenshtein edit distance for fuzzy crop matching ("farm
+// potat" must resolve to potato, never silently default to wheat).
+// Small strings only (command words vs 4 crop names) — O(n*m) is fine.
+function editDistance (a, b) {
+  const m = a.length, n = b.length
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)])
+  for (let j = 0; j <= n; j++) dp[0][j] = j
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+  }
+  return dp[m][n]
+}
+
 // Item name helpers: "iron pickaxe" -> "iron_pickaxe", "a diamond sword" -> "diamond_sword"
 const NUMBER_WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 }
 // v10.3: quantities + filler words. "all"/"everything"/"every" means
@@ -306,6 +334,7 @@ if (!('pendingSpawnBed' in brain)) brain.pendingSpawnBed = null
 if (!brain.roomChests) brain.roomChests = []
 if (!('lastGrave' in brain)) brain.lastGrave = null
 if (!brain.columns) brain.columns = {}
+if (!('storageUnit' in brain)) brain.storageUnit = null // v10.6: { anchor: [x,y,z], scannedAt } — set by the storage-unit scan
 if (!brain.areas) brain.areas = {}
 if (!brain.itemChest) brain.itemChest = {}
 if (!('sortJob' in brain)) brain.sortJob = null
@@ -313,8 +342,9 @@ if (!('trashChest' in brain)) brain.trashChest = null
 if (!brain.sugarcaneChests) brain.sugarcaneChests = []
 if (!('myRoom' in brain)) brain.myRoom = null
 let lastSetHome = null // name of the most recent /sethome, so the permanent home can link to it
-let pendingSethome = null // { name, at } — waiting for the server's reply to /sethome
-let pendingHome = null // { name, at, started, cancelled } — waiting for the /home warmup messages
+let pendingSethome = null // { name, at, failed, why, duplicate } — waiting for the server's reply to /sethome
+let pendingHome = null // { name, at, started, cancelled, noSuchHome } — waiting for the /home warmup messages
+let lastHomeFailure = null // 'cancelled' | 'nosuchhome' | 'nomove' — why the last tryServerHome failed (null on success)
 let connected = false // true only while actually on the server; loops must not run on stale state
 let pathMovements = null // the Movements object, so sprint + danger-avoid can be tuned live
 let gotoAllowWater = false // true only during a gotoPos({ allowWater: true }) — grave recovery (run 127). climbAssist's liquid bails and the A* water blocks are skipped while set; the gotoPos wrapper restores it in a finally.
@@ -323,6 +353,7 @@ let lastEvadeAt = 0
 let sortStopRequested = false // set when the owner says stop during a sort
 let sortPausedByStop = false // the sort already reported the pause; the queued stop handler stays quiet
 let pendingContinue = null // { job } — Segs asked "continue this sorting or another one?" and waits for the answer
+let pendingUnknownColumns = [] // v10.6: [{ num, key, chests, pos }] — scan found empty columns and asked what goes in each; the owner's next message may answer
 let recoveringGrave = false
 function saveBrain () { try { fs.writeFileSync('./brain.json', JSON.stringify(brain, null, 2)) } catch (e) {} }
 // Save the last ACTION task (not questions like "what time is it") so "do it again" works.
@@ -353,7 +384,14 @@ function cleanClause (s) {
 }
 // Split "go to the farm and farm wheat and then come back to me"
 // into ["go to the farm", "farm wheat", "come back to me"]
+// v10.6: NEVER split a teach/remember/learn — "this is potato and
+// carrot chest" is ONE multi-word name, not "this is potato" +
+// "carrot chest" (live bug 5b: recorded area "potato", then
+// "didnt get that" for the second clause). Same for macros:
+// "learn daily means go to the farm and farm wheat" must reach the
+// learn handler whole, or the macro is truncated at the first "and".
 function splitClauses (req) {
+  if (/^(this is|remember|learn)\b/.test(req)) return [req]
   return req
     .split(/\s+and then\s+|\s+then\s+|\s+and\s+|,\s+|\s+after that\s+/)
     .map(cleanClause).filter(Boolean)
@@ -368,14 +406,18 @@ function createBot () {
     username: BOT_NAME,
     version: EFFECTIVE_VERSION,
     auth: 'offline',
-    // v10.5 VIEW DISTANCE 7: tell the server to send 7 chunks around
-    // us. The bot does not render, so this is the main RAM lever: ~225
-    // chunks instead of ~121 at view 5. Server may cap it lower/higher;
-    // 7 is our request. On a 500MB-1GB machine this keeps the bot at
-    // ~200-400MB. NOTE: this only sets OUR test server's view distance
-    // via the client settings packet — on Youniga the SERVER owner sets
+    // v10.6 VIEW DISTANCE 10 (was 7 in v10.5): tell the server to
+    // send 10 chunks around us, so the storage-unit scan (Tash:
+    // "every chest around, within 10 view distance", ~160 blocks)
+    // can see the whole wall plus the room and farm chests. The bot
+    // does not render, so this is the main RAM lever: ~317 chunks
+    // instead of ~225 at view 7 — still inside the 500MB-1GB
+    // budget on Tash's machine. The SERVER may cap it lower; 10 is
+    // our request, and the scan is bounded by what the server
+    // actually sends. NOTE: this only sets the request via the
+    // client settings packet — on Youniga the SERVER owner sets
     // view/simulation distance, Segs cannot change it from the bot.
-    viewDistance: 7,
+    viewDistance: 10,
   })
 
   bot.loadPlugin(pathfinder)
@@ -457,7 +499,11 @@ function createBot () {
         }
         return result
       }
-      setInterval(() => {
+      // v10.6: clear the previous reporter's interval first — the
+      // old one counts a DEAD client's wrapper (frozen total) and
+      // would interleave with this one forever (live dual timer).
+      if (_watchdogTimers.packetrate) clearInterval(_watchdogTimers.packetrate)
+      _watchdogTimers.packetrate = setInterval(() => {
         const per10 = prTotal - prLastTotal; prLastTotal = prTotal
         logEvent('packetrate', 'outgoing ' + (per10 / 10).toFixed(1) + '/s avg (last 10s), peak 1s window ' + prPeak + '/s, total ' + prTotal)
       }, 10000)
@@ -636,7 +682,18 @@ function createBot () {
   // lastAckAt lets handleTalk skip its own "ok, doing it step by step"
   // intro when the ack already said it.
   let lastAckAt = 0
-  const ACK_WORDS = ['go', 'follow', 'tp', 'craft', 'cook', 'smelt', 'dig', 'mine', 'chop', 'place', 'farm', 'sleep', 'sort', 'move', 'build', 'get', 'pick', 'eat', 'drop', 'give', 'stop', 'guard', 'fish', 'sethome', 'home', 'inventory', 'stats', 'status', 'list', 'remember', 'learn', 'forget', 'make', 'come', 'return', 'check', 'dance', 'jump', 'look', 'enable', 'disable', 'continue', 'afk', 'stay', 'wait']
+  // v10.6 ACK FIX (live bugs 5a/5c): the old ack fired on SUBSTRING
+  // matches ('wheat chest' contains 'eat') with a RANDOM ack from one
+  // pool — so a no-movement teach got "on my way", and an unmatched
+  // command got "coming" AND the "didnt get that" fallback. Now:
+  // whole-word matching only; teaches, queries and instant commands
+  // are NEVER acked (their handler replies immediately, one command
+  // = one reply); movement commands get movement acks, slow work
+  // commands get neutral acks. Only commands that TAKE TIME are
+  // acked at all — the ack exists so Tash knows Segs heard, while
+  // the work runs.
+  const ACK_MOVE_WORDS = ['go', 'follow', 'tp', 'teleport', 'come', 'return', 'move']
+  const ACK_WORK_WORDS = ['craft', 'cook', 'smelt', 'dig', 'mine', 'chop', 'place', 'farm', 'sleep', 'sort', 'build', 'get', 'pick', 'eat', 'drop', 'give', 'guard', 'fish', 'sethome', 'home', 'make']
   function ackCommand (username, msg, isWhisper = false) {
     try {
       if (!isOwner(username)) return
@@ -645,12 +702,16 @@ function createBot () {
       const clean = lower.replace(/^(hey|hi)\s+segs\s+/, '').replace(/^segs\s+/, '').trim()
       if (!clean) return
       if (/^(hi|hello|hey|yo|thanks|thank you|thx|bye|good night|good morning)$/.test(clean)) return
-      const first = clean.split(/\s+/)[0]
-      const isCmd = ACK_WORDS.includes(first) || ACK_WORDS.some(w => clean.includes(w))
-      if (!isCmd) return
+      // teaches and instant commands answer immediately in their own
+      // handler — an ack here would be a second, wrong reply
+      if (/^(this is|remember|learn|forget|list|status|stats|inventory|help|what|where|how|show|enable|disable|stop)\b/.test(clean)) return
+      const words = clean.split(/\s+/)
+      const isMove = words.some(w => ACK_MOVE_WORDS.includes(w))
+      const isWork = !isMove && words.some(w => ACK_WORK_WORDS.includes(w))
+      if (!isMove && !isWork) return
       const at = Date.now()
       lastAckAt = at
-      const ack = pick(['on it', 'got it', 'ok — doing it', 'coming', 'doing it now', 'on my way'])
+      const ack = isMove ? pick(['coming', 'on my way', 'on it']) : pick(['on it', 'got it', 'ok — doing it', 'doing it now'])
       say(ack)
       logEvent('ack', `ack "${ack}" sent in ${Date.now() - at}ms for "${msg.slice(0, 60)}"`)
     } catch (e) {}
@@ -711,6 +772,15 @@ function createBot () {
   // held — only the pointless pulsing.
   let jumpHoldUntil = 0
 
+  // v10.6 CHAT DEDUP (live: "segs inventory" answered twice — the
+  // same owner line can arrive twice through server/plugin echo,
+  // and without a guard every handler runs twice, so one command
+  // produces two replies. Identical user+message within 1.5s is
+  // ONE command, not two. A human retype takes longer; scripted
+  // repeats are seconds apart.)
+  let lastChatKey = ''
+  let lastChatAt = 0
+
   bot.on('chat', (username, message) => {
     if (!bot || username === BOT_NAME) return
     const msg = message.trim()
@@ -723,6 +793,10 @@ function createBot () {
     if (msg.startsWith('/')) return
     if (/^(applied|gave|set|teleported|enchanted|summoned|filled|changed|cleared|removed|replaced|killed|spawned|granted|revoked)\b/i.test(msg)) return
     if (msg.endsWith(']') && !msg.toLowerCase().includes('segs ')) return
+    const dedupKey = username + '\0' + msg
+    if (dedupKey === lastChatKey && Date.now() - lastChatAt < 1500) { log('dedup: ignored repeat chat line from ' + username); return }
+    lastChatKey = dedupKey
+    lastChatAt = Date.now()
     log(`<${username}> ${msg}`)
     logChat(username, msg)
     if (!loggedIn && config.autoLogin && config.authPassword && !config.authPassword.includes('PUT_')) {
@@ -784,8 +858,11 @@ function createBot () {
     // something was running, say what is being dropped.
     const lowerCmd = msg.toLowerCase()
     const addressed = lowerCmd.includes('segs')
-    const firstWord = cleanQ.split(/\s+/)[0]
-    const isRealCmd = addressed && (ACK_WORDS.includes(firstWord) || ACK_WORDS.some(w => cleanQ.includes(w)))
+    // v10.6: whole-word matching (the old substring check made
+    // "this is wheat chest" a "real command" via 'eat', cancelling
+    // a running goto for a teach). Only movement/work words bump.
+    const wordsQ = cleanQ.split(/\s+/)
+    const isRealCmd = addressed && wordsQ.some(w => ACK_MOVE_WORDS.includes(w) || ACK_WORK_WORDS.includes(w))
     if (isOwner(username) && isRealCmd) {
       const prevDesc = currentCmdDesc
       const wasBusy = prevDesc && prevDesc !== 'stop'
@@ -818,7 +895,15 @@ function createBot () {
       // server) is not a refusal — ignore it.
       if (/unknown (command|or incomplete)/.test(m)) return
       const fail = /ya (existe|tienes)|existe|no (puedes|se puede|tienes)|l[ií]mite|m[aá]ximo|demasiad|ya hay|no se ha|denegado|pas la permission|ajouter un autre|permission d'ajouter|d[eé]j[aà]|limite|maximum/.test(m)
-      if (fail) { pendingSethome.failed = true; pendingSethome.why = (message || '').slice(0, 100) }
+      // v10.6 SERVER-HOME AMNESIA (live 2026-11-14): a DUPLICATE-name
+      // refusal proves the home EXISTS server-side — that is
+      // knowledge, not failure. Flag it separately so the sethome
+      // handler LEARNS the name. French text observed live: "Vous
+      // avez déjà un home avec ce nom !". English variant per the
+      // brief. A duplicate implies failed (the set did not happen)
+      // even when the generic fail regex misses the English text.
+      const duplicate = /d[eé]j[aà] un home avec ce nom|already have a home with this name|a home with this name already exists|ya existe un home|home with that name already/.test(m)
+      if (fail || duplicate) { pendingSethome.failed = true; pendingSethome.why = (message || '').slice(0, 100); if (duplicate) pendingSethome.duplicate = true }
     }
     // v8: the /home warmup speaks too — "Début de la téléportation vers
     // le home : a" (accepted, 3s countdown) and "Téléportation annulée
@@ -827,6 +912,12 @@ function createBot () {
     if (pendingHome && Date.now() - pendingHome.at < 6000) {
       const m = (message || '').toLowerCase()
       if (/t[eé]l[eé]portation annul[eé]e|annul[eé]e car vous avez boug[eé]|teleport.*cancel/.test(m)) { pendingHome.cancelled = true; logEvent('home', 'warmup cancelled by server: ' + (message || '').slice(0, 100)) }
+      // v10.6: a "no such home" reply (wording flexible — the exact
+      // French text was never observed in a log, so match the
+      // meaning in French/English/Spanish, never one invented
+      // string). tryServerHome reports it honestly instead of
+      // guessing why the teleport never started.
+      else if (/n'existe pas|aucun home|pas de home|introuvable|home inconnu|no such home|no home|does ?n'?t exist|does not exist|unknown home|not found|no existe/.test(m)) { pendingHome.noSuchHome = true; logEvent('home', 'no such home, server said: ' + (message || '').slice(0, 100)) }
       else if (/d[eé]but de la t[eé]l[eé]portation|t[eé]l[eé]portation dans/.test(m)) { pendingHome.started = true; logEvent('home', 'warmup started: ' + (message || '').slice(0, 100)) }
     }
     if (!loggedIn && config.autoLogin && config.authPassword && !config.authPassword.includes('PUT_')) {
@@ -843,8 +934,54 @@ function createBot () {
     aiRecordChat(username, message.trim())
   })
 
-  bot.on('sleep', () => log('Segs is sleeping'))
-  bot.on('wake', () => { say(pick(['morning', 'awake, ready to work', 'good morning, what now'])) })
+  // v10.6 RUBBER-BAND DETECTOR (run 168 root cause): when Segs is
+  // flush against a block, Paper rejects every movement packet and
+  // teleports him back ~20x/sec — completely silent client-side
+  // (this is why the live freeze had ZERO watchdog lines). A
+  // forcedMove storm (>= 10 corrections in 5s) gets logged so the
+  // next freeze is visible, not silent. Single teleports (/tp,
+  // /home) stay under the threshold and stay quiet.
+  let rbCount = 0, rbWindowAt = 0, rbLoggedAt = 0
+  bot.on('forcedMove', () => {
+    try {
+      const now = Date.now()
+      if (now - rbWindowAt > 5000) { rbCount = 0; rbWindowAt = now }
+      rbCount++
+      if (rbCount >= 10 && now - rbLoggedAt > 5000) {
+        rbLoggedAt = now
+        logEvent('rubberband', `server corrected position ${rbCount}x in 5s — movement rejected (flush against a block?) at ${bot.entity ? bot.entity.position : '?'}`)
+      }
+    } catch (e) {}
+  })
+
+  // v10.6 SLEEP CONTRACT (live, confirmed twice: "going to sleep"
+  // -> "morning" in 0.7s and 5s — fake-fast sleep). The old `wake`
+  // handler said "morning" on EVERY wake event, even a wake 0.7s
+  // after entering the bed with night still going. Now: "morning"
+  // only when Segs actually slept AND the night skipped to day
+  // (or the sleep was long). A wake seconds after bed-enter, still
+  // at night, says so honestly. A wake with no sleep event at all
+  // is ignored. wakeUp() sets the flag so its own line is the only
+  // reply (no double "awake" from the handler + wakeUp).
+  let sleepEnteredAt = 0
+  let sleepIntentionalWake = false
+  bot.on('sleep', () => {
+    sleepEnteredAt = Date.now()
+    try { bot.clearControlStates() } catch (e) {}
+    log('Segs is sleeping (timeOfDay=' + (bot.time ? bot.time.timeOfDay : '?') + ')')
+  })
+  bot.on('wake', () => {
+    const sleptMs = sleepEnteredAt ? Date.now() - sleepEnteredAt : 0
+    const wasAsleep = sleepEnteredAt > 0
+    sleepEnteredAt = 0
+    if (sleepIntentionalWake) { sleepIntentionalWake = false; return }
+    if (!wasAsleep) { log('wake event without a sleep — ignored, no morning lie'); return }
+    const tod = bot.time ? bot.time.timeOfDay : -1
+    const isDay = bot.time ? bot.time.isDay : sleptMs > 30000
+    log(`woke after ${(sleptMs / 1000).toFixed(1)}s asleep, timeOfDay=${tod}, isDay=${isDay}`)
+    if (isDay) say(pick(['morning', 'awake, ready to work', 'good morning, what now']))
+    else say('something woke me up — still night out')
+  })
 
   // v5 LEARNING from playing: when it dies, remember where and warn next time.
   // This is coded memory, not AI training - it just does not forget what happened.
@@ -941,10 +1078,12 @@ function createBot () {
     if (bot.food <= 18) { try { const p = bot.autoEat?.eat(); if (p && p.catch) p.catch(() => {}) } catch (e) {} }
   })
 
-  setInterval(() => {
-    if (!bot || !bot.entity || bot.health <= 0) return
-    defendCheck()
-  }, 1500)
+  if (!_watchdogTimers.defend) { // v10.6: one interval, not one per reconnect
+    _watchdogTimers.defend = setInterval(() => {
+      if (!bot || !bot.entity || bot.health <= 0) return
+      defendCheck()
+    }, 1500)
+  }
 
   // ---- v10: PvP-god combat ----
   // Tash's standard: zero hits taken, zero seconds wasted, zero hits
@@ -2141,28 +2280,38 @@ function createBot () {
     if (!bot.autoEat) return false
     if (bot.food >= 20) return false
     const before = bot.food
+    let threw = null
     try {
       // v10.5.2 (run 138 leg E): the plugin's own statusCheck may
       // already be eating when we arrive — its eat() THROWS 'Already
-      // eating!' in that case, and the old code reported a false
-      // failure while the in-progress eat then restored hunger a
-      // second later ("i tried to eat but my hunger didnt go up"
-      // while food went 18->20 anyway). Wait for the in-progress
-      // eat instead of starting a second one.
+      // eating!' in that case. Wait for the in-progress eat instead
+      // of starting a second one.
       if (bot.autoEat.isEating) {
-        for (let i = 0; i < 16 && bot.autoEat.isEating; i++) { try { await sleepMs(250) } catch (e) {} }
+        for (let i = 0; i < 24 && bot.autoEat.isEating; i++) { try { await sleepMs(250) } catch (e) {} }
       } else {
         await bot.autoEat.eat()
       }
-    } catch (e) { return false }
-    // Poll for the rise (up to ~2s) instead of a single 500ms check
-    // — the health packet can trail the eat-finish by a tick, and an
-    // in-progress eat we waited out finishes on its own schedule.
-    for (let i = 0; i < 8; i++) {
+    } catch (e) { threw = e }
+    // v10.6 EAT VERDICT (live bug: "i tried to eat but my hunger
+    // didnt go up" x2 on Youniga while food recovered to 20/20
+    // anyway). The old code returned false IMMEDIATELY from the
+    // catch above — a thrown eat (Already-eating race with the
+    // plugin's own statusCheck, or a plugin timeout) reported
+    // failure while the in-progress meal restored hunger a second
+    // later. And the 2s poll was too short on a laggy link (the
+    // health packet trails the meal). Now: ALWAYS poll for the
+    // rise, even after a throw, for up to 5s — and judge ONLY on
+    // the fresh food value. The message must never lie in either
+    // direction: food rose = success, no matter what threw.
+    for (let i = 0; i < 20; i++) {
       if (bot.food > before) return true
       try { await sleepMs(250) } catch (e) {}
     }
-    return bot.food > before
+    // one last settle, then the verdict on the freshest value
+    try { await sleepMs(500) } catch (e) {}
+    const rose = bot.food > before
+    logEvent('autoeat', `tryEatOnce verdict: food ${before} -> ${bot.food}, rose=${rose}${threw ? ', threw: ' + threw.message : ''}`)
+    return rose
   }
   async function eatBestFood () {
     const injured = bot.health < (bot.maxHealth || 20) - 3
@@ -2198,7 +2347,8 @@ function createBot () {
   function armorScore (item) { return (ARMOR_POINTS[item.name] || 0) * 5 + protectionLevel(item) * 3 + (ARMOR_TOUGH[item.name] || 0) }
   let autoArmorLast = 0
   function startAutoArmor () {
-    setInterval(() => {
+    if (_watchdogTimers.autoArmor) return // v10.6: one watchdog, not one per reconnect
+    _watchdogTimers.autoArmor = setInterval(() => {
       try {
         if (!connected || !bot || !bot.entity || bot.health <= 0) return
         if (inCombat() || fleeTimer) return
@@ -2226,7 +2376,8 @@ function createBot () {
   // ---- AUTOTOTEM (Wurst: re-equip on pop; health gate) ----
   let lastTotemTotal = -1, lastTotemEquipAt = 0, autoTotemStartedAt = Date.now()
   function startAutoTotem () {
-    setInterval(() => {
+    if (_watchdogTimers.autoTotem) return // v10.6: one watchdog, not one per reconnect
+    _watchdogTimers.autoTotem = setInterval(() => {
       try {
         if (!connected || !bot || !bot.entity || bot.health <= 0) return
         const off = bot.inventory.slots[45]
@@ -2328,6 +2479,47 @@ function createBot () {
       // (a different sort, or anything else), the question is cleared.
     }
 
+    // v10.6: answering the storage-scan question ("column 7 is
+    // empty, what goes here?"). The owner's reply ("column 7 is
+    // ores", or a bare "ores" when only one column is pending) is an
+    // answer even WITHOUT the "Segs" prefix — check it BEFORE the
+    // addressed gate, same as pendingContinue. A real command is
+    // never swallowed: command verbs clear the question and fall
+    // through to normal handling.
+    if (pendingUnknownColumns.length && isOwner(username)) {
+      const ans = lower.replace(/^(hey|hi)\s+segs\s+/, '').replace(/\bsegs\b/g, ' ').replace(/[?.!,]/g, ' ').replace(/\s+/g, ' ').trim()
+      if (/^(this|sort|go|come|follow|stop|list|eat|farm|craft|dig|sleep|guard|take|move|build|show|where|what|how|help|status|continue|again|do it again|forget|remember|learn|set|check|get|pick|kill|attack|fish|place|say|scan|map)/.test(ans)) {
+        pendingUnknownColumns = []
+        // fall through — a command, not an answer
+      } else {
+        const numMatch = ans.match(/column\s+(\d+)/)
+        let catWord = null
+        for (const w of ans.split(/\s+/)) {
+          if (COLUMN_WORDS[w]) { catWord = COLUMN_WORDS[w]; break }
+          const singular = w.endsWith('s') ? w.slice(0, -1) : w
+          if (COLUMN_WORDS[singular]) { catWord = COLUMN_WORDS[singular]; break }
+        }
+        const target = numMatch ? pendingUnknownColumns.find(p => p.num === Number(numMatch[1])) : (pendingUnknownColumns.length === 1 ? pendingUnknownColumns[0] : null)
+        if (target && catWord) {
+          pendingUnknownColumns = pendingUnknownColumns.filter(p => p !== target)
+          const blank = brain.columns[target.key]
+          const chests = (blank && blank.chests) || target.chests
+          if (blank) delete brain.columns[target.key]
+          const prev = (brain.columns[catWord] && brain.columns[catWord].chests) || []
+          brain.columns[catWord] = { category: catWord, name: catWord + ' column', chests: mergeChestLists([prev, chests]), pos: target.pos, taughtAt: Date.now() }
+          saveBrain()
+          logLearn('column', `column ${target.num} claimed as ${catWord} (answered scan question)`)
+          say(`ok, column ${target.num} is the ${catWord} column — ${brain.columns[catWord].chests.length} chests, i will remember it`)
+          return
+        }
+        if (numMatch && !catWord) { say(`column ${numMatch[1]} should hold what? name a category, like: column ${numMatch[1]} is ores`); return }
+        if (numMatch && !target) { say(`i only asked about column${pendingUnknownColumns.length > 1 ? 's' : ''} ${pendingUnknownColumns.map(p => p.num).join(', ')}`); return }
+        if (!numMatch && catWord && pendingUnknownColumns.length > 1) { say(`which column? say: column ${pendingUnknownColumns[0].num} is ${catWord}`); return }
+        // not an answer at all — clear the question, handle normally
+        pendingUnknownColumns = []
+      }
+    }
+
     const addressed = lower.includes('segs') || isWhisper || msg.startsWith('!')
     if (!addressed) return // ignore normal player chat, dont spam
 
@@ -2340,6 +2532,14 @@ function createBot () {
       .replace(/[?.!,]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
+
+    // v10.6 TYPO FIXES (live: "come her" -> ack + "didnt get that",
+    // "farm potat" -> silently farmed WHEAT). Whole-word fixes for
+    // Tash's evidenced typos, applied BEFORE routing so the ack and
+    // the handler agree on one reply path. Unknown words pass
+    // through untouched — nothing here invents a meaning.
+    const TYPO_FIXES = { her: 'here', potat: 'potato', potatoe: 'potato', potatos: 'potatoes', carot: 'carrot', carrott: 'carrot', whet: 'wheat', whaet: 'wheat', beetrot: 'beetroot' }
+    req = req.split(' ').map(w => TYPO_FIXES[w] || w).join(' ')
 
     if (!req) { say(pick(['yeah?', 'what do you need', 'im here, what now'])); return }
 
@@ -2466,7 +2666,7 @@ function createBot () {
 
     // help
     if (req.includes('help') || req.includes('what can you do')) {
-      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs sethome mine, segs go to mine, segs list homes, segs forget home mine, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop, segs set this bed as your bed, segs remember this is your permanent home, segs pick up the items, segs keep these items at your base, segs check for enemies, segs get your stuff, segs this is the ore column, segs this is my room, segs this is the trading hall, segs sort my room, segs move the ores to the ore column, segs make paper, segs continue last sorting, segs list columns, segs list places, segs go to the trading hall, segs this is the build site, segs build house here')
+      say('just talk to me like: segs tp to me, segs follow me, segs sleep, segs farm wheat, segs farm potato, segs farm all, segs craft iron pickaxe, segs dig stone, segs place torch, segs fish, segs smelt iron ore, segs get food, segs this is the potato farm, segs this is the smoker, segs what is here, segs remember this is home, segs go to mine, segs list bases, segs sethome mine, segs go to mine, segs list homes, segs forget home mine, segs learn daily means go to the farm and farm wheat and come back, segs what do you remember, segs stats, segs inventory, segs afk, segs guard me, segs eat, segs status, segs stop, segs set this bed as your bed, segs remember this is your permanent home, segs pick up the items, segs keep these items at your base, segs check for enemies, segs get your stuff, segs this is the ore column, segs this is the storage unit, segs this is my room, segs this is the trading hall, segs sort my room, segs move the ores to the ore column, segs make paper, segs continue last sorting, segs list columns, segs list places, segs go to the trading hall, segs this is the build site, segs build house here')
       return
     }
 
@@ -2526,6 +2726,18 @@ function createBot () {
     // (Segs' feet = the schematic's 0,0,0 corner). MUST run before the
     // generic "this is ..." landmark handler below, or the site gets
     // filed as a base-map area instead of a build origin.
+    // v10.6 ZERO-SETUP: "Segs this is the storage unit" (and
+    // aliases) SCANS the wall and learns every column itself — no
+    // per-column teaching. MUST run before the generic "this is ..."
+    // handler below, or the unit gets filed as a plain area and
+    // nothing is learned. Single reply, no double handling: the old
+    // permanent-home branch for 'storage unit' in the generic
+    // handler delegates here too (see below). Phrasings: this is
+    // the storage unit/system, scan/learn/map/see the storage.
+    // (NOT "this is the storage chest" — that stays a landmark.)
+    if (isOwner(username) && ((req.startsWith('this is') && (req.includes('storage unit') || req.includes('storage system'))) || req === 'this is the storage' || req === 'this is storage' || req.includes('scan the storage') || req.includes('scan storage') || req.includes('learn the storage') || req.includes('map the storage') || req.includes('see this storage') || req.includes('see the storage'))) {
+      await scanStorageUnit(); return
+    }
     if (isOwner(username) && req.includes('build site')) {
       const here = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
       brain.buildSite = { pos: here, setAt: Date.now() }
@@ -2614,15 +2826,13 @@ function createBot () {
           say('ok, noted this sugarcane chest — i will take cane from here to make paper'); return
         }
         if (name.includes('storage unit')) {
-          brain.areas['storage unit'] = { name: 'storage unit', pos: here }
-          if (!brain.permanentHome) {
-            const roomChests = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 8, count: 6 })
-            brain.permanentHome = { pos: here, serverHome: lastSetHome || null, setAt: Date.now() }
-            brain.roomChests = roomChests.map(p => [p.x, p.y, p.z])
-          }
-          saveBrain()
-          logLearn('area', `storage unit at ${here.join(', ')}`)
-          say('ok, this is the storage unit — my permanent home, and the centre of my base map'); return
+          // v10.6: ANY 'storage unit' teach is the scan — one
+          // handler, one reply. The old branch recorded the area
+          // AND set permanent home here, which double-handled the
+          // command (scan + "my permanent home") and clobbered the
+          // room's meaning. The scan records the area itself and
+          // never touches permanentHome.
+          await scanStorageUnit(); return
         }
         // named places (trading hall, a room, another player's home) — the
         // base map. Landmarks below handle farm/chest/furnace/smoker/bed/table.
@@ -2738,7 +2948,7 @@ function createBot () {
     // gates the WALKING fallback (you cannot walk to someone you
     // cannot see). Teleport success is detected by Segs having moved
     // a long way (the /tpa landed) or the owner being within 5 blocks.
-    if (req.includes('tp to me') || req.includes('teleport to me') || req.includes('come to me') || req.includes('come here') || req === 'come' || req === 'tp' || req === 'teleport' || req.includes('come to') || req.includes('tp me')) {
+    if (req.includes('tp to me') || req.includes('teleport to me') || req.includes('come to me') || req.includes('come here') || req === 'come' || req === 'tp' || req === 'teleport' || req.includes('come to') || req.includes('tp me') || req.includes('tp here') || req.includes('teleport here') || req.includes('tp 2 me')) {
       brain.lastPos = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]; saveBrain()
       stopAllMovement()
       // v10.5.1 TPA DEDUP: only ONE /tpa outstanding. Three "tp to me"
@@ -2782,6 +2992,9 @@ function createBot () {
 
     // follow
     if (req.includes('follow me') || req.includes('follow') || req.includes('stay with me')) {
+      // v10.6 DUAL DRIVER: following stops farming (and vice versa —
+      // see startFarming). Two movement drivers fighting is a bug.
+      if (farming) { stopFarming(); logEvent('follow', 'stopped farming to follow (latest wins)') }
       following = username
       say(pick(['ok, following you', 'following you now', 'got it, sticking with you']))
       followLoop()
@@ -2863,6 +3076,17 @@ function createBot () {
       pendingSethome = { name, at: Date.now() }
       await sleepMs(1500)
       if (pendingSethome && pendingSethome.failed) {
+        // v10.6 SERVER-HOME AMNESIA: a duplicate-name refusal proves
+        // the home EXISTS — learn it. Do NOT set lastSetHome: Segs
+        // did not set it now (it may be years old, anywhere), so it
+        // must not link to the permanent home.
+        if (pendingSethome.duplicate) {
+          if (!brain.serverHomes.includes(name)) { brain.serverHomes.push(name); saveBrain() }
+          logLearn('server-home', `learned existing /sethome ${name} from the server's duplicate-name refusal`)
+          say(`home ${name} already exists on the server — I remembered it, say segs go home ${name} to use it`)
+          pendingSethome = null
+          return
+        }
         const why = pendingSethome.why ? ' — the server said: ' + pendingSethome.why : ''
         say(`the server wouldnt set home ${name}${why}`)
         logEvent('sethome', `/sethome ${name} refused by server`)
@@ -3001,10 +3225,28 @@ function createBot () {
       for (const key of ['wheat', 'carrot', 'potato', 'beetroot']) { startFarming(key); await sleepMs(8000); stopFarming() }
       say('done farming everything'); return
     }
-    if (req.includes('farm') || req.includes('harvest')) {
-      const cropName = ['wheat', 'carrot', 'carrots', 'potato', 'potatoes', 'beetroot'].find(c => req.includes(c)) || 'wheat'
-      const key = cropName === 'carrots' ? 'carrot' : cropName === 'potatoes' ? 'potato' : cropName
-      if (!CROPS[key]) { say('farm what? wheat, carrot, potato, beetroot'); return }
+    // (go-to / list / query phrasings containing "farm" must fall
+    // through to their own handlers below, not start farming.)
+    const isFarmQuery = /^(go|list|show|what|where|how)\b/.test(req)
+    if ((req.includes('farm') || req.includes('harvest')) && !isFarmQuery) {
+      // v10.6 NO SILENT DEFAULT (live: "farm potat" farmed WHEAT —
+      // the old `|| 'wheat'` guessed wrong silently). Exact match
+      // first (typo fixes above already turned potat->potato), then
+      // fuzzy match (edit distance <= 2), else ASK. Never guess.
+      const cropName = ['wheat', 'carrot', 'carrots', 'potato', 'potatoes', 'beetroot'].find(c => req.includes(c))
+      let key = cropName ? (cropName === 'carrots' ? 'carrot' : cropName === 'potatoes' ? 'potato' : cropName) : null
+      if (!key) {
+        const words = req.split(/\s+/).filter(w => w && w !== 'farm' && w !== 'harvest' && w !== 'the' && w !== 'a' && w !== 'some' && w !== 'all' && w !== 'my' && w !== 'please')
+        let best = null, bestD = 3
+        for (const w of words) {
+          for (const c of ['wheat', 'carrot', 'potato', 'beetroot']) {
+            const d = editDistance(w, c)
+            if (d < bestD) { bestD = d; best = c }
+          }
+        }
+        if (best) { key = best; logEvent('farm', `fuzzy crop match: "${words.join(' ')}" -> ${best} (edit distance ${bestD})`) }
+      }
+      if (!key || !CROPS[key]) { say('farm what? wheat, carrot, potato, or beetroot — or say: segs farm all'); return }
       logEvent('farm', `farm ${key} started`)
       startFarming(key)
       return
@@ -3039,12 +3281,50 @@ function createBot () {
       return
     }
 
-    // store / keep — "Segs keep wheat in this chest" / "Segs store
-    // iron in this chest". Puts the named item into the nearest chest.
-    if ((req.includes('keep') || req.includes('store')) && req.includes('chest')) {
-      const rest = req.replace(/^(keep|store)\s*/, '').replace(/\s*in (this|the) chest\s*$/, '').trim()
+    // store / keep / put — "Segs keep wheat in this chest" / "Segs
+    // store iron in this chest" / "Segs put wheat in the wheat
+    // chest". Puts the named item into the nearest chest, or the
+    // NAMED chest when Segs knows one ("is" = "in" in Tash's
+    // phrasing: "put wheat is wheat chest"). A named chest Segs
+    // does NOT know is asked about, never silently substituted —
+    // storing wheat in the wrong chest is worse than asking.
+    if (((req.includes('keep') || req.includes('store')) && req.includes('chest')) || (req.startsWith('put ') && req.includes('chest'))) {
+      let rest = req.replace(/^(keep|store|put)\s*/, '')
+      let destName = null
+      const destMatch = rest.match(/\s+(in|is)\s+(?:the\s+)?(.+?)\s*chest\s*$/)
+      if (destMatch) {
+        destName = destMatch[2].trim()
+        if (['this', 'that', 'the', 'a', 'my'].includes(destName)) destName = null
+        rest = rest.slice(0, destMatch.index).trim()
+      } else {
+        rest = rest.replace(/\s*in (this|the) chest\s*$/, '').trim()
+      }
       const { itemName, count } = parseItemAndCount(rest)
-      const chestBlock = bot.findBlock({ matching: b => isContainer(b), maxDistance: 8 })
+      let chestBlock = null
+      if (destName) {
+        // a taught spot ("this is the wheat chest") names the place:
+        // the chest is the nearest container to that spot. Chest
+        // teachings live in brain.landmarks, area teachings in
+        // brain.areas — v10.6 run 177 proved the store handler must
+        // check BOTH (it only checked areas and missed a chest
+        // taught 7 runs earlier).
+        const spots = { ...(brain.landmarks || {}), ...(brain.areas || {}) }
+        const areaKey = Object.keys(spots).find(k => k === destName + ' chest' || k === destName || k === 'the ' + destName + ' chest')
+          || Object.keys(spots).find(k => k.includes(destName) || destName.includes(k))
+        if (areaKey && spots[areaKey] && spots[areaKey].pos) {
+          const ap = spots[areaKey].pos
+          const scanNear = () => bot.findBlocks({ matching: b => isContainer(b), maxDistance: 6, count: 20 })
+            .map(p => ({ p, d: Math.hypot(p.x - ap[0], p.y - ap[1], p.z - ap[2]) }))
+            .filter(o => o.d <= 4).sort((a, b) => a.d - b.d)
+          let near = scanNear()
+          if (!near.length && bot.entity.position.distanceTo(new Vec3(ap[0], ap[1], ap[2])) > 6) {
+            try { await gotoPos(new Vec3(ap[0], ap[1], ap[2])); near = scanNear() } catch (e) {}
+          }
+          if (near.length) chestBlock = bot.blockAt(near[0].p)
+        }
+        if (!chestBlock) { say(`i dont know the ${destName} chest — stand by it and say: segs this is the ${destName} chest`); return }
+      }
+      if (!chestBlock) chestBlock = bot.findBlock({ matching: b => isContainer(b), maxDistance: 8 })
       if (!chestBlock) { say('i cant see a chest near me'); return }
       const item = bot.inventory.items().find(i => i.name === itemName)
       if (!item) { say(`i dont have ${itemName} to store`); return }
@@ -3209,13 +3489,26 @@ function createBot () {
     // where home is yet" even though /sethome a was set — this handler
     // only checked brain bases, never server homes. "go home <name>"
     // now tries the server home first (teleport), then brain bases.
-    if (req === 'go home' || req.includes('go home') || req.includes('take me home')) {
-      const nameMatch = req.match(/go home\s+(\S+)/)
+    // v10.6 SERVER-HOME AMNESIA (live 2026-11-14): the brain gate is
+    // GONE for named homes — the server is the source of truth, so a
+    // fresh brain tries /home <name> even for names it never saw, and
+    // LEARNS the name when the teleport succeeds. A named home never
+    // falls through to the brain-home walk (that would walk to the
+    // WRONG place) and never says "i dont know where home is yet".
+    // Alias: "segs home <name>" works exactly like "segs go home
+    // <name>" (live: "segs home iron" got "didn't get that").
+    if (req === 'go home' || req.includes('go home') || req.includes('take me home') || req === 'home' || req.startsWith('home ')) {
+      const nameMatch = req.match(/go home\s+(\S+)/) || req.match(/^home\s+(\S+)/)
       const homeName = nameMatch ? nameMatch[1] : null
-      if (homeName && brain.serverHomes && brain.serverHomes.includes(homeName)) {
+      if (homeName) {
         stopAllMovement(); say(`going to ${homeName}`)
-        if (await tryServerHome(homeName)) { say(`at ${homeName}`); return }
-        say('couldnt teleport there, walking instead')
+        if (await tryServerHome(homeName)) {
+          if (!brain.serverHomes.includes(homeName)) { brain.serverHomes.push(homeName); saveBrain(); logLearn('server-home', `learned /home ${homeName} from a successful teleport`) }
+          say(`at ${homeName}`); return
+        }
+        if (lastHomeFailure === 'nosuchhome') { say(`the server says there is no home called ${homeName}`); return }
+        if (lastHomeFailure === 'cancelled') { say(`the teleport to ${homeName} was cancelled because i moved — say it again and ill stand still`); return }
+        say(`couldnt teleport to ${homeName} — the server didnt start the warmup, maybe the home doesnt exist or im not in the overworld`); return
       }
       const home = brain.bases.home || brain.home
       if (!home) { say('i dont know where home is yet, stand somewhere and say segs remember this is home'); return }
@@ -3425,6 +3718,11 @@ function createBot () {
 
   async function sleepInBed () {
     if (bot.isSleeping) { say('already sleeping'); return }
+    // v10.6: daytime check BEFORE trying — never attempt a daytime
+    // sleep and never fake-sleep. The old code let bot.sleep()
+    // resolve-or-fail at any hour and the wake handler lied
+    // "morning" 0.7s later.
+    if (bot.time && bot.time.isDay) { say("its daytime, i cant sleep yet — ill sleep tonight"); return }
     stopAllMovement()
     // find a bed nearby
     const bed = bot.findBlock({ matching: b => b.name && b.name.includes('bed'), maxDistance: 16 })
@@ -3442,7 +3740,13 @@ function createBot () {
   }
   async function wakeUp () {
     if (!bot.isSleeping) { say('im already awake'); return }
-    try { await bot.wake(); say('awake, ready to work') } catch (e) { say('cant wake up yet') }
+    // the wake handler stays silent for an intentional wake (this
+    // say is the one reply); the timeout clears a stale flag if
+    // the wake event never fires, so a later natural wake still
+    // gets its message.
+    sleepIntentionalWake = true
+    setTimeout(() => { sleepIntentionalWake = false }, 5000)
+    try { await bot.wake(); say('awake, ready to work') } catch (e) { sleepIntentionalWake = false; say('cant wake up yet') }
   }
 
   // ---- v8: sprint (hunger-dependent) ----
@@ -3665,13 +3969,25 @@ function createBot () {
   let sortingNow = false
   async function sortItems (opts) {
     if (sortingNow) { say('im already sorting, say stop first if you want me to stop'); return }
+    // v10.6 DUAL DRIVER: sorting walks a fixed route — stop following
+    // first, or the follow loop re-paths over every deposit walk.
+    if (following) { following = null; try { bot.pathfinder.setGoal(null) } catch (e) {} }
     const category = (opts && opts.category) || null
     // source chests: the taught room, else any container near Segs
     let sourceChests = []
     if (brain.myRoom && brain.myRoom.chests && brain.myRoom.chests.length) sourceChests = brain.myRoom.chests.map(p => new Vec3(p[0], p[1], p[2]))
     else { try { sourceChests = bot.findBlocks({ matching: b => isContainer(b), maxDistance: 8, count: 8 }) } catch (e) {} }
     if (!sourceChests.length) { say('i cant see any chests to sort from — stand in your room and tell me: segs this is my room'); return }
-    if (!brain.permanentHome && !Object.keys(brain.columns || {}).length) { say('i dont know your storage unit yet — take me there and tell me: segs this is your permanent home, then teach me the columns'); return }
+    // v10.6 ZERO-SETUP: no columns known yet? Don't ask to be
+    // taught — look around and learn the unit NOW, then sort with
+    // the learned map. This is Tash's exact live case ("Segs sort
+    // the storage" -> "i dont know your storage unit yet"): with a
+    // fresh brain, one command must be enough.
+    if (!Object.keys(brain.columns || {}).length) {
+      say('i dont know the storage unit yet — let me look around and learn it first')
+      await scanStorageUnit()
+      if (!Object.keys(brain.columns || {}).length) { say('i couldnt find a storage unit here — stand in front of the chest wall and say: segs this is the storage unit'); return }
+    }
     // (No trip to the storage unit up front — the sort starts at the
     // source chests in the room, and each deposit walk takes Segs to the
     // columns as needed. One less walk.)
@@ -3960,7 +4276,27 @@ function createBot () {
     const bz = b[2] !== undefined ? b[2] : b.z
     if (ax === bx && ay === by && az === bz) return true
     if (ay !== by) return false
-    return (Math.abs(ax - bx) === 1 && az === bz) || (Math.abs(az - bz) === 1 && ax === bx)
+    const adjacent = (Math.abs(ax - bx) === 1 && az === bz) || (Math.abs(az - bz) === 1 && ax === bx)
+    if (!adjacent) return false
+    // Adjacent chests share an inventory ONLY if they are a real
+    // double-chest pair (blockstate type left+right). Two adjacent
+    // SINGLES (e.g. a /fill-built wall, or any wall whose chests
+    // never paired) are SEPARATE inventories — the old pure
+    // adjacency rule made mergeChestLists drop half the scanned
+    // wall in run 164 (6 chests stored as 3). Barrels never pair.
+    // If the blocks are unreadable (unloaded chunk, bot down),
+    // fall back to the old adjacency rule so legacy taught
+    // columns keep merging the way they always did.
+    try {
+      if (!bot) return true
+      const ba = bot.blockAt(new Vec3(ax, ay, az))
+      const bb = bot.blockAt(new Vec3(bx, by, bz))
+      if ((ba && ba.name === 'barrel') || (bb && bb.name === 'barrel')) return false
+      const pa = ba && ba.getProperties ? ba.getProperties() : null
+      const pb = bb && bb.getProperties ? bb.getProperties() : null
+      if (!pa || !pb || pa.type === undefined || pb.type === undefined) return true
+      return (pa.type === 'left' && pb.type === 'right') || (pa.type === 'right' && pb.type === 'left')
+    } catch (e) { return true }
   }
   // Merge chest lists, dropping the second half of any double chest
   // (keep the west/north half, like the v9.1 dedup). Input/output are
@@ -3971,7 +4307,10 @@ function createBot () {
     const all = [...merged.values()].sort((a, b) => a[1] - b[1] || a[0] - b[0] || a[2] - b[2])
     const kept = []
     for (const p of all) {
-      if (kept.some(q => q[1] === p[1] && ((q[0] === p[0] - 1 && q[2] === p[2]) || (q[2] === p[2] - 1 && q[0] === p[0])))) continue
+      // Drop p only when an already-kept west/north neighbour shares
+      // its inventory (sameChestInventory: a real left/right pair).
+      // Adjacent singles are separate inventories and must be kept.
+      if (kept.some(q => q[1] === p[1] && ((q[0] === p[0] - 1 && q[2] === p[2]) || (q[2] === p[2] - 1 && q[0] === p[0])) && sameChestInventory(q, p))) continue
       kept.push(p)
     }
     return kept
@@ -4048,6 +4387,315 @@ function createBot () {
       chest.close()
       return take
     } catch (e) { log('withdraw: chest at ' + chestPos + ' failed: ' + e.message); return 0 }
+  }
+
+  // ---------- v10.6: ZERO-SETUP STORAGE-UNIT SCAN ----------
+  // Tash (live, 2026-11-14): "if I say this storage unit or what, he
+  // can see it and know all these chests are for storage, and he
+  // himself manages em all... I dont wanna baby sit him or setup
+  // him". One command — "Segs this is the storage unit" — and Segs
+  // looks at the wall, slices it into columns, samples 1-2 chests
+  // per column, infers each category from the contents (or a sign
+  // label), and stores the map in brain.columns in the EXACT format
+  // the teach-column code uses, so "Segs sort my room", "move the
+  // ores to the ore column" and the rest work with zero other
+  // changes. READ-ONLY scan: never moves an item, never opens a
+  // shulker, canDig=false for the whole scan. Empty columns are
+  // left unclaimed and asked about ONCE in chat.
+  //
+  // SCOPE (Tash, 2026-11-14): every chest around within 10 view
+  // distance — radius 160 blocks, high findBlocks count so the
+  // ~160-double-chest wall is never truncated. The scan is bounded
+  // by what the server actually sends (view distance 10 requested
+  // via the client settings packet; the server may cap it lower).
+  const SCAN_RADIUS = 160
+  const SCAN_COUNT = 600
+  // Read the plain-text lines of a sign block from its block-entity
+  // NBT (front_text.messages, each a JSON text component). Returns []
+  // when the block is not a sign or carries no readable text.
+  // Verified by probe-sign on the Paper test server (2026-11-14):
+  // bot.blockAt(pos).entity holds the full front_text/back_text NBT
+  // for signs already placed in the world (chunk-packet path).
+  function signTextLines (block) {
+    try {
+      if (!block || !block.name) return []
+      if (!(block.name.endsWith('_sign') || block.name.endsWith('_wall_sign') || block.name.endsWith('_hanging_sign'))) return []
+      const ent = block.entity
+      if (!ent || !ent.value) return []
+      const front = ent.value.front_text && ent.value.front_text.value
+      const msgs = front && front.messages && front.messages.value && front.messages.value.value
+      if (!Array.isArray(msgs)) return []
+      return msgs.map(m => {
+        try {
+          const parsed = JSON.parse(m)
+          if (typeof parsed === 'string') return parsed
+          if (parsed && typeof parsed.text === 'string') {
+            let t = parsed.text
+            if (Array.isArray(parsed.extra)) for (const e of parsed.extra) { if (e && typeof e.text === 'string') t += e.text }
+            return t
+          }
+          return ''
+        } catch (e) { return typeof m === 'string' ? m : '' }
+      })
+    } catch (e) { return [] }
+  }
+  // A sign line is a category hint ONLY when it names a known
+  // category (whole word, singular or plural): "ores", "mob drops",
+  // "building blocks". Anything else ("cool stuff", "do not touch")
+  // is ignored — contents decide. Whole-word matching, so "forest"
+  // does not false-fire on "ore".
+  function signCategoryHint (lines) {
+    for (const line of lines) {
+      const words = line.toLowerCase().split(/[^a-z]+/).filter(Boolean)
+      for (const w of words) {
+        if (COLUMN_WORDS[w]) return COLUMN_WORDS[w]
+        const singular = w.endsWith('s') ? w.slice(0, -1) : w
+        if (COLUMN_WORDS[singular]) return COLUMN_WORDS[singular]
+      }
+      if (SORT_CATEGORIES.includes(line.toLowerCase().trim())) return line.toLowerCase().trim()
+    }
+    return null
+  }
+  // Slice the scanned containers into wall columns. The wall is one
+  // continuous run: detect its long axis (x or z), slice along it by
+  // double-chest width (2 blocks), one slot per column, and keep
+  // separate depth lines apart (a back-to-back wall is two columns
+  // per slot, not one). Only the LARGEST connected run of slots
+  // (gap of at most one empty slot) is the wall — stray room/farm
+  // chests nearby form their own smaller runs and are ignored.
+  // Returns [{ slot, line, chests: [[x,y,z]...] }] sorted along the
+  // wall, or [] when nothing was scanned.
+  function clusterWallColumns (containers) {
+    if (!containers.length) return []
+    const xs = containers.map(p => p.x)
+    const zs = containers.map(p => p.z)
+    const spanX = Math.max(...xs) - Math.min(...xs)
+    const spanZ = Math.max(...zs) - Math.min(...zs)
+    const alongX = spanX >= spanZ
+    const origin = alongX ? Math.min(...xs) : Math.min(...zs)
+    const groups = new Map() // "slot,line" -> [[x,y,z]...]
+    for (const p of containers) {
+      const axis = alongX ? p.x : p.z
+      const line = alongX ? p.z : p.x
+      const slot = Math.floor((axis - origin) / 2)
+      const key = slot + ',' + line
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key).push([p.x, p.y, p.z])
+    }
+    const byLine = new Map()
+    for (const [key, chests] of groups) {
+      const [slot, line] = key.split(',').map(Number)
+      if (!byLine.has(line)) byLine.set(line, [])
+      byLine.get(line).push({ slot, line, chests })
+    }
+    let best = []
+    for (const slots of byLine.values()) {
+      slots.sort((a, b) => a.slot - b.slot)
+      let run = [slots[0]]
+      const runs = [run]
+      for (let i = 1; i < slots.length; i++) {
+        if (slots[i].slot - slots[i - 1].slot <= 2) run.push(slots[i])
+        else { run = [slots[i]]; runs.push(run) }
+      }
+      for (const r of runs) {
+        // longest run wins; ties break by chest count, not by
+        // findBlocks order (nearest-first made a lone room chest
+        // beat a 5-chest group in run 164's first attempt).
+        const chestCount = g => g.reduce((n, s) => n + s.chests.length, 0)
+        if (r.length > best.length || (r.length === best.length && chestCount(r) > chestCount(best))) best = r
+      }
+    }
+    return best.sort((a, b) => a.slot - b.slot || a.line - b.line)
+  }
+  // Signs labelling a column: face-adjacent to one of its chests
+  // (the 6 face neighbours — diagonals excluded, so a neighbour
+  // column's sign can never bleed into this one).
+  function columnSignHint (chests) {
+    const seen = new Set()
+    for (const cp of chests) {
+      for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0]]) {
+        const p = new Vec3(cp[0] + dx, cp[1] + dy, cp[2] + dz)
+        const key = p.x + ',' + p.y + ',' + p.z
+        if (seen.has(key)) continue
+        seen.add(key)
+        let b = null
+        try { b = bot.blockAt(p) } catch (e) {}
+        if (!b) continue
+        const hint = signCategoryHint(signTextLines(b))
+        if (hint) return hint
+      }
+    }
+    return null
+  }
+  // Sample ONE column: open the bottom chest and one middle chest
+  // (bottom-first filling means the bottom chest is likeliest to
+  // hold something), read the items, close. NEVER withdraws or
+  // deposits. Returns { votes: Map category -> item count, sampled }.
+  // Enchanted items vote 'misc', same as the sort's routeCarried.
+  // v10.6 SPEED: no full re-path per chest. Columns sit 2 blocks
+  // apart, so the next sample chest is usually already in reach —
+  // walk ONLY when it is more than 3.5 blocks away, else open it
+  // from here (falling back to a walk if the open fails).
+  async function sampleColumn (chests, tok) {
+    const idxs = [0]
+    if (chests.length > 1) idxs.push(Math.floor(chests.length / 2))
+    const votes = new Map()
+    let sampled = 0
+    for (const i of idxs) {
+      if (tok !== moveToken) break
+      const cp = chests[i]
+      const target = new Vec3(cp[0], cp[1], cp[2])
+      const block = bot.blockAt(target)
+      if (!block || !isContainer(block)) continue
+      try {
+        const dist = bot.entity ? bot.entity.position.distanceTo(target) : 99
+        let opened = null
+        if (dist <= 3.5) {
+          try { opened = await bot.openChest(block) } catch (e) { opened = null }
+        }
+        if (!opened) {
+          if (!(await gotoPos(target))) continue
+          const fresh = bot.blockAt(target)
+          if (!fresh || !isContainer(fresh)) continue
+          opened = await bot.openChest(fresh)
+        }
+        try {
+          for (const it of opened.containerItems()) {
+            if (!it) continue
+            const cat = itemIsEnchanted(it) ? 'misc' : categoryOf(it.name)
+            votes.set(cat, (votes.get(cat) || 0) + it.count)
+          }
+          sampled++
+        } finally { try { opened.close() } catch (e) {} }
+      } catch (e) { log('scan: sample chest at ' + cp + ' failed: ' + e.message) }
+    }
+    return { votes, sampled }
+  }
+  let scanningStorage = false
+  async function scanStorageUnit () {
+    if (scanningStorage) { say('im already learning the storage unit, one sec'); return }
+    if (!bot || !bot.entity) return
+    // stop following/farming first — the scan walks a fixed route
+    // and a follow loop would fight it. Capture the moveToken AFTER
+    // (stopAllMovement bumps it), so "stop" during the scan still
+    // cancels it cleanly.
+    stopAllMovement()
+    scanningStorage = true
+    const tok = moveToken
+    const interrupted = () => tok !== moveToken
+    const scanT0 = Date.now() // v10.6: measure the scan (Tash: storage work must not be slow like farming)
+    const here = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
+    try {
+      say('ok, looking at the storage unit — learning every column')
+      // Chunks stream in after a teleport/spawn: scan until the
+      // container count stops growing (max ~8s), or the first scan
+      // can miss half the wall (same lesson as run 112's chest
+      // search). The scan is bounded by what the server sends.
+      let containers = findNearbyContainers(SCAN_RADIUS, SCAN_COUNT)
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await sleepMs(2000)
+        if (interrupted()) { say('stopped learning the storage unit'); return }
+        const again = findNearbyContainers(SCAN_RADIUS, SCAN_COUNT)
+        if (again.length <= containers.length) { containers = again; break }
+        containers = again
+      }
+      if (!containers.length) { say('i cant see any chests here — stand in front of the storage unit wall and try again'); return }
+      const columns = clusterWallColumns(containers)
+      if (!columns.length) { say('i see chests but couldnt make out the wall — stand right in front of it and try again'); return }
+      logEvent('scan', `storage scan: ${containers.length} containers seen, ${columns.length} wall columns`)
+      // canDig=false for the whole scan — never break a block to
+      // reach a chest (same pattern as grave recovery).
+      const savedCanDig = pathMovements ? pathMovements.canDig : true
+      if (pathMovements) pathMovements.canDig = false
+      const results = [] // { num, chests, category|null, signHint }
+      try {
+        for (let i = 0; i < columns.length; i++) {
+          if (interrupted()) { say('stopped learning the storage unit'); break }
+          const chests = columns[i].chests.sort((a, b) => a[1] - b[1] || a[0] - b[0] || a[2] - b[2])
+          const hint = columnSignHint(chests)
+          const { votes } = await sampleColumn(chests, tok)
+          let bestCat = null
+          let bestVotes = 0
+          for (const [cat, v] of votes) if (v > bestVotes) { bestCat = cat; bestVotes = v }
+          // a sign label overrides the contents vote, but ONLY when
+          // it names a known category (signCategoryHint enforces it)
+          const category = hint || bestCat || null
+          results.push({ num: i + 1, chests, category, signHint: hint })
+          log(`scan: column ${i + 1}: ${chests.length} chests -> ${category || 'unknown'}${hint ? ' (sign)' : ''} votes=${JSON.stringify([...votes])}`)
+        }
+      } finally { if (pathMovements) pathMovements.canDig = savedCanDig }
+      if (interrupted()) return
+      // Store in brain.columns in the EXACT format the teach-column
+      // code uses, so sorting works with zero other changes.
+      // Same-category slices merge (like re-teaching merges); a
+      // slice overlapping a TAUGHT column is never stolen — the
+      // taught one wins. Unknown slices become blank columns
+      // (claimable later, same as a taught blank column).
+      const stored = []
+      const unknowns = []
+      pendingUnknownColumns = []
+      for (const r of results) {
+        let clash = null
+        for (const c of Object.values(brain.columns || {})) {
+          // blanks never clash: a named slice replaces a blank at
+          // the same spot, an unknown slice merges into it (below)
+          if (!c || !c.chests || !c.category || c.category === r.category) continue
+          if (c.chests.some(p => r.chests.some(q => sameChestInventory(p, q)))) { clash = c; break }
+        }
+        if (clash && r.category) {
+          log(`scan: column ${r.num} overlaps the taught ${clash.category} column — kept the taught one`)
+          continue
+        }
+        if (!r.category) {
+          if (clash) { log(`scan: unknown column ${r.num} overlaps the taught ${clash.category} column — kept the taught one`); continue }
+          // merge into an existing blank at this spot (re-scan), else new blank
+          let blankKey = null
+          for (const [k, c] of Object.entries(brain.columns || {})) {
+            if (c && !c.category && c.chests && c.chests.some(p => r.chests.some(q => sameChestInventory(p, q)))) { blankKey = k; break }
+          }
+          if (blankKey) {
+            const prev = brain.columns[blankKey].chests || []
+            brain.columns[blankKey].chests = mergeChestLists([prev, r.chests])
+            brain.columns[blankKey].taughtAt = Date.now()
+          } else {
+            blankKey = 'blank-' + r.chests[0].join(',')
+            brain.columns[blankKey] = { category: null, name: 'blank column', chests: r.chests, pos: r.chests[0], taughtAt: Date.now() }
+          }
+          unknowns.push(r)
+          pendingUnknownColumns.push({ num: r.num, key: blankKey, chests: r.chests, pos: r.chests[0] })
+          continue
+        }
+        // a blank column scanned earlier at this spot becomes the named column
+        for (const [k, c] of Object.entries(brain.columns || {})) {
+          if (c && !c.category && c.chests && c.chests.some(p => r.chests.some(q => sameChestInventory(p, q)))) delete brain.columns[k]
+        }
+        const prev = (brain.columns[r.category] && brain.columns[r.category].chests) || []
+        const all = mergeChestLists([prev, r.chests])
+        brain.columns[r.category] = { category: r.category, name: r.category + ' column', chests: all, pos: r.chests[0], taughtAt: Date.now() }
+        stored.push(r)
+      }
+      // anchor + base-map area (the old "this is the storage unit"
+      // behaviour, minus permanent home: the storage unit is NOT
+      // Segs' room — permanentHome is taught separately by "segs
+      // remember this is your permanent home", and the scan must
+      // never clobber it. Room chests are NOT taken from the wall
+      // either — "this is my room" sets those properly.)
+      brain.storageUnit = { anchor: here, scannedAt: Date.now() }
+      brain.areas['storage unit'] = { name: 'storage unit', pos: here }
+      saveBrain()
+      logLearn('storage-scan', `${stored.length} columns learned, ${unknowns.length} unknown, anchor ${here.join(', ')}, ${((Date.now() - scanT0) / 1000).toFixed(1)}s`)
+      // Report: one summary, chunked like the inventory list (chat
+      // caps at ~256 chars). Then ask ONCE about the unknowns.
+      const parts = results.map(r => `${r.num} ${r.category || 'unknown'} (${r.chests.length})`)
+      sayInventoryLines('storage unit learned: ', parts)
+      if (unknowns.length) {
+        const nums = unknowns.map(u => u.num)
+        if (nums.length === 1) say(`column ${nums[0]} is empty, what goes here? say: column ${nums[0]} is ores`)
+        else say(`columns ${nums.join(', ')} are empty — what goes in each? say: column ${nums[0]} is ores`)
+      } else {
+        say('every column learned, i can sort now — say: segs sort my room')
+      }
+    } finally { scanningStorage = false }
   }
 
   const KEEP_ITEMS = ['pickaxe', 'axe', 'shovel', 'sword', 'hoe', 'fishing_rod', 'bow', 'crossbow', 'shield', 'helmet', 'chestplate', 'leggings', 'boots', 'elytra', 'trident']
@@ -4250,7 +4898,8 @@ function createBot () {
   // home (or near the owner). If the owner is offline, go to the
   // permanent home and idle there — do not wander alone.
   function startNightWatchdog () {
-    setInterval(() => {
+    if (_watchdogTimers.night) return // v10.6: one watchdog, not one per reconnect
+    _watchdogTimers.night = setInterval(() => {
       try {
         if (!connected || !bot || !bot.entity || bot.health <= 0) return
         if (inCombat() || fleeTimer || followMode || sortJob) return
@@ -4415,10 +5064,9 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       waterDriving = false
     }
   }
-  let waterWatchdog = null
   function startWaterWatchdog () {
-    if (waterWatchdog) return
-    waterWatchdog = setInterval(() => {
+    if (_watchdogTimers.water) return // v10.6: module-level guard (the old createBot-local guard reset on reconnect)
+    _watchdogTimers.water = setInterval(() => {
       try {
         if (!connected || !bot || !bot.entity || bot.health <= 0) return
         if (inCombat()) return
@@ -4524,8 +5172,10 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
   // so and wait for the owner. Runs every 2s.
   let unstuckTries = 0
   let unstuckLastPos = null, unstuckLastMove = 0
+  let unstuckNetPos = null, unstuckNetAt = 0 // v10.6: net-progress window (jitter defeats the gross check)
   function startUnstuckWatchdog () {
-    setInterval(() => {
+    if (_watchdogTimers.unstuck) return // v10.6: one watchdog, not one per reconnect
+    _watchdogTimers.unstuck = setInterval(() => {
       try {
         if (!connected || !bot || !bot.entity || bot.health <= 0) return
         if (inCombat() || fleeTimer) return
@@ -4543,15 +5193,25 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         // still trying to climb out).
         if (bot.entity.isInWater) return
         const goal = bot.pathfinder && bot.pathfinder.goal
-        if (!goal) { unstuckLastPos = bot.entity.position.clone(); unstuckLastMove = Date.now(); unstuckTries = 0; return }
+        if (!goal) { unstuckLastPos = bot.entity.position.clone(); unstuckLastMove = Date.now(); unstuckTries = 0; unstuckNetPos = null; return }
         const pos = bot.entity.position
-        if (!unstuckLastPos || pos.distanceTo(unstuckLastPos) > 0.5) { unstuckLastPos = pos.clone(); unstuckLastMove = Date.now(); return }
-        if (Date.now() - unstuckLastMove < 10000) return
+        if (!unstuckLastPos || pos.distanceTo(unstuckLastPos) > 0.5) { unstuckLastPos = pos.clone(); unstuckLastMove = Date.now() }
+        // v10.6 NET-PROGRESS (live bug 1): gross movement resets the
+        // check above even when Segs jitters in place — the freeze
+        // showed ZERO unstuck lines. Track NET displacement over
+        // 10s independently: under 1 block net with an active goal
+        // is stuck, whatever the gross movement was.
+        if (!unstuckNetPos) { unstuckNetPos = pos.clone(); unstuckNetAt = Date.now() }
+        else if (pos.distanceTo(unstuckNetPos) >= 1.0) { unstuckNetPos = pos.clone(); unstuckNetAt = Date.now() }
+        const grossStuck = Date.now() - unstuckLastMove >= 10000
+        const netStuck = Date.now() - unstuckNetAt >= 10000
+        if (!grossStuck && !netStuck) return
+        if (netStuck && !grossStuck) logEvent('unstuck', 'net progress under 1 block in 10s despite movement — jitter-stuck, intervening')
         unstuckTries++
         logEvent('unstuck', 'stuck for 10s, try ' + unstuckTries)
         if (unstuckTries > 3) {
           say('im stuck and i cant get out without breaking something — come get me?')
-          unstuckLastMove = Date.now(); unstuckTries = 0
+          unstuckLastMove = Date.now(); unstuckTries = 0; unstuckNetPos = null
           try { bot.pathfinder.setGoal(null) } catch (e) {}
           return
         }
@@ -4563,6 +5223,7 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
           setTimeout(() => { try { bot.setControlState('forward', false) } catch (e) {} }, 1500)
         }
         unstuckLastMove = Date.now()
+        unstuckNetPos = pos.clone(); unstuckNetAt = Date.now() // v10.6: net window restarts after an intervention
       } catch (e) {}
     }, 2000)
   }
@@ -4573,10 +5234,9 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
   // v10.4.1 PARKOUR: true while attemptDropDown is walking Segs off
   // a ledge on purpose — the edge watchdog must not stop it.
   let dropDownActive = false
-  let edgeWatchdog = null
   function startEdgeWatchdog () {
-    if (edgeWatchdog) return
-    edgeWatchdog = setInterval(() => {
+    if (_watchdogTimers.edge) return // v10.6: module-level guard (the old createBot-local guard reset on reconnect)
+    _watchdogTimers.edge = setInterval(() => {
       try {
         if (!connected || !bot || !bot.entity || bot.health <= 0) return
         if (bot.isSleeping) return
@@ -4964,11 +5624,17 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     await sleepMs(3500)
     const moved = bot.entity.position.distanceTo(before) > 2
     const cancelled = pendingHome && pendingHome.cancelled
+    const noSuchHome = pendingHome && pendingHome.noSuchHome
     pendingHome = null
-    if (cancelled) { logEvent('home', `/home ${name} warmup cancelled — Segs moved`); return false }
-    if (moved) logEvent('home', `teleported to /home ${name}`)
-    else logEvent('home', `/home ${name} did not teleport (no such home, or the warmup never started)`)
-    return moved
+    // v10.6: movement is ground truth — if Segs moved, he teleported,
+    // whatever the messages said. Otherwise record WHY, so the caller
+    // can report honestly instead of guessing.
+    if (moved) { lastHomeFailure = null; logEvent('home', `teleported to /home ${name}`); return true }
+    if (cancelled) { lastHomeFailure = 'cancelled'; logEvent('home', `/home ${name} warmup cancelled — Segs moved`); return false }
+    if (noSuchHome) { lastHomeFailure = 'nosuchhome'; logEvent('home', `/home ${name} — server says no such home`); return false }
+    lastHomeFailure = 'nomove'
+    logEvent('home', `/home ${name} did not teleport (no such home, or the warmup never started)`)
+    return false
   }
   // Auto-accept a /tpa request from the owner. The exact message depends on
   // the server's TPA plugin, so match flexibly: it must mention teleport +
@@ -5189,6 +5855,106 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       const beyond = bot.entity ? (bot.entity.position.x - dp.x) * through.x + (bot.entity.position.z - dp.z) * through.z : -99
       logEvent('door', `door assist: moved ${moved.toFixed(1)} blocks, beyond door ${beyond.toFixed(1)} — through door at ${door.position}`)
       return beyond > 0.5
+    } catch (e) { return false }
+  }
+  // v10.6 STEP-CLIMB ASSIST (live bug 1 + run 168): the fork's
+  // pathfinder executor cannot climb a full 1-block step — its
+  // physics-simulation gates (canWalkJump/canStraightLine in
+  // mineflayer-pathfinder's physics.js) refuse the step-up, so the
+  // executor sets forward=false and re-plans forever while the bot
+  // jitters in place (probe-climb Phase A: 0.2 blocks in 15s, a
+  // fresh plan every ~3.5s futility reset, onGround flickering).
+  // Manual forward+jump climbs the same steps in ~2s (Phase B).
+  // So when the follow loop is stuck with a 1-block step ahead, do
+  // it by hand: clear the goal, face the target, hold forward+jump
+  // until the feet rise or 2.5s pass, settle, then report whether
+  // Segs actually ended up higher/further. Same pattern as the
+  // door assist (manual movement the A* cannot do itself).
+  async function tryStepClimb (targetPos) {
+    try {
+      if (!bot || !bot.entity) return false
+      const start = bot.entity.position.clone()
+      const startY = start.y
+      try { bot.pathfinder.setGoal(null) } catch (e) {}
+      try { bot.clearControlStates() } catch (e) {}
+      // land first (same lesson as the door assist: a walk/jump
+      // only has traction on the ground).
+      const landT0 = Date.now()
+      while (Date.now() - landT0 < 1500) {
+        if (bot.entity && bot.entity.onGround) break
+        await sleepMs(100)
+      }
+      const aim = targetPos ? new Vec3(targetPos.x, start.y + 1, targetPos.z) : new Vec3(start.x + 1, start.y + 1, start.z)
+      // STEP BACK FIRST (run 168 root cause, probe-flush): starting
+      // flush against the step face (AABB exactly touching the
+      // block), Paper rubber-bands EVERY position packet back —
+      // ~20 server corrections per second, zero motion, completely
+      // silent client-side. The probe proved it: frozen at x=-98.3
+      // and x=-98.32, climbs fine from x=-98.5. Back up ~0.6 blocks
+      // for a gap + run-up before climbing (same "stepped back"
+      // lesson as the gotoPos climb assist). Face the target and
+      // walk backward, so the aim never changes.
+      bot.lookAt(aim)
+      bot.setControlState('back', true)
+      const backT0 = Date.now()
+      while (Date.now() - backT0 < 1200) {
+        await sleepMs(100)
+        if (!bot || !bot.entity) break
+        try { bot.setControlState('back', true) } catch (e) {}
+        if (Math.hypot(bot.entity.position.x - start.x, bot.entity.position.z - start.z) >= 1.0) break
+      }
+      bot.setControlState('back', false)
+      try { bot.clearControlStates() } catch (e) {}
+      await sleepMs(100)
+      // CLIMB (probe-climb2, pattern B wins 2/2): CONTINUOUS
+      // sprint+forward+jump for up to 4s. The jump-first variant
+      // (pattern A) climbs one step then pins against the next
+      // face — it loses momentum. Sprint + uninterrupted drive
+      // carries Segs over both steps. Keep driving while a step is
+      // ahead (chains multiple steps in one assist call); stop
+      // once the ground ahead is clear and we have moved, so the
+      // pathfinder can take over on flat ground.
+      bot.lookAt(aim)
+      bot.setControlState('sprint', true)
+      bot.setControlState('forward', true)
+      bot.setControlState('jump', true)
+      log(`step-climb: start=${start} backed-to=${bot.entity.position} aim=${aim} yaw=${bot.entity.yaw.toFixed(2)} onGround=${bot.entity.onGround}`)
+      const t0 = Date.now()
+      while (Date.now() - t0 < 4000) {
+        await sleepMs(150)
+        if (!bot || !bot.entity) break
+        try { bot.setControlState('sprint', true); bot.setControlState('forward', true); bot.setControlState('jump', true) } catch (e) {}
+        bot.lookAt(aim)
+        const cur = bot.entity.position
+        const movedSoFar = Math.hypot(cur.x - start.x, cur.z - start.z)
+        if (movedSoFar >= 1.2 && !stepAheadToward(targetPos)) break
+      }
+      bot.setControlState('forward', false)
+      bot.setControlState('jump', false)
+      await sleepMs(300) // settle: a jump apex must not count as climbed
+      if (!bot || !bot.entity) return false
+      const end = bot.entity.position
+      const moved = Math.hypot(end.x - start.x, end.z - start.z)
+      const rose = end.y - startY
+      const climbed = rose >= 0.9 || moved >= 1.2
+      logEvent('follow', `step-climb assist: moved ${moved.toFixed(1)} horizontally, rose ${rose.toFixed(2)} (climbed=${climbed})`)
+      return climbed
+    } catch (e) { return false }
+  }
+  // Is there a 1-block step ahead toward the target (solid low
+  // block, air above)? Shared by the follow loop's stuck branches
+  // — the jump pulse and the climb assist both key off it.
+  function stepAheadToward (targetPos) {
+    try {
+      if (!bot || !bot.entity || !targetPos) return false
+      const p = bot.entity.position
+      const dx = targetPos.x - p.x, dz = targetPos.z - p.z
+      const len = Math.hypot(dx, dz) || 1
+      const ax = Math.floor(p.x + (dx / len) * 1.5), ay = Math.floor(p.y), az = Math.floor(p.z + (dz / len) * 1.5)
+      const low = bot.blockAt(new Vec3(ax, ay, az))
+      const high = bot.blockAt(new Vec3(ax, ay + 1, az))
+      const solid = b => b && b.name !== 'air' && b.name !== 'water'
+      return solid(low) && !solid(high)
     } catch (e) { return false }
   }
   // v10.4.1 PARKOUR — MANUAL DROP-DOWN (the different approach for
@@ -5772,6 +6538,11 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
 
   // v10: open a door in the way (wooden: right-click it; iron: press a
   // nearby plate / button / lever). Returns true if it opened something.
+  // v10.6: throttled log for OPEN doors in the way (live bug 2:
+  // Segs faced an open door, entered nothing, and the log had ZERO
+  // door lines — the old code returned false silently for open
+  // doors). One line per door per 10s, not per tick.
+  let _lastOpenDoorLog = { key: null, at: 0 }
   async function openDoorInWay () {
     try {
       if (!bot || !bot.entity) return false
@@ -5789,7 +6560,21 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       })
       if (!door) return false
       const props = door.getProperties ? door.getProperties() : {}
-      if (props.open === true) return false // already open, nothing to do
+      // v10.6: an OPEN door is still in the way — the fork A* cannot
+      // route through ANY door (it only "opens" the feet-level block
+      // and tries to break the head-level one, which fails with
+      // canDig=false), so an open door stalls Segs exactly like a
+      // closed one unless the walk-through assist runs. Report it
+      // distinctly ('open') so the caller walks through; never
+      // silently ignore it again.
+      if (props.open === true) {
+        const key = door.position.x + ',' + door.position.y + ',' + door.position.z
+        if (_lastOpenDoorLog.key !== key || Date.now() - _lastOpenDoorLog.at > 10000) {
+          _lastOpenDoorLog = { key, at: Date.now() }
+          logEvent('door', 'open door in the way at ' + door.position + ' — walk-through needed, the pathfinder cannot route through it')
+        }
+        return 'open'
+      }
       if (!door.name.startsWith('iron')) {
         // wooden door: right-click it open
         await bot.activateBlock(door)
@@ -5824,6 +6609,31 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     } catch (e) { return false }
   }
 
+  // v10.6: is there a door between Segs and the target? The door
+  // must be within maxDist AND in front of Segs toward the target
+  // (dot product > 0.3) — a door behind him is not in the way.
+  // Returns the door block or null. Used for the PROACTIVE
+  // walk-through: don't wait 6s stuck, walk through when close.
+  function doorAhead (targetPos, maxDist = 3.5) {
+    try {
+      if (!bot || !bot.entity || !targetPos) return null
+      const p = bot.entity.position
+      const tx = targetPos.x - p.x, tz = targetPos.z - p.z
+      const tLen = Math.hypot(tx, tz)
+      if (tLen < 0.5) return null
+      const door = bot.findBlock({
+        matching: b => b && b.name && b.name.endsWith('_door') && !b.name.includes('trapdoor'),
+        maxDistance: maxDist
+      })
+      if (!door) return null
+      const dx = door.position.x + 0.5 - p.x, dz = door.position.z + 0.5 - p.z
+      const dLen = Math.hypot(dx, dz) || 1
+      const dot = (dx * tx + dz * tz) / (dLen * tLen)
+      if (dot < 0.3) return null
+      return door
+    } catch (e) { return null }
+  }
+
   // v10.5 FAST FOLLOW: the old loop called setGoal(GoalFollow)
   // every 500ms — and setGoal calls resetPath() every time, so the A*
   // restarted constantly and long-distance follow ran at ~0.6 blocks/s
@@ -5852,6 +6662,11 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     // and re-path — they must NOT touch lastMove (see the stuck block
     // below: touching it capped stuckMs and starved the 6s door assist).
     let lastFollowJump = 0, lastFollowRepath = 0
+    // v10.6: net-progress window (live bug 1) + proactive door
+    // throttle (live bug 2). See the dist>2 branch below.
+    let progPos = null, progAt = Date.now()
+    let lastDoorAssistAt = 0
+    let lastStepClimbAt = 0 // v10.6: step-climb assist throttle
     let followStartPos = bot.entity ? bot.entity.position.clone() : null
     let followStartAt = Date.now()
     let measuring = true // measure speed until Segs first catches up
@@ -5884,7 +6699,55 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         // v10: proactive door open — do not wait 6s stuck. If a closed
         // door is in the way, open it now, then (re-)set the follow
         // goal so the pathfinder routes through the open doorway.
-        await openDoorInWay()
+        // v10.6: an OPEN door stalls Segs exactly the same way (the
+        // A* cannot route through any door) — when a door is in the
+        // way and Segs is close, WALK THROUGH it now (proactive
+        // assist, throttled to once per 8s), then re-set the goal.
+        // The old code waited for stuck>6s, and the stuck detector
+        // was defeated by jitter — the freeze was completely silent.
+        const doorState = await openDoorInWay()
+        const da = doorAhead(ownerEnt.position, 3.5)
+        if (da && Date.now() - lastDoorAssistAt > 8000) {
+          lastDoorAssistAt = Date.now()
+          logEvent('door', `door in the way at ${da.position} (${doorState === 'open' ? 'already open' : doorState ? 'just opened' : 'closed'}) — proactive walk-through, then fresh follow goal`)
+          if (await tryDoorAssist(ownerEnt.position)) {
+            try { bot.pathfinder.setGoal(new goals.GoalFollow(ownerEnt, 2)) } catch (e) {}
+            lastGoalOwnerPos = ownerEnt.position.clone()
+            lastGoalOwnerEnt = ownerEnt
+          }
+        }
+        // v10.6 NET-PROGRESS stuck detection (live bug 1): the gross
+        // check below resets on ANY 0.5-block move per tick, so a
+        // Segs jittering in place (0.04 blocks/s NET) never looked
+        // stuck and no watchdog ever fired. Track NET displacement
+        // over 10s: under 1 block net while still >2 from the owner
+        // is stuck, whatever the gross movement was. Escalate with
+        // a forced re-path + door assist, and LOG it.
+        {
+          const np = bot.entity.position
+          if (!progPos) { progPos = np.clone(); progAt = Date.now() }
+          else if (np.distanceTo(progPos) >= 1.0) { progPos = np.clone(); progAt = Date.now() }
+          else if (Date.now() - progAt > 10000) {
+            logEvent('follow', `net-progress stuck: under 1 block net in ${((Date.now() - progAt) / 1000).toFixed(0)}s while ${dist.toFixed(1)} from owner — forcing re-path + assist`)
+            lastGoalOwnerPos = null
+            lastGoalOwnerEnt = null
+            progPos = np.clone(); progAt = Date.now()
+            // v10.6: a step ahead needs the climb assist, not the
+            // door assist (run 168: door assist moved 0.0 forever
+            // while Segs faced a step). Try the right tool first.
+            let assisted = false
+            if (stepAheadToward(ownerEnt.position) && Date.now() - lastStepClimbAt > 4000) {
+              lastStepClimbAt = Date.now()
+              assisted = await tryStepClimb(ownerEnt.position)
+            }
+            if (!assisted) assisted = await tryDoorAssist(ownerEnt.position)
+            if (assisted) {
+              try { bot.pathfinder.setGoal(new goals.GoalFollow(ownerEnt, 2)) } catch (e) {}
+              lastGoalOwnerPos = ownerEnt.position.clone()
+              lastGoalOwnerEnt = ownerEnt
+            }
+          }
+        }
         // v10.5: re-path ONLY when needed — never every tick.
         const ownerMoved = !lastGoalOwnerPos || ownerEnt.position.distanceTo(lastGoalOwnerPos) > 3
         const entChanged = ownerEnt !== lastGoalOwnerEnt
@@ -5913,30 +6776,29 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
             // for 18s, stuckMs hovering 4500-5000, door assist never
             // ran). lastMove must keep accumulating so 6s is reachable;
             // the jump and the re-path throttle on their own clocks.
-            // v10.5.1 IDLE-JUMP FIX: only pulse jump when there is
-            // actually a 1-block STEP ahead toward the owner (low
-            // block solid, block above it air). On flat land Segs
-            // stands at the follow radius (dist 2.0-2.1) not moving
-            // — that is CAUGHT UP, not stuck on a step — and jumping
-            // every 2s there is the idle-jump bug Tash reported
-            // (flat land, no wall, no ledge, jumps every 1-2s).
-            // A step check also stops the pulse when Segs is pressed
-            // against a 2-high wall (low + high both solid — the
-            // door assist / sidestep owns that, not jumping).
-            const stepAhead = (() => {
-              try {
-                const p = bot.entity.position
-                const dx = ownerEnt.position.x - p.x, dz = ownerEnt.position.z - p.z
-                const len = Math.hypot(dx, dz) || 1
-                const ax = Math.floor(p.x + (dx / len) * 1.5), ay = Math.floor(p.y), az = Math.floor(p.z + (dz / len) * 1.5)
-                const low = bot.blockAt(new (require('vec3').Vec3)(ax, ay, az))
-                const high = bot.blockAt(new (require('vec3').Vec3)(ax, ay + 1, az))
-                const solid = b => b && b.name !== 'air' && b.name !== 'water'
-                return solid(low) && !solid(high)
-              } catch (e) { return false }
-            })()
-            if (stepAhead && (!lastFollowJump || Date.now() - lastFollowJump > 2000) && Date.now() >= jumpHoldUntil) {
+            // v10.6 STEP-CLIMB (run 168): the old code only pulsed
+            // jump here — jump WITHOUT forward drive, while the
+            // pathfinder sat idle with a refused path, so Segs
+            // hopped in place against the step forever. When a
+            // 1-block step is ahead, climb it by hand
+            // (forward+jump together — the probe proved that works)
+            // and re-set the follow goal after. Throttled to once
+            // per 4s; the re-path below still runs every 2s.
+            const stepAhead = stepAheadToward(ownerEnt.position)
+            if (stepAhead && Date.now() - lastStepClimbAt > 4000 && Date.now() >= jumpHoldUntil) {
+              lastStepClimbAt = Date.now()
+              if (await tryStepClimb(ownerEnt.position)) {
+                try { bot.pathfinder.setGoal(new goals.GoalFollow(ownerEnt, 2)) } catch (e) {}
+                lastGoalOwnerPos = ownerEnt.position.clone()
+                lastGoalOwnerEnt = ownerEnt
+                lastPos = bot.entity.position.clone(); lastMove = Date.now()
+                progPos = null
+              }
+            } else if (stepAhead && (!lastFollowJump || Date.now() - lastFollowJump > 2000) && Date.now() >= jumpHoldUntil) {
+              // climb assist throttled — a jump pulse at least keeps
+              // the intent visible in the log while waiting
               lastFollowJump = Date.now()
+              logEvent('follow', 'jump pulse: 1-block step ahead while stuck, pulsing jump (climb assist throttled)')
               bot.setControlState('jump', true)
               setTimeout(() => { try { bot.setControlState('jump', false) } catch (e) {} }, 500)
             }
@@ -5966,7 +6828,20 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
             // stuck: the goal may be stale — force a re-path next tick
             lastGoalOwnerPos = null
             lastGoalOwnerEnt = null
-            if (await tryDoorAssist(ownerEnt.position)) {
+            logEvent('follow', 'stuck 6s, trying step-climb / door assist / drop-down') // v10.6: log every intervention
+            // v10.6: step first (run 168) — the door assist is a
+            // no-op when Segs already passed the door.
+            let climbed = false
+            if (stepAheadToward(ownerEnt.position) && Date.now() - lastStepClimbAt > 4000) {
+              lastStepClimbAt = Date.now()
+              climbed = await tryStepClimb(ownerEnt.position)
+            }
+            if (climbed) {
+              try { bot.pathfinder.setGoal(new goals.GoalFollow(ownerEnt, 2)) } catch (e) {}
+              lastGoalOwnerPos = ownerEnt.position.clone()
+              lastGoalOwnerEnt = ownerEnt
+              lastPos = bot.entity.position.clone(); lastMove = Date.now()
+            } else if (await tryDoorAssist(ownerEnt.position)) {
               try { bot.pathfinder.setGoal(new goals.GoalFollow(ownerEnt, 2)) } catch (e) {}
               lastGoalOwnerPos = ownerEnt.position.clone()
               lastGoalOwnerEnt = ownerEnt
@@ -6000,6 +6875,7 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         }
       } else {
         // caught up — report the measured speed once per chase
+        progPos = null // v10.6: net-progress window resets on catch-up
         if (measuring && followStartPos) {
           const covered = followStartPos.distanceTo(bot.entity.position)
           const secs = Math.max(0.1, (Date.now() - followStartAt) / 1000)
@@ -6018,11 +6894,20 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     }
   }
 
-  let replantWarned = false
+  let farmRunning = false // v10.6: re-entrancy guard — the 5s timer + slow sweeps used to overlap and double-log the same crop
+  let farmEmptySweeps = 0 // consecutive sweeps with no ripe crops (for the "waiting" notice)
+  let farmWaitingSaid = false
   function startFarming (cropName) {
     if (farming) stopFarming()
+    // v10.6 DUAL DRIVER (live bug 4): starting farm MUST stop follow
+    // mode — the follow loop kept re-setting GoalFollow while Segs
+    // farmed, cancelling every farm goto ("farm skip unreachable"
+    // x523) and fighting every dig ("Digging aborted"). Latest wins
+    // must actually cancel the other movement driver.
+    if (following) { following = null; try { bot.pathfinder.setGoal(null) } catch (e) {} logEvent('farm', 'stopped following to farm (latest wins)') }
     farming = true
-    replantWarned = false
+    farmEmptySweeps = 0
+    farmWaitingSaid = false
     const center = config.farmCenter
       ? new Vec3(config.farmCenter[0], config.farmCenter[1], config.farmCenter[2])
       : bot.entity.position.clone()
@@ -6035,52 +6920,258 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     if (farmTimer) { clearInterval(farmTimer); farmTimer = null }
   }
 
-  async function farmOnce (cropName, center) {
-    if (!farming || !bot.entity) return
-    const crop = CROPS[cropName]
-    const mcData = mcDataFor(bot.version)
-    if (!mcData.blocksByName[crop.block]) { say('i dont know that crop on this version'); stopFarming(); return }
-    const blocks = bot.findBlocks({
-      matching: (b) => b.name === crop.block && b.metadata === crop.maxAge,
-      maxDistance: config.farmRadius || 16,
-      count: 20,
-    })
-    if (!blocks.length) return
-    // v10.4 AUTOFARM (Wurst): nearest-first, one crop at a time in
-    // order, and remember which seed goes on each spot.
-    blocks.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b))
-    for (const pos of blocks) {
-      if (!farming) break
-      const block = bot.blockAt(pos)
-      if (!block) continue
-      try {
-        // walk to the crop; if one block is unreachable, skip it quietly
-        // (simulation: 5 chat-spam "cant reach there" lines for blocks the
-        // bot had already harvested or could not stand next to)
-        try { await gotoPosQuiet(pos) } catch (e) { log('farm skip unreachable ' + pos); continue }
-        recordFarmSpot(pos, cropName, crop.seed)
-        await bot.dig(block)
-        bumpStat('cropsFarmed')
-        logEvent('farm', `harvested 1x ${cropName} at ${pos.x}, ${pos.y}, ${pos.z}`)
-        // v10.3 PICKUP: the drop lands on the ground — walk onto it
-        // BEFORE moving to the next crop, or the wheat stays on the
-        // ground and looks like Segs threw it (Tash's report). Wait
-        // for the item entity, step onto it, then replant.
-        await sleepMs(400)
-        const drop = bot.nearestEntity(e => e.type === 'object' && e.objectType === 'Item' && e.position.distanceTo(pos) < 3)
-        if (drop) { try { await gotoPosQuiet(drop.position) } catch (e) {} await sleepMs(300) }
-        await sleepMs(300)
-        const seed = bot.inventory.items().find(i => i.name === crop.seed)
-        if (seed) {
-          await bot.equip(seed, 'hand')
-          const soil = bot.blockAt(pos.offset(0, -1, 0))
-          if (soil && soil.name === 'farmland') { await bot.placeBlock(soil, new Vec3(0, 1, 0)); logEvent('autofarm', 'replanted ' + crop.seed + ' at ' + pos.x + ',' + pos.y + ',' + pos.z + ' (spot remembered)') }
-        } else if (!replantWarned) {
-          replantWarned = true
-          say(`i need ${crop.seed} to replant ${cropName}`)
-        }
-      } catch (e) { log('harvest one failed: ' + e.message) }
+  // v10.6 SERPENTINE ORDER (Tash: "he should plant serially in a row
+  // or column"). The old code re-sorted nearest-first every 5s tick
+  // from Segs' CURRENT position, so the order reshuffled as he moved
+  // and harvest coordinates jumped all over the farm. Now: detect
+  // the farm's row axis from the WHOLE layout (longer span = row
+  // direction), group ripe crops into rows, walk row by row from the
+  // nearest row, alternating direction each row (boustrophedon) so
+  // Segs never backtracks. Returns { ordered, alongX, rowCount, dir }.
+  function serpentineOrder (ripe, all, fromPos) {
+    const pts = all.length ? all : ripe
+    const xs = pts.map(p => p.x), zs = pts.map(p => p.z)
+    const spanX = Math.max(...xs) - Math.min(...xs)
+    const spanZ = Math.max(...zs) - Math.min(...zs)
+    const alongX = spanX >= spanZ
+    const axisOf = p => (alongX ? p.x : p.z)
+    const rowOf = p => (alongX ? p.z : p.x)
+    const rows = new Map()
+    for (const p of ripe) {
+      const key = rowOf(p)
+      if (!rows.has(key)) rows.set(key, [])
+      rows.get(key).push(p)
     }
+    let keys = [...rows.keys()].sort((a, b) => a - b)
+    // start from the row nearest Segs (reverse the row order if the far end is closer)
+    const hereRow = rowOf(fromPos)
+    if (Math.abs(hereRow - keys[keys.length - 1]) < Math.abs(hereRow - keys[0])) keys.reverse()
+    // first row: walk toward the end nearer Segs; then alternate
+    let dir = 1
+    {
+      const row0 = [...rows.get(keys[0])].sort((a, b) => axisOf(a) - axisOf(b))
+      if (fromPos.distanceTo(row0[row0.length - 1]) < fromPos.distanceTo(row0[0])) dir = -1
+    }
+    const ordered = []
+    for (let i = 0; i < keys.length; i++) {
+      const row = rows.get(keys[i]).sort((a, b) => axisOf(a) - axisOf(b))
+      const rowDir = (i % 2 === 0) ? dir : -dir
+      if (rowDir === -1) row.reverse()
+      ordered.push(...row)
+    }
+    return { ordered, alongX, rowCount: keys.length, dir }
+  }
+  // Replant one spot from seeds already carried. Returns true when a
+  // seed went down. Never warns — the sweep summary reports unplanted
+  // spots truthfully at the end (live bug 6: warning before the first
+  // harvest had a chance to drop seeds).
+  async function tryReplant (pos, crop) {
+    try {
+      const seed = bot.inventory.items().find(i => i.name === crop.seed)
+      if (!seed) return false
+      await bot.equip(seed, 'hand')
+      const soil = bot.blockAt(pos.offset(0, -1, 0))
+      if (!soil || soil.name !== 'farmland') return false
+      const above = bot.blockAt(pos)
+      if (above && above.name !== 'air' && above.name !== 'cave_air') return false
+      await bot.placeBlock(soil, new Vec3(0, 1, 0))
+      logEvent('autofarm', 'replanted ' + crop.seed + ' at ' + pos.x + ',' + pos.y + ',' + pos.z + ' (spot remembered)')
+      return true
+    } catch (e) { return false }
+  }
+
+  // v10.6 PICKUP SWEEP (live: ZERO pickup lines in the whole
+  // session — drops left on the ground, only accidental walk-over
+  // pickup). After each farm row, actively collect the drops from
+  // blocks Segs JUST broke: only item entities within 4 blocks of
+  // a harvested-this-sweep position, so Segs never vacuums other
+  // players' stuff. Walks to each, verifies the inventory delta,
+  // logs what was picked up. Bounded: 6 rounds, 5s per walk.
+  async function pickupFarmDrops (positions) {
+    if (!positions.length || !bot.entity) return
+    const before = new Map()
+    for (const it of bot.inventory.items()) before.set(it.name, (before.get(it.name) || 0) + it.count)
+    const tried = new Set()
+    for (let round = 0; round < 6; round++) {
+      if (!farming) break
+      const dropped = Object.values(bot.entities || {}).filter(e => {
+        if (!e || e.name !== 'item' || tried.has(e.id)) return false
+        return positions.some(p => e.position.distanceTo(new Vec3(p.x + 0.5, p.y, p.z + 0.5)) <= 4)
+      })
+      if (!dropped.length) break
+      dropped.sort((a, b) => bot.entity.position.distanceTo(a.position) - bot.entity.position.distanceTo(b.position))
+      const target = dropped[0]
+      tried.add(target.id)
+      try {
+        await gotoWithTimeout(new goals.GoalNear(target.position.x, target.position.y, target.position.z, 1), 5000)
+        await sleepMs(400)
+      } catch (e) {
+        // v10.6 run 175: the sweep drove Segs off the farm bed and
+        // he ended flush against the farmland side, pinned — the
+        // step-climb (back up + sprint+jump) gets him back on the
+        // bed. One climb + one retry, then move on.
+        let reached = false
+        if (stepAheadToward(target.position) && await tryStepClimb(target.position)) {
+          try { await gotoWithTimeout(new goals.GoalNear(target.position.x, target.position.y, target.position.z, 1), 3000); await sleepMs(400); reached = true } catch (e2) {}
+        }
+        if (!reached) log('farm pickup: could not reach drop at ' + target.position)
+      }
+    }
+    const got = []
+    for (const it of bot.inventory.items()) {
+      const diff = it.count - (before.get(it.name) || 0)
+      if (diff > 0) got.push(`${diff}x ${it.name}`)
+    }
+    if (got.length) { logEvent('farm', 'pickup sweep: +' + got.join(', ')); bumpStat('itemsPicked', got.length) }
+  }
+
+  async function farmOnce (cropName, center) {
+    if (!farming || !bot.entity || farmRunning) return
+    farmRunning = true
+    const sweepT0 = Date.now()
+    try {
+      const crop = CROPS[cropName]
+      const mcData = mcDataFor(bot.version)
+      if (!mcData.blocksByName[crop.block]) { say('i dont know that crop on this version'); stopFarming(); return }
+      const dropName = { wheat: 'wheat', carrot: 'carrot', carrots: 'carrot', potato: 'potato', potatoes: 'potato', beetroot: 'beetroot' }[cropName] || cropName
+      const countItem = (n) => bot.inventory.items().filter(i => i.name === n).reduce((a, i) => a + i.count, 0)
+      // all crop blocks (ripe + growing) for the farm's SHAPE, ripe
+      // ones for the sweep. Count 200: a real farm has 100+ crops and
+      // the old cap of 20 truncated the sweep every tick.
+      const all = bot.findBlocks({ matching: b => b.name === crop.block, maxDistance: config.farmRadius || 16, count: 200 })
+      const ripe = []
+      for (const p of all) { const b = bot.blockAt(p); if (b && b.metadata === crop.maxAge) ripe.push(p) }
+      if (!ripe.length) {
+        farmEmptySweeps++
+        // v10.6 SILENT END (live bug: last harvest 11:56:17, then
+        // nothing — no "done", no scan lines). After productive
+        // sweeps, 3 empty sweeps means nothing is ripe: say so ONCE
+        // instead of going quiet mid-task.
+        if (farmEmptySweeps === 3 && !farmWaitingSaid) {
+          farmWaitingSaid = true
+          say(`nothing ripe left to farm, waiting for the ${cropName} to grow — say segs stop farm to stop me`)
+          logEvent('farm', 'no ripe crops for 3 sweeps, waiting for regrow')
+        }
+        return
+      }
+      farmEmptySweeps = 0
+      farmWaitingSaid = false
+      const { ordered, alongX, rowCount, dir } = serpentineOrder(ripe, all, bot.entity.position)
+      logEvent('farm', `sweep: ${ordered.length} ripe ${cropName}, ${rowCount} rows along ${alongX ? 'x' : 'z'}, start dir ${dir > 0 ? '+' : '-'}${alongX ? 'x' : 'z'}`)
+      const invBefore = countItem(dropName)
+      const harvestedHere = new Set() // coords harvested this sweep — never double-log
+      const unplanted = []
+      let harvested = 0, replanted = 0
+      let consecUnreached = 0 // run 175: stop burning 8s/crop when the bed itself is unreachable
+      let rowKey = null
+      let rowHarvested = [] // positions harvested in the current row (for the pickup sweep)
+      const allHarvested = [] // every position harvested this sweep (final sweep)
+      for (const pos of ordered) {
+        if (!farming) break
+        const key = pos.x + ',' + pos.y + ',' + pos.z
+        if (harvestedHere.has(key)) continue
+        // fresh block check: still the ripe crop? Never log a
+        // harvest for a block that is already gone.
+        const block = bot.blockAt(pos)
+        if (!block || block.name !== crop.block || block.metadata !== crop.maxAge) continue
+        try {
+          // move ONLY when out of reach — consecutive row crops are
+          // 1 block apart, so most need no walk at all (no per-crop
+          // full re-path). A failed walk skips THIS crop only; the
+          // crop stays ripe for the next sweep (it is not
+          // "unreachable" forever — the old code's verdict was wrong
+          // whenever another driver cancelled the goal).
+          if (bot.entity.position.distanceTo(pos) > 3.2) {
+            try { await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2), 8000) }
+            catch (e) {
+              // v10.6 run 175: Segs falls off the bed and pins flush
+              // against the farmland side — the pathfinder alone can
+              // never step back up. One step-climb + one retry;
+              // after 3 unreachable in a row, end the sweep instead
+              // of burning 8s per crop (the next sweep retries).
+              let reached = false
+              if (stepAheadToward(pos) && await tryStepClimb(pos)) {
+                try { await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2), 4000); reached = true } catch (e2) {}
+              }
+              if (!reached) {
+                log('farm: crop at ' + pos + ' not reached this sweep (' + e.message + ')')
+                if (++consecUnreached >= 3) { log('farm: 3 crops in a row unreachable — ending this sweep, will retry next pass'); break }
+                continue
+              }
+            }
+            const b2 = bot.blockAt(pos)
+            if (!b2 || b2.name !== crop.block || b2.metadata !== crop.maxAge) continue
+          }
+          recordFarmSpot(pos, cropName, crop.seed)
+          // re-fetch the block right before digging: the reference
+          // captured before the walk is stale and aborts the dig
+          // ("Digging aborted").
+          const fresh = bot.blockAt(pos)
+          await bot.dig(fresh)
+          // verify the block actually BROKE before counting it —
+          // the old code logged "harvested" on every dig attempt,
+          // over-counting 197 lines vs 165 wheat actually gained.
+          await sleepMs(100)
+          const after = bot.blockAt(pos)
+          if (after && after.name === crop.block && after.metadata === crop.maxAge) { log('farm: dig at ' + pos + ' did not break the crop, not counting it'); continue }
+          harvestedHere.add(key)
+          harvested++
+          consecUnreached = 0
+          bumpStat('cropsFarmed')
+          logEvent('farm', `harvested 1x ${cropName} at ${pos.x}, ${pos.y}, ${pos.z}`)
+          // pickup sweep at each row boundary: collect this row's
+          // drops before walking on (never leave farm drops behind).
+          const rk = alongX ? pos.z : pos.x
+          if (rowKey === null) rowKey = rk
+          if (rk !== rowKey) { await pickupFarmDrops(rowHarvested); rowHarvested = []; rowKey = rk }
+          rowHarvested.push(pos)
+          allHarvested.push(pos)
+          // replant immediately from carried seeds — no stop-wait
+          // between harvest and replant. No seed yet? The spot
+          // joins the replant pass below (the pickup sweep above
+          // collects the harvest's own drops first).
+          if (await tryReplant(pos, crop)) replanted++
+          else unplanted.push(pos)
+        } catch (e) { log('harvest one failed: ' + e.message) }
+      }
+      // last row's drops, then the replant pass, then a FINAL sweep
+      // over everything harvested (catches drops scattered during
+      // the replant walk) before the summary counts the gain.
+      if (rowHarvested.length) await pickupFarmDrops(rowHarvested)
+      // replant pass: same serpentine order, spots missed for lack of
+      // seeds — by now the pickup sweeps have collected the sweep's
+      // drops, so seeds are available.
+      for (const pos of unplanted) {
+        if (!farming) break
+        const above = bot.blockAt(pos)
+        if (above && above.name === crop.block) continue // regrown already
+        if (bot.entity.position.distanceTo(pos) > 3.2) {
+          try { await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2), 8000) }
+          catch (e) {
+            // same step-climb recovery as the harvest loop (run 175)
+            let reached = false
+            if (stepAheadToward(pos) && await tryStepClimb(pos)) {
+              try { await gotoWithTimeout(new goals.GoalNear(pos.x, pos.y, pos.z, 2), 4000); reached = true } catch (e2) {}
+            }
+            if (!reached) continue
+          }
+        }
+        if (await tryReplant(pos, crop)) replanted++
+      }
+      if (allHarvested.length) await pickupFarmDrops(allHarvested)
+      const unplantedLeft = harvested - replanted
+      const invAfter = countItem(dropName)
+      const gained = invAfter - invBefore
+      const sweepSecs = Math.max(0.1, (Date.now() - sweepT0) / 1000)
+      const rate = (harvested / sweepSecs * 60).toFixed(0)
+      logEvent('farm', `sweep done: ${harvested} harvested, ${replanted} replanted, +${gained} ${dropName} in inventory, ${sweepSecs.toFixed(1)}s (${rate}/min)`)
+      // v10.6: SAY the result — never go quiet mid-task. The seed
+      // warning fires ONLY here, truthfully, after the harvest had
+      // its chance (live bug 6: warned 1s after farm start).
+      if (harvested > 0) {
+        say(`done farming this pass — got ${gained}x ${dropName}, replanted ${replanted}${unplantedLeft > 0 ? `, ${unplantedLeft} spot${unplantedLeft > 1 ? 's' : ''} still need${unplantedLeft > 1 ? '' : 's'} ${crop.seed}` : ''}`)
+      }
+    } finally { farmRunning = false }
   }
 
   function startAfk () {
@@ -6267,20 +7358,40 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
   // container), and every container seen is REMEMBERED in brain
   // (pos + type, not contents) so Segs knows what is in his base
   // even when he is not standing next to it.
-  function findNearbyContainers (radius = 32) {
+  // v10.6: count param (default 100, as before). The storage-unit
+  // scan passes a high count — the real unit has ~160 double chests
+  // plus room/farm chests nearby, and the old 100 cap would silently
+  // truncate the wall. Callers that don't pass count are unchanged.
+  function findNearbyContainers (radius = 32, count = 100) {
     try {
-      const raw = bot.findBlocks({ matching: b => b && (b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel'), maxDistance: radius, count: 100 })
+      const raw = bot.findBlocks({ matching: b => b && (b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel'), maxDistance: radius, count })
       const seen = new Set()
       const out = []
       for (const pos of raw) {
         const key = pos.x + ',' + pos.y + ',' + pos.z
         if (seen.has(key)) continue
         seen.add(key)
-        // double chest: if the west or north neighbour is also a
-        // chest, this is the second half — skip it (one container).
-        const w = bot.blockAt(new Vec3(pos.x - 1, pos.y, pos.z))
-        const n = bot.blockAt(new Vec3(pos.x, pos.y, pos.z - 1))
-        if ((w && (w.name === 'chest' || w.name === 'trapped_chest')) || (n && (n.name === 'chest' || n.name === 'trapped_chest'))) continue
+        // Double chest: skip ONLY the `right` half, read from the
+        // blockstate `type` (single/left/right). The old neighbour
+        // check ("west/north neighbour is a chest") collapsed a
+        // whole continuous wall into one chest per row, because
+        // every chest in a run has a chest neighbour — run 164
+        // proved it: a 30-chest wall scanned as 3 chests. The
+        // blockstate is the truth: single/left halves are kept,
+        // right halves are the second half of a double chest.
+        // (Probed 2026-11-14: getProperties() exposes type; /fill
+        // and /setblock chests stay type=single on this Paper
+        // build, player-placed pairs are left/right. Barrels have
+        // no `type` and are always kept. If properties are
+        // unreadable, keep the chest — double-counting one double
+        // chest is harmless, collapsing a wall is not.)
+        let isRightHalf = false
+        try {
+          const here = bot.blockAt(pos)
+          const props = here && here.getProperties ? here.getProperties() : null
+          if (props && props.type === 'right') isRightHalf = true
+        } catch (e) {}
+        if (isRightHalf) continue
         out.push(pos)
       }
       // container memory (Wurst ChestESP point): remember every
@@ -6532,6 +7643,11 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       // 1. already have food? just eat.
       const food = hasFood()
       if (food) {
+        // v10.6: check fullness BEFORE announcing — the old order
+        // said "eating now" then "im already full" 2ms later (run
+        // 171b), a contradictory pair. Never announce an eat that
+        // will not happen.
+        if (bot.food >= 20) { say('im already full'); return }
         say(`i have ${food.name}, eating now`)
         // v10.5.2: verified eat — the old code counted foodEaten and
         // said "fed, all good" even when the eat timed out or was
@@ -6611,22 +7727,24 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
   // (Simulation run 4: threshold was <12 with a 60s check — food sat at
   // exactly 12 at the check and the watchdog never fired. 30s + <14 fixes it.)
   let lastHungrySay = 0
-  setInterval(() => {
-    try {
-      if (!bot || !bot.entity || bot.health <= 0) return
-      if (bot.food < 19 && Date.now() - lastHungrySay > 60 * 1000) {
-        lastHungrySay = Date.now()
-        say('im getting hungry, sorting food out myself')
-        survive().catch(e => log('survive watchdog: ' + e.message))
-      }
-      updateSprint()
-      // v8: a bed remembered during the day — sleep in it tonight to set spawn
-      if (brain.pendingSpawnBed) sleepPendingBed().catch(e => log('sleepPendingBed: ' + e.message))
-    } catch (e) {}
-  }, 30000)
+  if (!_watchdogTimers.hunger) { // v10.6: one interval, not one per reconnect
+    _watchdogTimers.hunger = setInterval(() => {
+      try {
+        if (!bot || !bot.entity || bot.health <= 0) return
+        if (bot.food < 19 && Date.now() - lastHungrySay > 60 * 1000) {
+          lastHungrySay = Date.now()
+          say('im getting hungry, sorting food out myself')
+          survive().catch(e => log('survive watchdog: ' + e.message))
+        }
+        updateSprint()
+        // v8: a bed remembered during the day — sleep in it tonight to set spawn
+        if (brain.pendingSpawnBed) sleepPendingBed().catch(e => log('sleepPendingBed: ' + e.message))
+      } catch (e) {}
+    }, 30000)
+  }
 
   // v8: enemy evade — check every 5s, flee like a villager if one gets close.
-  setInterval(() => { evadeTick().catch(e => log('evade: ' + e.message)) }, 5000)
+  if (!_watchdogTimers.evade) _watchdogTimers.evade = setInterval(() => { evadeTick().catch(e => log('evade: ' + e.message)) }, 5000)
 
   // ---- v5: dig / mine / chop / place / fish / smelt ----
   // v10 NO-TOOL RULE: blocks that need a pickaxe. Digging one by hand
