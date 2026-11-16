@@ -1,4 +1,4 @@
-# Segs — CHANGELOG (v10 → v10.6)
+# Segs — CHANGELOG (v10 → v10.7)
 
 > **How to read this file.** One section per version, newest last in the file's
 > history but listed in release order below. Every claim comes from
@@ -796,3 +796,109 @@ pickup, sleep fake-fast, typos, store phrasings. Simulation runs 164–181.
   log: still uninvestigated.
 - Everything above is simulation proof only. Real-server testing on
   Youniga by Tash is still pending for v10–v10.6.
+
+## v10.7 — 2026-11-17 — package 10.7.0 — STAGE 1: professional builder core
+
+Stage 1 of the builder project (Tash 2026-11-16): Segs builds from
+Sponge `.schem` files with BuildPrint-grade state-aware placement.
+The v1 Autobuild block (65-block JSON house) is REPLACED by the v2
+builder; all v10.6 behaviour is preserved (regression runs below).
+No new fork patches. The `.schem` file itself is binary and is never
+committed — only the converted JSON text lives in the repo.
+
+- SCHEM CONVERTER (`tools/convert-schem.js`): reads Sponge v2
+  `.schem` (palette inversion + varint BlockData, YZX order), writes
+  compact Segs JSON `{palette, blocks, billOfMaterials, blockEntities}`
+  plus a `--verify` mode against a known analysis. Run 183 (offline):
+  dom2-e3000.schem converts to 121x55x69, palette 806, 66,425
+  non-air blocks, 1,632 block entities — VERIFY OK, exact match.
+  Output: `schematics/dom2.json` (1,049,997 bytes).
+- ALIGNMENT SCAN ("Segs scan the build" / "Segs align the build"):
+  AlignmentVote-style matching of placed blocks against the
+  schematic's bottom 2 layers; derives origin + rotation (0/90/180/
+  270), reports confidence, refuses below 0.6. Rotation rotates
+  coordinates AND blockstates (facing/axis/rotation/vines; hinge is
+  rotation-invariant; stair shape is server-computed, never
+  hand-computed). Run 185: 60 pre-placed cells at a 90-degree
+  rotation found at origin -95,70,152, rotation 90, confidence
+  100% (60 matched, 0 mismatched), 5/5 attempts.
+- STATE-AWARE PLACEMENT ("BuildPrint brain"): port of BuildPrint
+  0.1.41's PlacementSolver search (supports x 5 hit points x
+  candidate looks, BuildPrint heavy/light scoring, faceAllowed,
+  sneak for interactive supports) with pure-function state
+  predictors per block family. Predictors were CORRECTED against a
+  CFR decompile of vanilla 26.3 `getStateForPlacement` (47 classes):
+  trapdoor two-branch rule, full door-hinge rule with click-position
+  tiebreak, barrel/dispenser/dropper/piston look-opposite rule,
+  observer look rule, hopper Y-clamp, campfire/pot playerDir rule,
+  button/lever/grindstone FaceAttached rule, bell double-wall rule,
+  vine opposite-face rule, wall hanging sign perpendicular-look
+  rule, ceiling hanging sign cardinal/attached rule, end-rod
+  chaining flip, floor coral fan faceless. Yaw/pitch frame bugs
+  found by testing: notchian/internal conversion at the `bot.look`
+  boundary, and the fork's `bot.look` await resolving on YAW ONLY —
+  pitch swings need a computed settle wait (0.15 rad/tick stepping).
+  Run 184 (torture, 68 cells): verifier ok=68 bad=0 — stairs 4
+  facings x top/bottom, slabs, logs 3 axes, trapdoors, door + hinge,
+  wall sign, chest, lanterns, end rod, piston (look rule confirmed),
+  double slab, fence gate, barrel facing up.
+- STAGING CHEST: Segs places his own chest outside the footprint
+  (never inside), draws the batch from it via bulkRefill, reports
+  when dry. Run 187: chest placed outside, 64/64 at 169/min. Run
+  188: bulk draws 40+16+5+2+1 = 64 from staging, 64/64, 0 wrong.
+  Run 189: empty staging + empty inventory -> "staging ran dry for
+  oak_planks", 64 nomat, 0 wrong, 0 chest walks.
+- RESUME + PROGRESS: skip only on exact block+state match;
+  wrong-present blocks are reported and left alone, never broken.
+  Progress quartiles + measured rate in chat; `brain.buildProgress`
+  reset at build start (a killed build no longer leaves a stale
+  "running now" status). Run 186: stop mid-build (51 placed) ->
+  "build paused" -> resume skips all 51. Run 192: fresh process
+  resumes, 123 skipped, terminates honestly with 37 unplaced.
+- BATCHING + SPEED: stand-point batching (ring d=1/2/3 + tops of
+  placed cells), BuildOrder sort, waypoint routing around the
+  footprint, badStands blacklist, step-climb fallback gated on a
+  real 1-block step, pass gate (zero-progress pass ends the build).
+  Run 190 (dense wall): 169/min burst (first 40 in 13 s, ~2.8/s,
+  matching BuildPrint's printer rate), ~40/min sustained for the 6
+  ground-reachable rows (120 in 182 s). Human-legitimate only:
+  reach ~4.5, 1 block per place action, no packet spam, no flying.
+- SKIP LIST: nether_portal, dragon_egg, beacon, conduit, heads/
+  skulls, budding_amethyst, suspicious_gravel, turtle_egg, beehive/
+  bee_nest, cave_vines_plant — never placed, always reported with
+  counts. Run 191: 5 stones placed, all 5 skip types reported, 0
+  wrong. End rods ARE placeable and are placed.
+- FIXES FOUND BY THIS ROUND (shared code, all regression-covered):
+  `bulkRefill` read `chest.items()` (player inventory!) instead of
+  `containerItems()` — it had never withdrawn anything (run 188);
+  `withdrawFromChests` ghost filter (loaded non-chest positions
+  skipped + forgotten without walking); staging-chest hunt scoped
+  to radius 12 (run 185); build material hunt scoped to radius 16
+  + once-per-item-per-build (run 189); `doCraft` variant sort
+  (least-missing first, best-variant missing report — run 193
+  proves both torch variants craft); stale `brain.buildProgress`
+  reset + error-path running=false.
+- REGRESSION (v10.6 set, same scripts): run 180 drop-all exact
+  counts PASS; run 137 eat deficit-0 PASS (hungry legs inconclusive
+  by test design, as in v10.5.3) + run 138 positive eat proof PASS
+  (food 19->20, 0 drops); run 57 follow-through-door PASS (door
+  opened, 0 dug, 2.0 behind); run 172 serpentine farm PASS (0 skip
+  lines, 23 wheat = reported); run 177 one-reply PASS; run 182 home
+  alias PASS (all phases). Run 111 (craft from chests) INCONCLUSIVE:
+  the general radius-32 hunt drowns in test-environment brain
+  pollution (40 remembered chests from ~190 runs, pinning Segs at
+  platform edges) — pre-existing behaviour, unchanged by v10.7;
+  run 193 is the positive doCraft proof.
+- HONEST LIMITS (stage 1): everything simulation-only. Tall sheer
+  walls: rows above ground reach (~6 rows) are honestly reported
+  unplaced — scaffolding/pillaring/jump-placing is stage 2 (runs
+  186/190/192: 123/160 wall, 0 wrong, 37 top-row cells unplaced).
+  Water needs one bucket per water cell (no scooping refill yet).
+  Staging chest reuse is not scoped per site (one remembered chest
+  for all builds). Piston facing uses the look-opposite rule
+  (confirmed by the run-184 probe, not by decompile — the 26.3
+  piston class name differs). WallSign/WallBanner/TripWireHook loop
+  bodies were verified by header + the wall-sign torture cell, not
+  by full body reads. Real-server proof still needed: the real
+  121x55x69 dom2 alignment against Tash's 4%, real latency, the
+  real SimpleGraves grave block type (unchanged unknown).

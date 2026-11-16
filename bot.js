@@ -693,7 +693,7 @@ function createBot () {
   // acked at all — the ack exists so Tash knows Segs heard, while
   // the work runs.
   const ACK_MOVE_WORDS = ['go', 'follow', 'tp', 'teleport', 'come', 'return', 'move']
-  const ACK_WORK_WORDS = ['craft', 'cook', 'smelt', 'dig', 'mine', 'chop', 'place', 'farm', 'sleep', 'sort', 'build', 'get', 'pick', 'eat', 'drop', 'give', 'guard', 'fish', 'sethome', 'home', 'make']
+  const ACK_WORK_WORDS = ['craft', 'cook', 'smelt', 'dig', 'mine', 'chop', 'place', 'farm', 'sleep', 'sort', 'build', 'scan', 'get', 'pick', 'eat', 'drop', 'give', 'guard', 'fish', 'sethome', 'home', 'make']
   function ackCommand (username, msg, isWhisper = false) {
     try {
       if (!isOwner(username)) return
@@ -3351,6 +3351,23 @@ function createBot () {
       return
     }
 
+    // v10.7 BUILDER: "Segs scan the build" / "Segs align the build" —
+    // vote-based alignment scan against the schematic's bottom layers.
+    // Placed before the build handler (and before the generic status
+    // handler below, which swallows anything containing 'status').
+    if (req.includes('scan the build') || req.includes('align the build') || req.includes('scan build') || req.includes('align build')) {
+      const m = req.match(/(?:scan|align)(?: the)? build\s+([a-z0-9_-]+)/)
+      const name = m ? m[1] : (brain.buildAlignment ? brain.buildAlignment.name : 'dom2')
+      await scanBuild(name)
+      return
+    }
+
+    // v10.7 BUILDER: "Segs build status" — alignment + last-build progress.
+    if (req.includes('build status') || req.includes('building status') || req.includes('build progress')) {
+      say(buildStatusText())
+      return
+    }
+
     // v10.5 AUTOBUILD: "Segs build house here" — reads
     // schematics/<name>.json and builds it at the marked site.
     // Must come before "craft", or "build house" would fall through
@@ -5589,6 +5606,10 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
 
   function stopAllMovement () {
     moveToken++
+    // v10.7: cancel a running build too (the build loop checks _buildRunId,
+    // not cmdGen: a second build command bumps cmdGen BEFORE the guard runs,
+    // which would kill the running build and refuse the replacement).
+    globalThis._buildRunId = (globalThis._buildRunId || 0) + 1
     following = null
     stopFarming()
     stopAfk()
@@ -7452,6 +7473,23 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     let got = 0
     for (const pos of chests) {
       if (got >= count) break
+      // v10.7 GHOST FILTER (run 185): a REMEMBERED chest whose chunk is
+      // loaded and whose block is no longer a chest is gone — skip it
+      // WITHOUT walking (the old code walked up to 20s per ghost and a
+      // stale brain could burn a whole run). Unloaded (null) blocks
+      // keep the old behaviour — the chunk may load en route. The
+      // criterion matches the post-walk check below (name has 'chest').
+      const pre = bot.blockAt(pos)
+      if (pre && !pre.name.includes('chest')) {
+        try {
+          if (brain.containers) {
+            const before = brain.containers.length
+            brain.containers = brain.containers.filter(c => !(c.pos[0] === pos.x && c.pos[1] === pos.y && c.pos[2] === pos.z))
+            if (brain.containers.length !== before) saveBrain()
+          }
+        } catch (e2) {}
+        continue
+      }
       try {
         // v10.5.1 (item 3): CAP the walk to the chest at 6s. The
         // unbounded gotoPosQuiet HANGS forever if the chest is
@@ -7849,281 +7887,1613 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     say(`dropped ${items.length} stacks, kept my tools`)
   }
 
-  // ---- v10.5: AUTOBUILD SCHEMATIC TOOL v1 ----
-  // Schematics live in schematics/ as JSON:
-  //   { "name": "house", "blocks": [{ "dx": 0, "dy": 0, "dz": 0, "block": "cobblestone" }] }
-  // relative to a marked origin ("Segs this is the build site").
-  // "Segs build house here" counts the mats, searches nearby chests
-  // (16 blocks) for mats AND raw mats, crafts what it can from raw
-  // (planks from logs, sticks from planks), reports the exact
-  // missing-mats list and STOPS if anything is missing, then builds
-  // layer by layer (Y ascending, nearest-first in each layer) at
-  // HUMAN speed — 1 block per tick, normal reach, line of sight.
-  // It NEVER breaks a non-air block, NEVER uses fastPlace or 6-block
-  // reach (those were the CHEAT parts of NiceWurst AutoBuild).
-  const RAW_CRAFT = { oak_planks: 'oak_log', spruce_planks: 'spruce_log', birch_planks: 'birch_log', stick: 'oak_planks' }
+  // ---- v10.7: PROFESSIONAL BUILDER (BuildPrint PlacementSolver port) ----
+  // Stage 1: compact SCHEM converter output, vote-based alignment scan,
+  // state-aware placement (solver search over supports x hit points x looks,
+  // ported from BuildPrint 0.1.41 PlacementSolver.java — see
+  // ~/workspace/buildprint/buildprint-printer-analysis.md), staging chest,
+  // resume/progress, and stand-point batching. Human-legitimate only:
+  // vanilla reach (~4.4), one block per place action, real supports, no
+  // angel placement, no reach learning. AccuratePlacement / PlaceProtocol
+  // (hit-X state encoding) is NOT ported: it needs Carpet/Servux server-side
+  // and Youniga has neither — solver-only on this server.
+  // Backwards compatible: v1 JSON schematics ({dx,dy,dz,block}) are
+  // normalized to the same internal cell format.
+
+  // ---------- blockstate parsing / rotation ----------
+  function parseBlockState (stateStr) {
+    const s = String(stateStr || '')
+    const m = s.match(/^([^[]+)(?:\[(.*)\])?$/)
+    const rawName = (m ? m[1] : s).replace(/^minecraft:/, '')
+    const props = {}
+    if (m && m[2]) {
+      for (const part of m[2].split(',')) {
+        const kv = part.split('=')
+        if (kv.length === 2) props[kv[0].trim()] = kv[1].trim()
+      }
+    }
+    return { name: rawName, props }
+  }
+
+  function stateToString (name, props) {
+    const keys = Object.keys(props).filter(k => props[k] !== undefined).sort()
+    if (!keys.length) return 'minecraft:' + name
+    return 'minecraft:' + name + '[' + keys.map(k => k + '=' + props[k]).join(',') + ']'
+  }
+
+  const DIR_VEC = { down: [0, -1, 0], up: [0, 1, 0], north: [0, 0, -1], south: [0, 0, 1], west: [-1, 0, 0], east: [1, 0, 0] }
+  const OPPOSITE_DIR = { down: 'up', up: 'down', north: 'south', south: 'north', west: 'east', east: 'west' }
+  const ROT_FACING_CW = { north: 'east', east: 'south', south: 'west', west: 'north' } // clockwise viewed from above
+  const CW_OF = { north: 'east', east: 'south', south: 'west', west: 'north' }
+  const CCW_OF = { north: 'west', west: 'south', south: 'east', east: 'north' }
+
+  function rotFacing (f, rot) {
+    let out = f
+    for (let i = 0; i < (rot & 3); i++) out = ROT_FACING_CW[out] || out
+    return out
+  }
+
+  // FootprintTransform.apply (BuildPrint): NONE (x,z); CW_90 (L-1-z, x);
+  // CW_180 (W-1-x, L-1-z); CW_270 (z, W-1-x).
+  function rotateXZ (x, z, rot, W, L) {
+    switch (rot & 3) {
+      case 0: return [x, z]
+      case 1: return [L - 1 - z, x]
+      case 2: return [W - 1 - x, L - 1 - z]
+      default: return [z, W - 1 - x]
+    }
+  }
+
+  // Rotate a full blockstate string by rot*90 degrees clockwise (viewed
+  // from above). facing/axis/rotation_16/connection faces rotate; hinge,
+  // half, face, attachment, part, vertical_direction are invariant.
+  // Stair shape is server-computed — carried through but never verified.
+  function rotateState (stateStr, rot) {
+    rot &= 3
+    if (rot === 0) return stateStr
+    const { name, props } = parseBlockState(stateStr)
+    const out = { ...props }
+    for (const k of ['facing', 'horizontal_facing']) if (out[k]) out[k] = rotFacing(out[k], rot)
+    if ((rot & 1) && out.axis) out.axis = out.axis === 'x' ? 'z' : out.axis === 'z' ? 'x' : out.axis
+    if (out.rotation !== undefined) out.rotation = String((parseInt(out.rotation, 10) + 4 * rot) % 16)
+    const conn = ['north', 'south', 'east', 'west']
+    if (conn.some(k => out[k] !== undefined)) {
+      for (let i = 0; i < rot; i++) {
+        const n = out.north; const e = out.east; const s = out.south; const w = out.west
+        out.east = n; out.south = e; out.west = s; out.north = w
+      }
+    }
+    return stateToString(name, out)
+  }
+
+  function rotatedDims (schem, rot) {
+    return (rot & 1) ? [schem.length, schem.height, schem.width] : [schem.width, schem.height, schem.length]
+  }
+
+  // ---------- schematic loading (v2 compact + v1 legacy) ----------
   function loadSchematic (name) {
     try {
       const safe = String(name || '').replace(/[^a-z0-9_-]/gi, '')
       const p = require('path').join(__dirname, 'schematics', safe + '.json')
       const data = JSON.parse(fs.readFileSync(p, 'utf8'))
-      if (!data || !Array.isArray(data.blocks) || !data.blocks.length) return null
-      return data
+      if (!data) return null
+      // v2 compact: {palette, blocks:[[x,y,z,pIdx],...]}
+      if (Array.isArray(data.palette) && Array.isArray(data.blocks) && data.blocks.length && Array.isArray(data.blocks[0])) {
+        const cells = data.blocks.map(b => {
+          const st = parseBlockState(data.palette[b[3]])
+          return { x: b[0], y: b[1], z: b[2], state: data.palette[b[3]], name: st.name, props: st.props }
+        })
+        return { name: data.name || safe, format: 'v2', width: data.width, height: data.height, length: data.length, offset: data.offset || [0, 0, 0], cells, materials: data.materials || null, blockEntities: data.blockEntities || null, raw: data }
+      }
+      // v1: {blocks:[{dx,dy,dz,block}]} — normalize to 0-based coords
+      if (Array.isArray(data.blocks) && data.blocks.length && typeof data.blocks[0] === 'object' && data.blocks[0].block) {
+        let minX = Infinity; let minY = Infinity; let minZ = Infinity
+        let maxX = -Infinity; let maxY = -Infinity; let maxZ = -Infinity
+        for (const b of data.blocks) {
+          minX = Math.min(minX, b.dx); minY = Math.min(minY, b.dy); minZ = Math.min(minZ, b.dz)
+          maxX = Math.max(maxX, b.dx); maxY = Math.max(maxY, b.dy); maxZ = Math.max(maxZ, b.dz)
+        }
+        const cells = data.blocks.map(b => ({ x: b.dx - minX, y: b.dy - minY, z: b.dz - minZ, state: 'minecraft:' + b.block, name: b.block, props: {} }))
+        return { name: data.name || safe, format: 'v1', width: maxX - minX + 1, height: maxY - minY + 1, length: maxZ - minZ + 1, offset: [0, 0, 0], cells, materials: null, blockEntities: null, raw: data }
+      }
+      return null
     } catch (e) { return null }
   }
-  async function autobuild (name) {
-    // v10.5.1 (item 3): one build at a time. A second "build house
-    // here" while a build is running used to start a SECOND build
-    // loop — the two loops interleaved, both moving Segs and placing,
-    // and neither ever finished or reported (run 113: the first build
-    // never said its summary, the second was cut off by the run end).
-    if (globalThis._autobuildRunning) { say('im already building — wait for this one to finish'); return }
-    globalThis._autobuildRunning = true
+
+  // ---------- skip list: blocks a survival player genuinely cannot place/obtain ----------
+  const BUILD_SKIP_NAMES = new Set(['nether_portal', 'dragon_egg', 'beacon', 'conduit', 'budding_amethyst', 'suspicious_gravel', 'turtle_egg', 'beehive', 'bee_nest', 'end_portal', 'end_gateway', 'fire', 'soul_fire', 'bubble_column', 'cave_vines_plant'])
+  function isSkippedBlock (name) {
+    if (BUILD_SKIP_NAMES.has(name)) return true
+    // mob heads / skulls (incl. wall variants) — survival-unobtainable as blocks here
+    if (name.endsWith('_head') || name.endsWith('_wall_head') || name.endsWith('_skull') || name.endsWith('_wall_skull')) return true
+    return false
+  }
+
+  // ---------- block classification helpers ----------
+  const REPLACEABLE_NAMES = new Set(['air', 'cave_air', 'void_air', 'water', 'lava', 'short_grass', 'tall_grass', 'fern', 'large_fern', 'dead_bush', 'dandelion', 'poppy', 'blue_orchid', 'allium', 'azure_bluet', 'red_tulip', 'orange_tulip', 'white_tulip', 'pink_tulip', 'oxeye_daisy', 'cornflower', 'lily_of_the_valley', 'wither_rose', 'sunflower', 'lilac', 'rose_bush', 'peony', 'oak_sapling', 'spruce_sapling', 'birch_sapling', 'jungle_sapling', 'acacia_sapling', 'dark_oak_sapling', 'cherry_sapling', 'pale_oak_sapling', 'mangrove_propagule', 'brown_mushroom', 'red_mushroom', 'crimson_fungus', 'warped_fungus', 'crimson_roots', 'warped_roots', 'nether_sprouts', 'seagrass', 'tall_seagrass', 'glow_lichen', 'vine', 'snow', 'fire', 'soul_fire', 'sweet_berry_bush', 'small_dripleaf', 'big_dripleaf', 'hanging_roots', 'pink_petals', 'spore_blossom', 'pitcher_crop', 'torchflower_crop', 'cave_vines', 'weeping_vines', 'twisting_vines', 'wheat', 'carrots', 'potatoes', 'beetroots', 'melon_stem', 'pumpkin_stem', 'attached_melon_stem', 'attached_pumpkin_stem', 'nether_wart', 'cocoa', 'tripwire', 'redstone_wire'])
+  function isReplaceableName (name) { return REPLACEABLE_NAMES.has(name) }
+
+  // Interactive blocks: clicking them opens/toggles instead of placing —
+  // sneak to place against them (BuildPrint: interactive support +3, sneak).
+  const INTERACTIVE_NAMES = new Set(['chest', 'trapped_chest', 'ender_chest', 'barrel', 'furnace', 'blast_furnace', 'smoker', 'crafting_table', 'hopper', 'dropper', 'dispenser', 'brewing_stand', 'enchanting_table', 'anvil', 'chipped_anvil', 'damaged_anvil', 'loom', 'cartography_table', 'smithing_table', 'fletching_table', 'grindstone', 'stonecutter', 'lectern', 'composter', 'jukebox', 'note_block', 'respawn_anchor', 'cake', 'cauldron', 'water_cauldron', 'lava_cauldron', 'powder_snow_cauldron', 'beehive', 'bee_nest', 'crafter'])
+  function isInteractiveName (name) {
+    if (INTERACTIVE_NAMES.has(name)) return true
+    if (name.endsWith('_shulker_box')) return true
+    if (name.endsWith('_door') || name.endsWith('_trapdoor') || name.endsWith('_fence_gate')) return true
+    if (name.endsWith('_button') || name === 'lever') return true
+    if (name.endsWith('_bed')) return true
+    return false
+  }
+
+  const AXIS_BLOCKS = new Set(['oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log', 'dark_oak_log', 'cherry_log', 'pale_oak_log', 'mangrove_log', 'crimson_stem', 'warped_stem', 'stripped_oak_log', 'stripped_spruce_log', 'stripped_birch_log', 'stripped_jungle_log', 'stripped_acacia_log', 'stripped_dark_oak_log', 'stripped_cherry_log', 'stripped_pale_oak_log', 'stripped_mangrove_log', 'stripped_crimson_stem', 'stripped_warped_stem', 'oak_wood', 'spruce_wood', 'birch_wood', 'jungle_wood', 'acacia_wood', 'dark_oak_wood', 'cherry_wood', 'pale_oak_wood', 'mangrove_wood', 'crimson_hyphae', 'warped_hyphae', 'stripped_oak_wood', 'stripped_spruce_wood', 'stripped_birch_wood', 'stripped_jungle_wood', 'stripped_acacia_wood', 'stripped_dark_oak_wood', 'stripped_cherry_wood', 'stripped_pale_oak_wood', 'stripped_mangrove_wood', 'stripped_crimson_hyphae', 'stripped_warped_hyphae', 'bamboo_block', 'stripped_bamboo_block', 'basalt', 'polished_basalt', 'quartz_pillar', 'purpur_pillar', 'hay_block', 'chain'])
+  // NOTE: end_rod / lightning_rod are NOT axis blocks — they have a
+  // `facing` prop and are handled by OMNI_FACE_MOUNTS below.
+  function isAxisBlock (name) { return AXIS_BLOCKS.has(name) }
+
+  function isChestLike (name) { return name === 'chest' || name === 'trapped_chest' }
+  function isDoublePlant (name) { return name === 'rose_bush' || name === 'lilac' || name === 'large_fern' || name === 'peony' || name === 'sunflower' || name === 'pitcher_plant' || name === 'tall_grass' || name === 'tall_seagrass' }
+  function isStandingForm (name) {
+    if (name === 'torch' || name === 'redstone_torch' || name === 'soul_torch') return true
+    if (name.endsWith('_sign') && !name.includes('_wall_') && !name.endsWith('_hanging_sign')) return true
+    if (name.endsWith('_banner') && !name.includes('_wall_')) return true
+    return false
+  }
+  function isWallForm (name) {
+    if (name === 'wall_torch' || name === 'redstone_wall_torch' || name === 'soul_wall_torch') return true
+    if (name.endsWith('_wall_sign') || name.endsWith('_wall_banner')) return true
+    return false
+  }
+
+  // Full-collision cube approximation (BuildOrder tier 0 + door-hinge
+  // full-block test). Mis-tiering only affects placement ORDER, never
+  // correctness — the solver + verifier are the truth.
+  function isFullCubeName (name) {
+    if (name.endsWith('_stairs') || name.endsWith('_slab') || name.endsWith('_fence') || name.endsWith('_wall') || name.endsWith('_pane') || name.endsWith('_trapdoor') || name.endsWith('_door') || name.endsWith('_button') || name.endsWith('_plate') || name.endsWith('_sign') || name.endsWith('_banner') || name.endsWith('_rail') || name.endsWith('_torch') || name.endsWith('_pot') || name.endsWith('_bud') || name.endsWith('_fence_gate')) return false
+    if (name === 'chest' || name === 'trapped_chest' || name === 'barrel' || name === 'hopper' || name === 'grindstone' || name === 'bell' || name === 'anvil' || name === 'chipped_anvil' || name === 'damaged_anvil' || name === 'lantern' || name === 'soul_lantern' || name === 'chain' || name === 'end_rod' || name === 'lever' || name === 'tripwire' || name === 'redstone_wire' || name === 'repeater' || name === 'comparator' || name === 'lectern' || name === 'brewing_stand' || name === 'enchanting_table' || name === 'stonecutter' || name === 'loom' || name === 'composter' || name === 'campfire' || name === 'soul_campfire' || name === 'cake' || name === 'cauldron' || name === 'scaffolding' || name === 'snow' || name === 'crafter' || name === 'observer' || name === 'daylight_detector' || name === 'conduit' || name === 'beacon') return false
+    if (name.includes('carpet') || name.includes('vine') || name.includes('torch') || name.includes('flower') || name.includes('sapling') || name.includes('mushroom') || name.includes('grass') || name.includes('fern') || name.includes('bush') || name.includes('lily') || name.includes('seagrass') || name.includes('kelp') || name.includes('bamboo') || name.includes('cactus') || name.includes('chorus') || name.endsWith('_bed') || name === 'sculk_sensor' || name === 'sculk_shrieker' || name === 'sculk_catalyst' || name === 'heavy_core' || name === 'trial_spawner' || name === 'vault' || name === 'end_rod' || name === 'lightning_rod') return false
+    if (isReplaceableName(name)) return false
+    return true
+  }
+
+  // BuildOrder tiers (BuildPrint): 0 STRUCTURE (full-collision),
+  // 1 SHELL, 2 DECORATION (placed last — needs supports, no support).
+  function buildTier (name) {
+    if (name === 'torch' || name === 'redstone_torch' || name === 'soul_torch' || name.endsWith('_torch') || name === 'lantern' || name === 'soul_lantern' || name === 'end_rod' || name.endsWith('_candle') || name === 'sea_pickle' || name === 'amethyst_cluster' || name.endsWith('_amethyst_bud') || name === 'pointed_dripstone' || name === 'redstone_wire' || name === 'repeater' || name === 'comparator' || name.endsWith('_button') || name === 'lever' || name.endsWith('_plate') || name.endsWith('_rail') || name === 'tripwire' || name.endsWith('_carpet') || name === 'snow' || name.endsWith('_sign') || name.endsWith('_banner') || name.endsWith('_head') || name.endsWith('_skull') || name === 'ladder' || name === 'flower_pot' || name.startsWith('potted_') || name === 'decorated_pot') return 2
+    if (isReplaceableName(name) || isDoublePlant(name) || name === 'vine' || name === 'cave_vines' || name === 'bamboo' || name === 'sugar_cane' || name === 'kelp' || name === 'glow_lichen' || name === 'cactus' || name === 'chorus_plant' || name === 'chorus_flower' || name === 'nether_wart' || name === 'cocoa' || name === 'sweet_berry_bush' || name === 'small_dripleaf' || name === 'big_dripleaf' || name === 'pink_petals' || name === 'pitcher_plant' || name === 'spore_blossom' || name === 'hanging_roots' || name === 'mangrove_propagule' || name === 'azalea' || name === 'flowering_azalea') return 2
+    if (isFullCubeName(name)) return 0
+    return 1
+  }
+
+  // ---------- yaw helpers ----------
+  // The solver works in NOTCHIAN degrees (the server's frame: 0=south,
+  // 90=west, 180=north, 270=east — Direction.fromYRot). The fork's
+  // internal yaw is 0=north, 180=south: toNotchianYaw = 180 - internal
+  // (mineflayer lib/conversions.js). Convert ONLY at the bot.look
+  // boundary and when reading bot.entity.yaw — never inside predictors.
+  function yawToDir (yawDeg) {
+    const idx = ((Math.floor(yawDeg / 90 + 0.5) % 4) + 4) % 4
+    return ['south', 'west', 'north', 'east'][idx]
+  }
+  function notchianToInternalRad (notchianDeg) {
+    return (180 - notchianDeg) * Math.PI / 180
+  }
+  function internalToNotchianDeg (internalRad) {
+    return 180 - internalRad * 180 / Math.PI
+  }
+  // Pitch: toNotchianPitch = -internalPitch, so internal = -notchian.
+  function notchianPitchToInternalRad (notchianPitchDeg) {
+    return -notchianPitchDeg * Math.PI / 180
+  }
+  function internalPitchToNotchianDeg (internalPitchRad) {
+    return -internalPitchRad * 180 / Math.PI
+  }
+  function angDiffDeg (a, b) {
+    let d = (a - b) % 360
+    if (d > 180) d -= 360
+    if (d < -180) d += 360
+    return Math.abs(d)
+  }
+
+  // Nearest looking direction (Direction.orderedByNearest[0], decompiled
+  // from Paper 26.3): the axis with the largest look-vector component.
+  // Inputs are NOTCHIAN degrees (yaw 0=south, pitch +90=looking down).
+  function nearestLookingDir (yawDeg, pitchDeg) {
+    const y = yawDeg * Math.PI / 180
+    const p = pitchDeg * Math.PI / 180
+    const lx = -Math.sin(y) * Math.cos(p)
+    const ly = -Math.sin(p)
+    const lz = Math.cos(y) * Math.cos(p)
+    const ax = Math.abs(lx); const ay = Math.abs(ly); const az = Math.abs(lz)
+    if (ax >= ay && ax >= az) return lx > 0 ? 'east' : 'west'
+    if (ay >= ax && ay >= az) return ly > 0 ? 'up' : 'down'
+    return lz > 0 ? 'south' : 'north'
+  }
+  // Rotation-segment for a cardinal direction (RotationSegment:
+  // south=0, west=4, north=8, east=12).
+  function cardinalSegment (dir) {
+    return { south: 0, west: 4, north: 8, east: 12 }[dir]
+  }
+
+  // ---------- state predictors (pure functions per block family) ----------
+  // ctx: { face, hitY (0..1 within the support block), yawDeg, pitchDeg,
+  //        target: Vec3, worldAt: (pos) => block|null }
+  // Returns predicted props (subset the placement determines), or null if
+  // this face cannot place the block at all.
+  // Door hinge — the FULL 26.3 rule (DoorBlock.getHinge, decompiled):
+  // balance = (-1 per full block on the LEFT incl. above) + (+1 per full
+  // block on the RIGHT incl. above); doors on the sides (LOWER half only)
+  // decide first; on a tie the CLICK POSITION within the cell decides.
+  // ctx needs hitU/hitV (the solver's hit point) + face for the tiebreak.
+  function predictDoorHinge (ctx, playerDir) {
+    const t = ctx.target
+    const ccw = CCW_OF[playerDir]; const cw = CW_OF[playerDir]
+    const off = (dir, dy) => new Vec3(t.x + DIR_VEC[dir][0], t.y + (dy || 0), t.z + DIR_VEC[dir][2])
+    const l = ctx.worldAt(off(ccw)); const lu = ctx.worldAt(off(ccw, 1))
+    const r = ctx.worldAt(off(cw)); const ru = ctx.worldAt(off(cw, 1))
+    const isDoorLower = (b) => {
+      if (!b || !b.name.endsWith('_door')) return false
+      try { const p = b.getProperties ? b.getProperties() : {}; return String(p.half) === 'lower' } catch (e) { return false }
+    }
+    const isFull = (b) => b && isFullCubeName(b.name)
+    const balance = (isFull(l) ? -1 : 0) + (isFull(lu) ? -1 : 0) + (isFull(r) ? 1 : 0) + (isFull(ru) ? 1 : 0)
+    const doorLeft = isDoorLower(l)
+    const doorRight = isDoorLower(r)
+    if ((!doorLeft || doorRight) && balance <= 0) {
+      if ((!doorRight || doorLeft) && balance >= 0) {
+        // Click-position tiebreak.
+        const stepX = DIR_VEC[playerDir][0]; const stepZ = DIR_VEC[playerDir][2]
+        let clickX; let clickZ
+        const face = ctx.face
+        if (face === 'up' || face === 'down') { clickX = ctx.hitU; clickZ = ctx.hitV }
+        else if (face === 'north') { clickX = ctx.hitU; clickZ = 1 }
+        else if (face === 'south') { clickX = ctx.hitU; clickZ = 0 }
+        else if (face === 'west') { clickX = 1; clickZ = ctx.hitV }
+        else { clickX = 0; clickZ = ctx.hitV } // east
+        const goRight = (stepX < 0 && clickZ < 0.5) || (stepX > 0 && clickZ > 0.5) || (stepZ < 0 && clickX > 0.5) || (stepZ > 0 && clickX < 0.5)
+        return goRight ? 'right' : 'left'
+      }
+      return 'left'
+    }
+    return 'right'
+  }
+
+  const OMNI_FACE_MOUNTS = new Set(['amethyst_cluster', 'small_amethyst_bud', 'medium_amethyst_bud', 'large_amethyst_bud', 'lightning_rod'])
+  const WALL_MOUNTS = new Set(['ladder', 'tripwire_hook'])
+  function isWallMountName (name) {
+    if (WALL_MOUNTS.has(name)) return true
+    if (name.endsWith('_wall_sign') || name.endsWith('_wall_banner')) return true
+    if (name === 'wall_torch' || name === 'redstone_wall_torch' || name === 'soul_wall_torch') return true
+    if (name.endsWith('_coral_wall_fan')) return true
+    return false
+  }
+  function isFloorCoralFan (name) {
+    return name.endsWith('_coral_fan') && !name.endsWith('_coral_wall_fan')
+  }
+  // Facing = opposite of the player's horizontal direction (decompiled:
+  // ChestBlock, AbstractFurnaceBlock, LecternBlock, ChiseledBookShelfBlock,
+  // StonecutterBlock, CarvedPumpkinBlock, BigDripleafBlock).
+  const CHESTLIKE_FACING = new Set(['chest', 'trapped_chest', 'ender_chest', 'furnace', 'blast_furnace', 'smoker', 'lectern', 'chiseled_bookshelf', 'stonecutter', 'carved_pumpkin', 'jack_o_lantern', 'big_dripleaf'])
+  // Facing = the player's horizontal direction (decompiled: CampfireBlock,
+  // DecoratedPotBlock — the pot's prop is plain `facing` in 26.3).
+  const PLAYERDIR_FACING = new Set(['campfire', 'soul_campfire', 'decorated_pot'])
+  // Facing = opposite of the nearest looking direction (decompiled:
+  // BarrelBlock, DispenserBlock; pistons unverified — same family, flagged).
+  const LOOK_OPPOSITE_FACING = new Set(['barrel', 'dispenser', 'dropper', 'piston', 'sticky_piston'])
+  // Facing = the nearest looking direction (decompiled: ObserverBlock —
+  // double opposite = identity).
+  const LOOK_FACING = new Set(['observer'])
+
+  function predictState (name, ctx) {
+    const face = ctx.face
+    const playerDir = yawToDir(ctx.yawDeg)
+    const oppDir = OPPOSITE_DIR[playerDir]
+    const clickHigh = ctx.hitY > 0.5
+    // STAIRS: facing = player direction; half = top if clicked DOWN face,
+    // or (non-UP face and click in the top half) — vanilla rule.
+    if (name.endsWith('_stairs')) {
+      return { facing: playerDir, half: (face === 'down' || (face !== 'up' && clickHigh)) ? 'top' : 'bottom' }
+    }
+    // SLABS (single): type from the same click-height rule.
+    if (name.endsWith('_slab')) {
+      return { type: (face === 'down' || (face !== 'up' && clickHigh)) ? 'top' : 'bottom' }
+    }
+    // AXIS blocks: axis from the clicked face.
+    if (isAxisBlock(name)) {
+      return { axis: face === 'up' || face === 'down' ? 'y' : face === 'north' || face === 'south' ? 'z' : 'x' }
+    }
+    // TRAPDOORS (TrapDoorBlock, decompiled): TWO branches. Horizontal
+    // clicked face (support solid): facing = clicked face, half from the
+    // click height. UP/DOWN face: facing = opposite of player, half =
+    // UP->bottom, DOWN->top.
+    if (name.endsWith('_trapdoor')) {
+      if (face === 'up') return { facing: oppDir, half: 'bottom', open: 'false' }
+      if (face === 'down') return { facing: oppDir, half: 'top', open: 'false' }
+      return { facing: face, half: clickHigh ? 'top' : 'bottom', open: 'false' }
+    }
+    // DOORS: facing = player direction; hinge from the neighbour rule.
+    if (name.endsWith('_door')) {
+      return { facing: playerDir, hinge: predictDoorHinge(ctx, playerDir), half: 'lower', open: 'false' }
+    }
+    // End rods: facing = clicked face, EXCEPT the chaining flip: if the
+    // block behind the support is an end rod facing the same way, the new
+    // rod faces the opposite (EndRodBlock, decompiled).
+    if (name === 'end_rod') {
+      const behind = ctx.target.offset(-DIR_VEC[face][0] * 2, -DIR_VEC[face][1] * 2, -DIR_VEC[face][2] * 2)
+      const bb = ctx.worldAt(behind)
+      if (bb && bb.name === 'end_rod') {
+        try {
+          const bp = bb.getProperties ? bb.getProperties() : {}
+          if (String(bp.facing) === face) return { facing: OPPOSITE_DIR[face] }
+        } catch (e) {}
+      }
+      return { facing: face }
+    }
+    // Omni-face mounts (lightning rod, amethyst clusters):
+    // facing = the clicked face, any face works.
+    if (OMNI_FACE_MOUNTS.has(name)) {
+      return { facing: face }
+    }
+    // Wall mounts: facing = the clicked (horizontal) face.
+    if (isWallMountName(name)) {
+      if (face === 'up' || face === 'down') return null
+      return { facing: face }
+    }
+    // Wall hanging signs (WallHangingSignBlock, decompiled): the loop
+    // takes the first HORIZONTAL looking direction whose axis differs
+    // from the clicked face's axis; facing = its opposite. So Segs must
+    // look PERPENDICULAR to the wall — a look parallel to the wall is
+    // ambiguous and is rejected (the solver picks a decisive look).
+    if (name.endsWith('_wall_hanging_sign')) {
+      if (face === 'up' || face === 'down') return null
+      const faceAxis = (face === 'north' || face === 'south') ? 'z' : 'x'
+      const lookAxis = (playerDir === 'north' || playerDir === 'south') ? 'z' : 'x'
+      if (faceAxis === lookAxis) return null
+      return { facing: oppDir }
+    }
+    // Floor coral fans: NO facing prop in 26.3 (state is waterlogged
+    // only) — UP face only, nothing to predict.
+    if (isFloorCoralFan(name)) {
+      if (face !== 'up') return null
+      return {}
+    }
+    // Fence gates: facing = player direction (opposite is scored light —
+    // BuildPrint's visual-symmetry fast path).
+    if (name.endsWith('_fence_gate')) {
+      return { facing: playerDir, open: 'false' }
+    }
+    // Chest-like: facing = opposite of player.
+    if (CHESTLIKE_FACING.has(name)) {
+      return { facing: oppDir }
+    }
+    // Campfires / decorated pots: facing = player direction.
+    if (PLAYERDIR_FACING.has(name)) {
+      return { facing: playerDir }
+    }
+    // Barrels / dispensers / droppers / pistons: facing = opposite of the
+    // nearest looking direction (look-based, NOT the clicked face).
+    if (LOOK_OPPOSITE_FACING.has(name)) {
+      return { facing: OPPOSITE_DIR[nearestLookingDir(ctx.yawDeg, ctx.pitchDeg)] }
+    }
+    // Observers: facing = the nearest looking direction.
+    if (LOOK_FACING.has(name)) {
+      return { facing: nearestLookingDir(ctx.yawDeg, ctx.pitchDeg) }
+    }
+    // Buttons / levers / grindstones (FaceAttachedHorizontalDirectional-
+    // Block, decompiled): the forced-first looking direction is the
+    // opposite of the clicked face, so FACE comes from the clicked face
+    // and FACING = clicked face on walls, player direction on floor/ceiling.
+    if (name.endsWith('_button') || name === 'lever') {
+      const f = face === 'up' ? 'floor' : face === 'down' ? 'ceiling' : 'wall'
+      return { face: f, facing: f === 'wall' ? face : playerDir, powered: 'false' }
+    }
+    // Grindstone: same FaceAttached rule, but no `powered` prop exists.
+    if (name === 'grindstone') {
+      const f = face === 'up' ? 'floor' : face === 'down' ? 'ceiling' : 'wall'
+      return { face: f, facing: f === 'wall' ? face : playerDir }
+    }
+    // Bells (BellBlock, decompiled): Y-axis face -> floor/ceiling +
+    // player direction; horizontal face -> facing = OPPOSITE of the
+    // clicked face, attachment = double_wall iff both perpendicular
+    // sides are sturdy, else single_wall.
+    if (name === 'bell') {
+      if (face === 'up') return { attachment: 'floor', facing: playerDir }
+      if (face === 'down') return { attachment: 'ceiling', facing: playerDir }
+      const perp = (face === 'north' || face === 'south') ? ['west', 'east'] : ['north', 'south']
+      const sturdy = (dir) => {
+        const b = ctx.worldAt(ctx.target.offset(DIR_VEC[dir][0], 0, DIR_VEC[dir][2]))
+        return b && isFullCubeName(b.name)
+      }
+      const dbl = sturdy(perp[0]) && sturdy(perp[1])
+      return { attachment: dbl ? 'double_wall' : 'single_wall', facing: OPPOSITE_DIR[face] }
+    }
+    // Anvils: facing = player direction rotated clockwise once.
+    if (name === 'anvil' || name === 'chipped_anvil' || name === 'damaged_anvil') {
+      return { facing: CW_OF[playerDir] }
+    }
+    // Hoppers (HopperBlock, decompiled): facing = opposite of the clicked
+    // face, EXCEPT vertical faces always give DOWN (never UP).
+    if (name === 'hopper') {
+      if (face === 'up' || face === 'down') return { facing: 'down', enabled: 'true' }
+      return { facing: OPPOSITE_DIR[face], enabled: 'true' }
+    }
+    // Beds: facing = player direction, foot half.
+    if (name.endsWith('_bed')) {
+      return { facing: playerDir, part: 'foot', occupied: 'false' }
+    }
+    // Standing signs / banners: rotation_16 from yaw.
+    if ((name.endsWith('_sign') && !name.includes('_wall_') && !name.endsWith('_hanging_sign')) || (name.endsWith('_banner') && !name.includes('_wall_'))) {
+      const seg = Math.floor(((ctx.yawDeg + 180) * 16) / 360 + 0.5) & 15
+      return { rotation: String(seg) }
+    }
+    // Ceiling hanging signs (CeilingHangingSignBlock, decompiled): DOWN
+    // face only. With a face-full ceiling and no sneak: attached=false
+    // and rotation = the CARDINAL segment of the opposite of the player's
+    // facing. With a non-full ceiling (slab/stair) or sneaking:
+    // attached=true and the full 16-segment yaw rotation.
+    if (name.endsWith('_hanging_sign') && !name.endsWith('_wall_hanging_sign')) {
+      if (face !== 'down') return null
+      const above = ctx.worldAt(ctx.target.offset(0, 1, 0))
+      const fullCeiling = above && isFullCubeName(above.name)
+      if (fullCeiling && !ctx.sneak) {
+        return { rotation: String(cardinalSegment(oppDir)), attached: 'false' }
+      }
+      const seg = Math.floor(((ctx.yawDeg + 180) * 16) / 360 + 0.5) & 15
+      return { rotation: String(seg), attached: 'true' }
+    }
+    // Lanterns: hanging iff clicked the DOWN face; UP/DOWN faces only.
+    if (name === 'lantern' || name === 'soul_lantern') {
+      if (face !== 'up' && face !== 'down') return null
+      return { hanging: face === 'down' ? 'true' : 'false' }
+    }
+    // Vines (VineBlock, decompiled): the forced-first looking direction
+    // is the opposite of the clicked face, so the vine attaches to the
+    // SUPPORT side: horizontal face F -> prop OPPOSITE(F). DOWN face
+    // (ceiling) -> up. UP face cannot hold a vine (DOWN is skipped).
+    if (name === 'vine' || name === 'cave_vines' || name === 'glow_lichen') {
+      if (face === 'up') return null
+      const p = { north: 'false', south: 'false', east: 'false', west: 'false', up: 'false' }
+      if (face === 'down') p.up = 'true'
+      else p[OPPOSITE_DIR[face]] = 'true'
+      return p
+    }
+    // Default: no orientation props predicted — the server default wins
+    // and verification only enforces heavy props the predictor returned.
+    return {}
+  }
+
+
+  // ---------- PlacementSolver port (BuildPrint search) ----------
+  const SUPPORT_ORDER = ['down', 'north', 'east', 'south', 'west', 'up'] // direction TO the support block
+  const HEAVY_PROPS = new Set(['facing', 'axis', 'half', 'type', 'face', 'hanging', 'orientation', 'rotation', 'attachment', 'tilt', 'vertical_direction', 'hinge', 'part'])
+  const HIT_POINTS = [[0.5, 0.5], [0.25, 0.25], [0.25, 0.75], [0.75, 0.25], [0.75, 0.75]] // centre + 4 quarter points
+  const VERIFY_EXCLUDE = new Set(['waterlogged', 'persistent'])
+
+  function cursorForFace (faceDir, u, v) {
+    // BuildPrint facePoint: axis X -> (fixed, u, v); axis Y -> (u, fixed, v);
+    // axis Z -> (u, v, fixed); fixed = 1.0 if the axis direction is
+    // positive, else 0.0.
+    switch (faceDir) {
+      case 'up': return new Vec3(u, 1, v)
+      case 'down': return new Vec3(u, 0, v)
+      case 'north': return new Vec3(u, v, 0)
+      case 'south': return new Vec3(u, v, 1)
+      case 'west': return new Vec3(0, u, v)
+      case 'east': return new Vec3(1, u, v)
+    }
+    return new Vec3(0.5, 0.5, 0.5)
+  }
+
+  function faceAllowed (name, props, faceDir) {
+    // Lantern fast path: hanging -> DOWN face only, else UP face only.
+    if (name === 'lantern' || name === 'soul_lantern') {
+      return props.hanging === 'true' ? faceDir === 'down' : faceDir === 'up'
+    }
+    // Standing forms (sign/banner/torch) -> UP face only.
+    if (isStandingForm(name)) return faceDir === 'up'
+    // Floor coral fans survive only on floors.
+    if (isFloorCoralFan(name)) return faceDir === 'up'
+    // Wall forms -> only the face matching their form.
+    if (isWallForm(name)) {
+      if (props.facing) return faceDir === props.facing
+      return faceDir !== 'up' && faceDir !== 'down'
+    }
+    return true
+  }
+
+  function scoreMismatch (predicted, desired, blockName) {
+    let score = 0
+    for (const [k, want] of Object.entries(desired)) {
+      if (VERIFY_EXCLUDE.has(k)) continue
+      if (k === 'type' && isChestLike(blockName)) continue // chest type merges server-side
+      if (k === 'shape' && blockName.endsWith('_stairs')) continue // server-computed from neighbours
+      const got = predicted[k]
+      if (got === undefined) continue // predictor doesn't determine it — accept the server default
+      if (String(got) === String(want)) continue
+      // Fence-gate opposite facing is visually symmetric (BuildPrint fast path).
+      if (k === 'facing' && blockName.endsWith('_fence_gate') && String(got) === OPPOSITE_DIR[want]) { score += 1; continue }
+      score += HEAVY_PROPS.has(k) ? 1000 : 1
+    }
+    return score
+  }
+
+  function candidateLooks (yawDeg, pitchDeg, desiredProps) {
+    const looks = [{ yaw: yawDeg, pitch: pitchDeg, cost: 0 }]
+    for (const y of [0, 90, 180, -90]) looks.push({ yaw: y, pitch: 0, cost: 1 })
+    looks.push({ yaw: yawDeg, pitch: -90, cost: 1 }, { yaw: yawDeg, pitch: 90, cost: 1 })
+    if (desiredProps.rotation !== undefined) {
+      for (let seg = 0; seg < 16; seg++) looks.push({ yaw: seg * 22.5, pitch: 0, cost: 1 })
+    }
+    if (desiredProps.orientation !== undefined) {
+      for (const y of [0, 90, 180, -90]) { looks.push({ yaw: y, pitch: -90, cost: 1 }, { yaw: y, pitch: 90, cost: 1 }) }
+    }
+    return looks
+  }
+
+  // Extra placement legality for multi-cell blocks (beds need a free head
+  // cell + solid below both; doors need a free upper cell + solid below;
+  // double plants need a free upper cell + solid below).
+  function extraCellsOK (name, cell, predicted, worldAt) {
+    const below = worldAt(cell.offset(0, -1, 0))
+    const solidBelow = below && !isReplaceableName(below.name)
+    if (name.endsWith('_bed')) {
+      if (!solidBelow) return false
+      const f = predicted.facing
+      if (!f) return false
+      const head = cell.offset(DIR_VEC[f][0], 0, DIR_VEC[f][2])
+      const hb = worldAt(head)
+      if (!hb || !isReplaceableName(hb.name)) return false
+      const hbBelow = worldAt(head.offset(0, -1, 0))
+      if (!hbBelow || isReplaceableName(hbBelow.name)) return false
+      return true
+    }
+    if (name.endsWith('_door') || isDoublePlant(name)) {
+      if (!solidBelow) return false
+      const above = worldAt(cell.offset(0, 1, 0))
+      if (!above || !isReplaceableName(above.name)) return false
+      return true
+    }
+    return true
+  }
+
+  // The solver: search supports x hit points x looks, score each candidate
+  // with the predictors, return the first score-0 solution (or the best
+  // sub-1000 one), else null. Yaw/pitch/sneak are the CALLER's job to
+  // apply and restore — the solver itself is pure.
+  function solvePlacement (cell, desiredName, desiredProps, opts) {
+    const eye = opts.eye
+    const looks = candidateLooks(opts.currentYawDeg, opts.currentPitchDeg, desiredProps)
+    const worldAt = (p) => bot.blockAt(p)
+    let best = null
+    let bestScore = Infinity
+    for (const toSupport of SUPPORT_ORDER) {
+      const support = cell.offset(DIR_VEC[toSupport][0], DIR_VEC[toSupport][1], DIR_VEC[toSupport][2])
+      const sb = bot.blockAt(support)
+      if (!sb || sb.name === 'air' || isReplaceableName(sb.name)) continue
+      const faceDir = OPPOSITE_DIR[toSupport]
+      if (!faceAllowed(desiredName, desiredProps, faceDir)) continue
+      const interactive = isInteractiveName(sb.name)
+      const sneak = interactive
+      for (const [u, v] of HIT_POINTS) {
+        const cursor = cursorForFace(faceDir, u, v)
+        const clickPoint = new Vec3(support.x + cursor.x, support.y + cursor.y, support.z + cursor.z)
+        if (eye.distanceTo(clickPoint) > 4.4) continue
+        for (const look of looks) {
+          const ctx = { face: faceDir, hitY: cursor.y, hitU: u, hitV: v, yawDeg: look.yaw, pitchDeg: look.pitch, target: cell, worldAt, sneak }
+          const predicted = predictState(desiredName, ctx)
+          if (!predicted) continue
+          if (!extraCellsOK(desiredName, cell, predicted, worldAt)) continue
+          const score = scoreMismatch(predicted, desiredProps, desiredName) + (interactive ? 3 : 0) + look.cost
+          if (score >= bestScore) continue
+          bestScore = score
+          best = { support, face: new Vec3(DIR_VEC[faceDir][0], DIR_VEC[faceDir][1], DIR_VEC[faceDir][2]), faceDir, cursor, yawDeg: look.yaw, pitchDeg: look.pitch, sneak, score }
+          if (bestScore === 0) return best
+        }
+      }
+    }
+    return bestScore < 1000 ? best : null
+  }
+
+  // ---------- verification (re-read after placing) ----------
+  function isConnectionProp (name, k) {
+    if (k !== 'north' && k !== 'south' && k !== 'east' && k !== 'west' && k !== 'up') return false
+    if (name.endsWith('_fence') && !name.endsWith('_fence_gate')) return true
+    if (name.endsWith('_wall') && !name.endsWith('_wall_sign') && !name.endsWith('_wall_banner') && !name.endsWith('_wall_torch') && !name.endsWith('_wall_head') && !name.endsWith('_wall_skull')) return true
+    if (name.endsWith('_pane') || name === 'iron_bars' || name === 'glass_pane') return true
+    if (name === 'redstone_wire') return true
+    return false
+  }
+
+  // Returns {ok, reason, light[]}. Heavy prop mismatch -> WRONG; light-only
+  // mismatch -> placed, logged. Server-computed props are never enforced.
+  function verifyCell (cell, desiredName, desiredProps) {
+    const b = bot.blockAt(cell)
+    if (!b) return { ok: false, reason: 'unloaded' }
+    if (b.name !== desiredName) return { ok: false, reason: 'name ' + b.name + ' != ' + desiredName }
+    let actual = {}
+    try { actual = b.getProperties ? b.getProperties() : {} } catch (e) { actual = {} }
+    const heavyBad = []
+    const lightBad = []
+    for (const [k, want] of Object.entries(desiredProps)) {
+      if (VERIFY_EXCLUDE.has(k)) continue
+      if (k === 'shape' && desiredName.endsWith('_stairs')) continue
+      if (k === 'type' && isChestLike(desiredName)) continue
+      if (isConnectionProp(desiredName, k)) continue
+      if (k === 'distance' || k === 'bottom') continue // scaffolding: server-computed
+      if (k === 'in_wall') continue // fence gate: server-computed
+      if (k === 'attached') continue // tripwire hook: server-computed
+      if (k === 'power') continue // redstone: live value
+      const got = actual[k]
+      if (got === undefined) continue // this fork's block data lacks the prop
+      if (String(got) === String(want)) continue
+      if (k === 'facing' && desiredName.endsWith('_fence_gate') && String(got) === OPPOSITE_DIR[want]) { lightBad.push(k); continue }
+      if (HEAVY_PROPS.has(k)) heavyBad.push(k + '=' + got + ' want ' + want)
+      else lightBad.push(k + '=' + got + ' want ' + want)
+    }
+    if (heavyBad.length) return { ok: false, reason: heavyBad.join(', '), light: lightBad }
+    return { ok: true, light: lightBad }
+  }
+
+  // ---------- item mapping: block name -> held item name ----------
+  function itemForBlock (name) {
+    if (name === 'water') return 'water_bucket'
+    if (name === 'lava') return 'lava_bucket'
+    if (name === 'redstone_wire') return 'redstone'
+    if (name.endsWith('_wall_sign')) return name.replace('_wall_sign', '_sign')
+    if (name.endsWith('_wall_banner')) return name.replace('_wall_banner', '_banner')
+    if (name.endsWith('_wall_hanging_sign')) return name.replace('_wall_hanging_sign', '_hanging_sign')
+    if (name === 'wall_torch') return 'torch'
+    if (name === 'redstone_wall_torch') return 'redstone_torch'
+    if (name === 'soul_wall_torch') return 'soul_torch'
+    if (name === 'cave_vines') return 'glow_berries'
+    if (name === 'tripwire') return 'string'
+    if (name === 'fire') return 'flint_and_steel'
+    return name
+  }
+
+  const RAW_CRAFT = { oak_planks: 'oak_log', spruce_planks: 'spruce_log', birch_planks: 'birch_log', jungle_planks: 'jungle_log', acacia_planks: 'acacia_log', dark_oak_planks: 'dark_oak_log', cherry_planks: 'cherry_log', pale_oak_planks: 'pale_oak_log', mangrove_planks: 'mangrove_log', crimson_planks: 'crimson_stem', warped_planks: 'warped_stem', bamboo_planks: 'bamboo_block', stick: 'oak_planks' }
+
+  function haveItemCount (itemName) {
     try {
-    const schem = loadSchematic(name)
-    if (!schem) { say(`i dont have a schematic called ${name} — check schematics/${name}.json`); return }
-    if (!brain.buildSite) { say('i dont know where the build site is — stand at the corner and tell me: segs this is the build site'); return }
-    const origin = brain.buildSite.pos
-    // count materials
-    const need = {}
-    for (const b of schem.blocks) need[b.block] = (need[b.block] || 0) + 1
-    // gather: inventory + chests within 16, crafting raw mats where possible
-    let searched = 0
-    for (const [mat, n] of Object.entries(need)) {
-      const res = await ensureItem(mat, n, 16)
-      searched = Math.max(searched, res.searched)
-      if (res.have < n && RAW_CRAFT[mat]) {
-        // try crafting the shortfall from raw (planks from logs, etc.)
-        const short = n - res.have
-        const rawMat = RAW_CRAFT[mat]
-        const rawRes = await ensureItem(rawMat, short, 16)
-        searched = Math.max(searched, rawRes.searched)
-        if (rawRes.have > 0) {
-          const perRaw = mat === 'stick' ? 2 : 4 // 1 log -> 4 planks, 1 plank -> 2 sticks
-          const crafts = Math.ceil(short / perRaw)
-          await doCraft(mat, crafts * perRaw)
-        }
-      }
-    }
-    const missing = []
-    for (const [mat, n] of Object.entries(need)) {
       const mcData = mcDataFor(bot.version)
-      const def = mcData.itemsByName[mat] || mcData.blocksByName[mat]
-      const have = def ? bot.inventory.count(def.id, null) : 0
-      if (have < n) missing.push(`${n - have}x ${mat}`)
+      const def = mcData.itemsByName[itemName] || mcData.blocksByName[itemName]
+      if (!def) return 0
+      return bot.inventory.count(def.id, null)
+    } catch (e) { return 0 }
+  }
+
+  // Equip fresh from inventory (v1 pattern: 3 tries, close stale window,
+  // 300ms settle, verify the held item).
+  async function equipFresh (itemName) {
+    try {
+      const mcData = mcDataFor(bot.version)
+      const def = mcData.itemsByName[itemName] || mcData.blocksByName[itemName]
+      if (!def) return false
+      const item = bot.inventory.findInventoryItem(def.id, null)
+      if (!item) return false
+      if (bot.heldItem && bot.heldItem.type === item.type) return true
+      for (let tries = 0; tries < 3; tries++) {
+        try {
+          if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch (e) {} await sleepMs(80) }
+          await bot.equip(item, 'hand')
+          await sleepMs(300)
+          if (bot.heldItem && bot.heldItem.type === item.type) return true
+        } catch (e) { await sleepMs(200) }
+      }
+      return false
+    } catch (e) { return false }
+  }
+
+  // Wait for the fork's stepped look (~8.6 deg/tick) to converge, then a
+  // settle pause. Compares INTERNAL radians (bot.entity.yaw/pitch) against
+  // the internal-radian targets actually passed to bot.look. Never assume
+  // the look landed (v10.4 bow lesson).
+  // Wait for the SENT rotation to reach the target. The fork steps the
+  // sent yaw/pitch toward bot.entity.yaw/pitch at 0.15 rad/tick (yawSpeed
+  // = pitchSpeed = 3.0 rad/s), and bot.look's await resolves on the YAW
+  // ONLY (the 'move' handler checks deltaYaw alone) — so a pitch swing
+  // can still be mid-flight when bot.look returns (run 184: the barrel
+  // needed pitch +90 and placed with the stale pitch, facing south).
+  // bot.look's await covers the yaw ticks; the pitch steps concurrently,
+  // so only the EXCESS pitch ticks need waiting, plus a settle margin.
+  // Call AFTER bot.look, passing the rotation from BEFORE the look.
+  async function waitLookSent (prevYaw, prevPitch, yawRad, pitchRad) {
+    let dy = (yawRad - prevYaw) % (Math.PI * 2)
+    if (dy > Math.PI) dy -= Math.PI * 2
+    if (dy < -Math.PI) dy += Math.PI * 2
+    const yawTicks = Math.ceil(Math.abs(dy) / 0.15)
+    const pitchTicks = Math.ceil(Math.abs(pitchRad - prevPitch) / 0.15)
+    const extraTicks = Math.max(0, pitchTicks - yawTicks)
+    await sleepMs(extraTicks * 50 + 200)
+  }
+
+  function eyePos () {
+    return bot.entity.position.offset(0, 1.62, 0)
+  }
+
+  // Key for a Vec3 position (floored block coords).
+  function posKey (v) { return Math.floor(v.x) + ',' + Math.floor(v.y) + ',' + Math.floor(v.z) }
+
+  async function moveCapped (pos, capMs) {
+    const from = bot.entity.position.clone()
+    try {
+      await Promise.race([
+        (async () => { try { await gotoPosQuiet(pos) } catch (e) {} })(),
+        sleepMs(capMs || 6000)
+      ])
+    } catch (e) {}
+    try { bot.pathfinder.setGoal(null) } catch (e) {}
+    try { bot.clearControlStates() } catch (e) {}
+    await sleepMs(100)
+    const d = bot.entity.position.distanceTo(new Vec3(pos.x, pos.y, pos.z))
+    const ok = d <= 2.5
+    logEvent('autobuild', 'move ' + posKey(from) + ' -> ' + posKey(pos) + ' ' + (ok ? 'ok' : 'FAIL') + ' (d=' + d.toFixed(2) + ')')
+    return ok
+  }
+
+  // Ground feet-Y at a column: the first level where the block below is
+  // solid and feet+head are air (same scan as computeStandPoints).
+  function groundFeetY (x, z, originY) {
+    for (let y = originY + 2; y >= originY - 6; y--) {
+      const below = bot.blockAt(new Vec3(x, y, z))
+      const feet = bot.blockAt(new Vec3(x, y + 1, z))
+      const head = bot.blockAt(new Vec3(x, y + 2, z))
+      if (below && below.name !== 'air' && !isReplaceableName(below.name) && feet && feet.name === 'air' && head && head.name === 'air') return y + 1
     }
-    if (missing.length) {
-      say(`i cant build ${schem.name || name} — im missing ${missing.join(', ')} (checked ${searched} chest(s) within 16 blocks)`)
-      logEvent('autobuild', `${name}: missing ${missing.join(', ')}`)
-      return
+    return null
+  }
+
+  // Waypoint routing for stand moves (run-184 lesson): a straight leg
+  // across the footprint pins Segs against the 1-high wall (rubber-band
+  // storm, 4 minutes lost). If the straight segment crosses the expanded
+  // footprint rect, route via the ring corners — each hop verified not
+  // to cross from the CURRENT position, re-filtered after every hop.
+  async function moveToStand (target, origin, worldW, worldL, ctx) {
+    const ex0 = origin[0] - 1; const ex1 = origin[0] + worldW
+    const ez0 = origin[2] - 1; const ez1 = origin[2] + worldL
+    const inside = (x, z) => x > ex0 && x < ex1 && z > ez0 && z < ez1
+    const crosses = (ax, az, bx, bz) => {
+      const steps = Math.max(1, Math.ceil(Math.hypot(bx - ax, bz - az) / 0.5))
+      for (let i = 1; i < steps; i++) {
+        if (inside(ax + (bx - ax) * i / steps, az + (bz - az) * i / steps)) return true
+      }
+      return false
     }
-    say(`building ${schem.name || name} — ${schem.blocks.length} blocks, layer by layer`)
-    logEvent('autobuild', `${name}: starting, ${schem.blocks.length} blocks from origin ${origin.join(',')}`)
-    // v10.5 run 113 fix: BUILD FROM OUTSIDE. The first build placed
-    // only 23/65 because Segs walked INSIDE the footprint to place the
-    // floor, then could not step aside (it was standing on the next
-    // cell, "im stuck"), so placeBlock was refused and the roof had
-    // nothing to attach to. Segs now NEVER stands inside the
-    // footprint — it works from the perimeter (reach 4.5 covers a 5x5
-    // house from outside) and steps out before every place.
-    let minDx = Infinity, maxDx = -Infinity, minDz = Infinity, maxDz = -Infinity
-    for (const b of schem.blocks) {
-      minDx = Math.min(minDx, b.dx); maxDx = Math.max(maxDx, b.dx)
-      minDz = Math.min(minDz, b.dz); maxDz = Math.max(maxDz, b.dz)
+    const corners = [
+      [origin[0] - 3, origin[2] - 3], [origin[0] + worldW + 2, origin[2] - 3],
+      [origin[0] - 3, origin[2] + worldL + 2], [origin[0] + worldW + 2, origin[2] + worldL + 2]
+    ]
+    // Waypointing is only for ring-to-ring moves. A target INSIDE the
+    // rect (a top) must be approached directly — the segment to it
+    // always "crosses", and waypointing just spins on one corner
+    // (run 185: 3 wasted hops per top, same corner 3 times).
+    const targetInside = inside(target.x, target.z)
+    for (let hop = 0; hop < 3 && !targetInside; hop++) {
+      const now = bot.entity.position
+      if (inside(now.x, now.z)) break // already inside: go direct, short exit
+      if (!crosses(now.x, now.z, target.x, target.z)) break
+      const cands = corners
+        .filter(c => !crosses(now.x, now.z, c[0] + 0.5, c[1] + 0.5) && Math.hypot(c[0] + 0.5 - now.x, c[1] + 0.5 - now.z) > 2)
+        .sort((a, b) => (Math.hypot(a[0] - target.x, a[1] - target.z) - Math.hypot(b[0] - target.x, b[1] - target.z)))
+      if (!cands.length) break
+      const cy = groundFeetY(cands[0][0], cands[0][1], origin[1])
+      if (cy === null) break
+      logEvent('autobuild', 'stand waypoint hop ' + hop + ' via ' + cands[0][0] + ',' + cy + ',' + cands[0][1])
+      await moveCapped(new Vec3(cands[0][0] + 0.5, cy, cands[0][1] + 0.5), 5000)
+      if (ctx && ctx.cancelled()) return false
     }
-    const insideFootprint = (x, z) => x >= origin[0] + minDx - 0.5 && x <= origin[0] + maxDx + 0.5 && z >= origin[2] + minDz - 0.5 && z <= origin[2] + maxDz + 0.5
-    // a stand point outside the footprint, within reach of the cell
-    const standOutside = (cell) => {
-      const cands = []
-      for (const [sx, sz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        for (const d of [2, 3, 4]) {
-          const px = cell.x + 0.5 + sx * d, pz = cell.z + 0.5 + sz * d
-          if (!insideFootprint(px, pz)) { cands.push(new Vec3(px, cell.y, pz)); break }
+    const ok = await moveCapped(target, 5000)
+    if (ok) return true
+    // Climb fallback for tops: the A* cannot route up a sheer face, but
+    // the proven step-climb assist chains 1-block steps. Gate it on
+    // stepAheadToward — a sheer 2+ high face (solid low AND solid high)
+    // can never be jumped, and driving into it wastes 6s per top and
+    // pins Segs against the wall (run 192: 46 failed moves, 0 climbed).
+    if (target.y >= bot.entity.position.y + 1 && stepAheadToward(target)) {
+      try {
+        const climbed = await tryStepClimb(target)
+        if (climbed) {
+          const ok2 = await moveCapped(target, 4000)
+          if (ok2) return true
+        }
+      } catch (e) {}
+    }
+    return false
+  }
+
+  // ---------- executor: place one build cell ----------
+  // Returns: 'placed' | 'done' (already correct) | 'wrong' | 'nomat' |
+  // 'nosupport' (kept for a later pass) | 'cancelled'.
+  async function placeBuildCell (c, ctx) {
+    const cell = new Vec3(c.wx, c.wy, c.wz)
+    if (ctx.cancelled()) return 'cancelled'
+    // Specials first — each handles its own current-state logic.
+    if (c.name === 'water' || c.name === 'lava') return placeLiquidCell(c, cell, ctx)
+    if (c.name.startsWith('potted_')) return placePottedCell(c, cell, ctx)
+    if (c.name === 'farmland') return placeFarmlandCell(c, cell, ctx)
+    if (c.name === 'potatoes' || c.name === 'carrots' || c.name === 'wheat' || c.name === 'beetroots') return placeCropCell(c, cell, ctx)
+    if (c.name.endsWith('_slab') && c.props.type === 'double') return placeDoubleSlab(c, cell, ctx)
+    // Generic pre-check: already there and correct?
+    const cur = bot.blockAt(cell)
+    if (cur && cur.name !== 'air' && !isReplaceableName(cur.name)) {
+      const v = verifyCell(cell, c.name, c.props)
+      if (v.ok) return 'done'
+      return 'wrong'
+    }
+    const itemName = itemForBlock(c.name)
+    let solvedOnce = false
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (ctx.cancelled()) return 'cancelled'
+      // Material?
+      if (haveItemCount(itemName) < 1) {
+        const got = await refillMaterial(itemName, 1, ctx, 16)
+        if (!got) {
+          if (!ctx.dryReported.has(itemName)) {
+            ctx.dryReported.add(itemName)
+            say('staging ran dry for ' + itemName + ' — building the rest, still need it for ' + ctx.remainingForItem(itemName) + ' cells')
+          }
+          logEvent('autobuild', 'dry: ' + itemName + ' at ' + cell)
+          return 'nomat'
         }
       }
-      if (!cands.length) return null
-      const cur = bot.entity.position
-      cands.sort((a, b) => a.distanceTo(cur) - b.distanceTo(cur))
-      return cands[0]
+      const sol = solvePlacement(cell, c.name, c.props, { eye: eyePos(), currentYawDeg: internalToNotchianDeg(bot.entity.yaw), currentPitchDeg: internalPitchToNotchianDeg(bot.entity.pitch) })
+      if (!sol) { await sleepMs(300); continue }
+      solvedOnce = true
+      const held = await equipFresh(itemName)
+      if (!held) { await sleepMs(200); continue }
+      if (sol.sneak) { bot.setControlState('sneak', true); await sleepMs(100) }
+      try {
+        const lookYaw = notchianToInternalRad(sol.yawDeg)
+        const lookPitch = notchianPitchToInternalRad(sol.pitchDeg)
+        const prevYaw = bot.entity.yaw; const prevPitch = bot.entity.pitch
+        await bot.look(lookYaw, lookPitch)
+        await waitLookSent(prevYaw, prevPitch, lookYaw, lookPitch)
+        const ref = bot.blockAt(sol.support)
+        if (!ref) continue
+        await bot._placeBlockWithOptions(ref, sol.face, { delta: sol.cursor, swingArm: 'right', forceLook: 'ignore' })
+      } catch (e) {
+        logEvent('autobuild', 'place refused at ' + cell + ' (' + c.name + '): ' + (e && e.message ? e.message : e))
+        await sleepMs(300)
+        continue
+      } finally {
+        if (sol.sneak) { try { bot.setControlState('sneak', false) } catch (e) {} }
+      }
+      await sleepMs(50)
+      const v = verifyCell(cell, c.name, c.props)
+      if (v.ok) {
+        if (v.light && v.light.length) logEvent('autobuild', cell + ' ' + c.name + ' placed, light mismatch: ' + v.light.join(', '))
+        return 'placed'
+      }
+      logEvent('autobuild', 'place verify failed at ' + cell + ' (' + c.name + '): ' + (v.reason || 'mismatch') + ' — attempt ' + (attempt + 1) + ' of 3')
+      // If the cell is now occupied by the wrong block, retrying cannot
+      // fix it (placing into an occupied cell is refused) — report WRONG.
+      const now = bot.blockAt(cell)
+      if (now && now.name !== 'air' && !isReplaceableName(now.name)) return 'wrong'
+      await sleepMs(300) // 6-tick settle before a same-cell retry (Printer discipline)
     }
-    // layer by layer (Y ascending), nearest-first within each layer
-    const layers = {}
-    for (const b of schem.blocks) { (layers[b.dy] = layers[b.dy] || []).push(b) }
-    const dys = Object.keys(layers).map(Number).sort((a, b) => a - b)
-    let placed = 0, skipped = 0, wrong = 0
-    for (const dy of dys) {
-      const layer = layers[dy]
-      // nearest-first from Segs' current position
-      const cur = bot.entity.position
-      layer.sort((a, b) => {
-        const da = Math.hypot(origin[0] + a.dx - cur.x, origin[2] + a.dz - cur.z)
-        const db = Math.hypot(origin[0] + b.dx - cur.x, origin[2] + b.dz - cur.z)
-        return da - db
-      })
-      for (const b of layer) {
-        if (!bot || !bot.entity || bot.health <= 0) break
-        const cell = new Vec3(origin[0] + b.dx, origin[1] + b.dy, origin[2] + b.dz)
-        const existing = bot.blockAt(cell)
-        if (existing && existing.name !== 'air') { skipped++; logEvent('autobuild', `skipped ${cell} — ${existing.name} already there`); continue }
-        // never stand inside the footprint — step out first, then
-        // stand outside within reach of the cell
-        const feet = bot.entity.position
-        // 6s cap per stand move — a blocked stand point is abandoned,
-        // not waited on for the pathfinder's full ~25s timeout.
-        // v10.5.1 (item 3): cancel the stale pathfinder goal after
-        // the race. Promise.race leaves the loser's goal RUNNING —
-        // when the 6s sleep wins, gotoPosQuiet's goal keeps driving
-        // Segs (and its lookAt) while the place fires, so the place
-        // is refused ("Server refused to place ... the block is still
-        // air") while Segs is still settling from the step-out
-        // (run 113e). setGoal(null) kills the stale goal.
-        const moveCapped = async (p) => {
-          try { await Promise.race([gotoPosQuiet(p), sleepMs(6000)]) } catch (e) {}
-          try { bot.pathfinder.setGoal(null) } catch (e) {}
-          try { bot.clearControlStates() } catch (e) {}
+    return solvedOnce ? 'wrong' : 'nosupport'
+  }
+
+  async function placeLiquidCell (c, cell, ctx) {
+    const cur = bot.blockAt(cell)
+    if (cur && cur.name === c.name) return 'done'
+    if (cur && cur.name !== 'air' && !isReplaceableName(cur.name)) return 'wrong'
+    const itemName = c.name === 'water' ? 'water_bucket' : 'lava_bucket'
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (ctx.cancelled()) return 'cancelled'
+      if (haveItemCount(itemName) < 1) {
+        const got = await refillMaterial(itemName, 1, ctx, 16)
+        if (!got) {
+          if (!ctx.dryReported.has(itemName)) { ctx.dryReported.add(itemName); say('staging ran dry for ' + itemName + ' — building the rest') }
+          return 'nomat'
         }
-        let standMoved = false
-        if (insideFootprint(feet.x, feet.z)) {
-          const out = standOutside(cell)
-          if (out) { await moveCapped(out); standMoved = true }
+      }
+      const sol = solvePlacement(cell, c.name, c.props, { eye: eyePos(), currentYawDeg: internalToNotchianDeg(bot.entity.yaw), currentPitchDeg: internalPitchToNotchianDeg(bot.entity.pitch) })
+      if (!sol) { await sleepMs(300); continue }
+      const held = await equipFresh(itemName)
+      if (!held) { await sleepMs(200); continue }
+      try {
+        const lookYaw = notchianToInternalRad(sol.yawDeg)
+        const lookPitch = notchianPitchToInternalRad(sol.pitchDeg)
+        const prevYaw = bot.entity.yaw; const prevPitch = bot.entity.pitch
+        await bot.look(lookYaw, lookPitch)
+        await waitLookSent(prevYaw, prevPitch, lookYaw, lookPitch)
+        const ref = bot.blockAt(sol.support)
+        if (!ref) continue
+        await bot._placeBlockWithOptions(ref, sol.face, { delta: sol.cursor, swingArm: 'right', forceLook: 'ignore' })
+      } catch (e) { await sleepMs(300); continue }
+      await sleepMs(100)
+      const b = bot.blockAt(cell)
+      if (b && b.name === c.name) return 'placed'
+      if (b && b.name !== 'air' && !isReplaceableName(b.name)) return 'wrong'
+      await sleepMs(300)
+    }
+    return 'nosupport'
+  }
+
+  async function placePottedCell (c, cell, ctx) {
+    const cur = bot.blockAt(cell)
+    if (cur && cur.name === c.name) return 'done'
+    if (cur && cur.name !== 'air' && cur.name !== 'flower_pot' && !isReplaceableName(cur.name)) return 'wrong'
+    // Step 1: the pot.
+    if (!cur || cur.name !== 'flower_pot') {
+      const potCell = { ...c, name: 'flower_pot', props: {} }
+      const r = await placeBuildCell(potCell, ctx)
+      if (r !== 'placed' && r !== 'done') return r
+    }
+    // Step 2: the plant into the pot.
+    const plant = c.name.replace(/^potted_/, '')
+    const plantItem = plant === 'azalea_bush' ? 'azalea' : plant === 'flowering_azalea_bush' ? 'flowering_azalea' : plant
+    if (haveItemCount(plantItem) < 1) {
+      const got = await refillMaterial(plantItem, 1, ctx, 16)
+      if (!got) return 'nomat'
+    }
+    const held = await equipFresh(plantItem)
+    if (!held) return 'nosupport'
+    const pot = bot.blockAt(cell)
+    if (!pot || pot.name !== 'flower_pot') return 'nosupport'
+    try {
+      await bot.activateBlock(pot, new Vec3(0, 1, 0), new Vec3(0.5, 1, 0.5))
+    } catch (e) { await sleepMs(200) }
+    await sleepMs(150)
+    const b = bot.blockAt(cell)
+    if (b && b.name === c.name) return 'placed'
+    return 'nosupport'
+  }
+
+  async function placeFarmlandCell (c, cell, ctx) {
+    const cur = bot.blockAt(cell)
+    if (cur && cur.name === 'farmland') return 'done'
+    if (cur && cur.name !== 'air' && cur.name !== 'dirt' && cur.name !== 'grass_block' && !isReplaceableName(cur.name)) return 'wrong'
+    // Step 1: dirt at the cell.
+    if (!cur || cur.name === 'air' || isReplaceableName(cur.name)) {
+      const dirtCell = { ...c, name: 'dirt', props: {} }
+      const r = await placeBuildCell(dirtCell, ctx)
+      if (r !== 'placed' && r !== 'done') return r
+    }
+    // Step 2: hoe it.
+    const hoes = ['netherite_hoe', 'diamond_hoe', 'iron_hoe', 'stone_hoe', 'golden_hoe', 'wooden_hoe']
+    let hoe = null
+    for (const h of hoes) { if (haveItemCount(h) >= 1) { hoe = h; break } }
+    if (!hoe) {
+      if (!ctx.dryReported.has('hoe')) { ctx.dryReported.add('hoe'); say('i need a hoe for the farmland — building the rest') }
+      return 'nomat'
+    }
+    const held = await equipFresh(hoe)
+    if (!held) return 'nosupport'
+    const dirt = bot.blockAt(cell)
+    if (!dirt || (dirt.name !== 'dirt' && dirt.name !== 'grass_block')) return 'nosupport'
+    try {
+      await bot.activateBlock(dirt, new Vec3(0, 1, 0), new Vec3(0.5, 1, 0.5))
+    } catch (e) { await sleepMs(200) }
+    await sleepMs(150)
+    const b = bot.blockAt(cell)
+    if (b && b.name === 'farmland') return 'placed'
+    return 'nosupport'
+  }
+
+  async function placeCropCell (c, cell, ctx) {
+    const cur = bot.blockAt(cell)
+    if (cur && cur.name === c.name) return 'done'
+    if (cur && cur.name !== 'air' && !isReplaceableName(cur.name)) return 'wrong'
+    const below = bot.blockAt(cell.offset(0, -1, 0))
+    if (!below || below.name !== 'farmland') return 'nosupport' // farmland cell builds first (Y-ascending)
+    const seedItem = c.name === 'potatoes' ? 'potato' : c.name === 'carrots' ? 'carrot' : c.name === 'wheat' ? 'wheat_seeds' : 'beetroot_seeds'
+    if (haveItemCount(seedItem) < 1) {
+      const got = await refillMaterial(seedItem, 1, ctx, 16)
+      if (!got) return 'nomat'
+    }
+    const held = await equipFresh(seedItem)
+    if (!held) return 'nosupport'
+    try {
+      await bot.activateBlock(below, new Vec3(0, 1, 0), new Vec3(0.5, 1, 0.5))
+    } catch (e) { await sleepMs(200) }
+    await sleepMs(150)
+    const b = bot.blockAt(cell)
+    if (b && b.name === c.name) return 'placed'
+    return 'nosupport'
+  }
+
+  async function placeDoubleSlab (c, cell, ctx) {
+    const cur = bot.blockAt(cell)
+    if (cur && cur.name === c.name && cur.getProperties && cur.getProperties().type === 'double') return 'done'
+    if (cur && cur.name !== 'air' && cur.name !== c.name && !isReplaceableName(cur.name)) return 'wrong'
+    const itemName = itemForBlock(c.name)
+    // Step 1: a single slab in the cell (if air).
+    if (!cur || cur.name === 'air' || isReplaceableName(cur.name)) {
+      const singleCell = { ...c, props: { ...c.props, type: 'bottom' } }
+      const r = await placeBuildCell(singleCell, ctx)
+      if (r !== 'placed' && r !== 'done') return r
+    }
+    // Step 2: merge — use a second slab on the single slab. Use
+    // _genericPlace directly: _placeBlockWithOptions throws on the
+    // same-type ack (slab -> slab), even though the merge worked.
+    if (haveItemCount(itemName) < 1) {
+      const got = await refillMaterial(itemName, 1, ctx, 16)
+      if (!got) return 'nomat'
+    }
+    const held = await equipFresh(itemName)
+    if (!held) return 'nosupport'
+    const slab = bot.blockAt(cell)
+    if (!slab || slab.name !== c.name) return 'nosupport'
+    try {
+      await bot.lookAt(new Vec3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5))
+      await sleepMs(200)
+      await bot._genericPlace(slab, new Vec3(0, 1, 0), { delta: new Vec3(0.5, 1, 0.5), swingArm: 'right', forceLook: 'ignore' })
+    } catch (e) { await sleepMs(200) }
+    await sleepMs(200)
+    const b = bot.blockAt(cell)
+    if (b && b.name === c.name && b.getProperties && b.getProperties().type === 'double') return 'placed'
+    return 'nosupport'
+  }
+
+  // Refill one material: staging chest + nearby chests via ensureItem,
+  // then raw-craft fallback (planks/sticks). Returns true if Segs now
+  // holds at least 1.
+  // Material fallback for the build loop: inventory -> nearby chests ->
+  // raw-craft. The hunt radius is 16 for builds (staging + chests near
+  // the site); the 32-block default burned whole runs walking to stale
+  // remembered chests (runs 185/189). ctx.dryHunted bounds the hunt to
+  // ONE attempt per item per build: a failed hunt is not repeated for
+  // every cell (staging is still re-checked by bulkRefill each stand,
+  // so mid-build restocking still works).
+  async function refillMaterial (itemName, count, ctx, radius) {
+    if (haveItemCount(itemName) >= 1) return true
+    if (ctx && ctx.dryHunted && ctx.dryHunted.has(itemName)) return false
+    const r = radius || 32
+    try {
+      const res = await ensureItem(itemName, Math.max(1, count || 1), r)
+      if (res && res.have >= 1) { if (ctx && ctx.dryHunted) ctx.dryHunted.delete(itemName); return true }
+    } catch (e) {}
+    if (haveItemCount(itemName) >= 1) return true
+    if (RAW_CRAFT[itemName]) {
+      try {
+        const rawMat = RAW_CRAFT[itemName]
+        const res2 = await ensureItem(rawMat, 1, r)
+        if (res2 && res2.have >= 1) {
+          await doCraft(itemName, Math.max(1, count || 1))
+          if (haveItemCount(itemName) >= 1) { if (ctx && ctx.dryHunted) ctx.dryHunted.delete(itemName); return true }
         }
-        const dist = bot.entity.position.distanceTo(new Vec3(cell.x + 0.5, cell.y, cell.z + 0.5))
-        if (dist > 3.5 || insideFootprint(bot.entity.position.x, bot.entity.position.z)) {
-          const stand = standOutside(cell)
-          if (stand) { await moveCapped(stand); standMoved = true }
-        }
-        // reference block: the solid block below, else any solid neighbour
-        // v10.5.1 (item 3): NEVER place against a CONTAINER. A
-        // right-click on a chest/furnace/crafting table OPENS it
-        // instead of placing the block (the server treats the click
-        // as "use", not "place") — run 113: the floor cell (-138,71,160)
-        // sits directly above the mats chest, so its ref was the chest
-        // and every attempt was refused ("Server refused to place ...
-        // the block is still air"). Skip containers and use a
-        // neighbouring already-placed cell (or the ground) instead.
-        const isContainer = (b) => b && b.name && (
-          b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'ender_chest' ||
-          b.name === 'barrel' || b.name === 'furnace' || b.name === 'smoker' ||
-          b.name === 'blast_furnace' || b.name === 'crafting_table' || b.name === 'hopper' ||
-          b.name === 'dropper' || b.name === 'dispenser' || b.name === 'brewing_stand' ||
-          b.name === 'enchanting_table' || b.name === 'anvil' || b.name.endsWith('_shulker_box')
-        )
-        // v10.5.1 (item 3): the ref search reads the CLIENT's world
-        // state, which lags the server by a tick or two — a neighbour
-        // placed a moment ago still reads as air. Run 113 retest: the
-        // chest cell (-138,71,160) skipped with "nothing solid to
-        // place against" because the chest is (correctly) skipped as a
-        // container and its just-placed cobblestone neighbours had not
-        // landed in the client's state yet. Wait 500ms and re-run the
-        // ref search once before giving up on the cell.
-        const findRef = () => {
-          const b0 = bot.blockAt(cell.offset(0, -1, 0))
-          if (b0 && b0.name !== 'air' && !isContainer(b0)) return { ref: b0, face: new Vec3(0, 1, 0) }
-          for (const [ox, oy, oz, fx, fy, fz] of [[1,0,0,-1,0,0],[-1,0,0,1,0,0],[0,0,1,0,0,-1],[0,0,-1,0,0,1],[0,1,0,0,-1,0],[0,-1,0,0,1,0]]) {
-            const nb = bot.blockAt(cell.offset(ox, oy, oz))
-            if (nb && nb.name !== 'air' && !isContainer(nb)) return { ref: nb, face: new Vec3(fx, fy, fz) }
+      } catch (e) {}
+    }
+    const ok = haveItemCount(itemName) >= 1
+    if (!ok && ctx && ctx.dryHunted) ctx.dryHunted.add(itemName)
+    return ok
+  }
+
+  // Bulk refill for a stand visit: one trip to the staging chest, withdraw
+  // everything the reachable batch needs (up to free inventory space).
+  async function bulkRefill (needs, ctx) {
+    const sp = brain.buildStaging && brain.buildStaging.pos
+    if (!sp) return false
+    const chestBlock = bot.blockAt(new Vec3(sp[0], sp[1], sp[2]))
+    if (!chestBlock || (chestBlock.name !== 'chest' && chestBlock.name !== 'trapped_chest')) return false
+    try {
+      const moved = await moveCapped(chestBlock.position, 8000)
+      if (!moved) return false
+      const chest = await bot.openChest(chestBlock)
+      const mcData = mcDataFor(bot.version)
+      let took = 0
+      for (const [itemName, need] of needs) {
+        if (ctx.cancelled()) break
+        const def = mcData.itemsByName[itemName] || mcData.blocksByName[itemName]
+        if (!def) continue
+        const have = bot.inventory.count(def.id, null)
+        const want = Math.max(0, need - have)
+        if (want <= 0) continue
+        const inChest = chest.containerItems().filter(i => i.type === def.id).reduce((s, i) => s + i.count, 0)
+        if (inChest <= 0) continue
+        const space = bot.inventory.emptySlotCount() * 64
+        if (space <= 0) break
+        const n = Math.min(want, inChest, space)
+        try { await chest.withdraw(def.id, null, n); took += n; logEvent('autobuild', 'staging: took ' + n + 'x ' + itemName + ' (chest had ' + inChest + ')') } catch (e) { logEvent('autobuild', 'staging withdraw failed for ' + itemName + ': ' + (e && e.message ? e.message : e)) }
+      }
+      try { chest.close() } catch (e) {}
+      return took > 0
+    } catch (e) { return false }
+  }
+
+  // ---------- staging chest ----------
+  async function placeChestAt (pos, ctx) {
+    try {
+      const ok = await moveCapped(new Vec3(pos[0], pos[1], pos[2]), 8000)
+      if (!ok) return false
+      if (haveItemCount('chest') < 1) {
+        // NEARBY-ONLY hunt (run 185): the staging chest must never
+        // trigger a cross-map walk to distant chests — 29 real but
+        // hard-to-reach chests 28 blocks away burned the whole run
+        // via the radius-32 material search. 12 blocks, then craft,
+        // then give up and build without staging.
+        try { await ensureItem('chest', 1, 12) } catch (e) {}
+        if (haveItemCount('chest') < 1) {
+          // Only attempt the craft when a table is actually nearby —
+          // doCraft would say so anyway after its variant loop, and
+          // skipping it here keeps a bare platform fast (run 185).
+          if (findWorkstation(['crafting_table'], 12)) {
+            try { await doCraft('chest', 1) } catch (e) {}
           }
-          return null
+          if (haveItemCount('chest') < 1) return false
         }
-        let found = findRef()
-        if (!found) { await sleepMs(500); found = findRef() }
-        if (!found) { skipped++; logEvent('autobuild', `skipped ${cell} — nothing solid to place against`); continue }
-        const ref = found.ref, face = found.face
-        // v10.5.1 (item 3): settle BEFORE every place, not just on
-        // retry. The north edge (z=160) lost blocks to "Server refused
-        // to place" because Segs was still settling from the stand
-        // move when the first place fired (run 113e). Wait for
-        // onGround=true AND ~stillness before every place attempt.
-        // Speed is the cost: the first version used a 3s cap + 0.05
-        // threshold and the build took 260s (the velocity rarely drops
-        // below 0.05, so almost every cell burned the full 3s). Now:
-        // 1500ms cap, 0.1 threshold (a slow drift does not break a
-        // place — only a moving Segs does), and NO settle at all when
-        // no stand move happened (Segs is already still).
-        const settleBeforePlace = async () => {
-          if (!standMoved) { await sleepMs(200); return true }
-          const t0 = Date.now()
-          while (Date.now() - t0 < 1500) {
-            const v = bot.entity ? bot.entity.velocity : null
-            const sp = v ? Math.hypot(v.x, v.z) : 99
-            if (bot.entity && bot.entity.onGround && sp < 0.1) {
-              await sleepMs(300)
-              const v2 = bot.entity.velocity
-              if (v2 && Math.hypot(v2.x, v2.z) < 0.1 && bot.entity.onGround) return true
-            }
-            await sleepMs(100)
+      }
+      const held = await equipFresh('chest')
+      if (!held) return false
+      const below = bot.blockAt(new Vec3(pos[0], pos[1] - 1, pos[2]))
+      if (!below || below.name === 'air' || isReplaceableName(below.name) || isContainer(below)) return false
+      await bot.lookAt(new Vec3(pos[0] + 0.5, pos[1] - 0.5, pos[2] + 0.5))
+      await sleepMs(200)
+      await bot._placeBlockWithOptions(below, new Vec3(0, 1, 0), { delta: new Vec3(0.5, 1, 0.5), swingArm: 'right', forceLook: 'ignore' })
+      await sleepMs(150)
+      const b = bot.blockAt(new Vec3(pos[0], pos[1], pos[2]))
+      return b && b.name === 'chest'
+    } catch (e) { return false }
+  }
+
+  // Find/place a staging chest just OUTSIDE the footprint (never inside).
+  // Returns the chest position [x,y,z] or null (build continues without).
+  async function ensureStagingChest (origin, worldW, worldL, ctx) {
+    if (brain.buildStaging && brain.buildStaging.pos) {
+      const b = bot.blockAt(new Vec3(brain.buildStaging.pos[0], brain.buildStaging.pos[1], brain.buildStaging.pos[2]))
+      if (b && (b.name === 'chest' || b.name === 'trapped_chest')) return brain.buildStaging.pos
+    }
+    const cands = []
+    for (let d = 2; d <= 4; d++) {
+      for (let x = origin[0] - d; x <= origin[0] + worldW - 1 + d; x++) {
+        cands.push([x, origin[2] - d]); cands.push([x, origin[2] + worldL - 1 + d])
+      }
+      for (let z = origin[2] - d + 1; z <= origin[2] + worldL - 1 + d - 1; z++) {
+        cands.push([origin[0] - d, z]); cands.push([origin[0] + worldW - 1 + d, z])
+      }
+    }
+    const cur = bot.entity.position
+    cands.sort((a, b) => Math.hypot(a[0] - cur.x, a[1] - cur.z) - Math.hypot(b[0] - cur.x, b[1] - cur.z))
+    let tried = 0
+    for (const [x, z] of cands) {
+      if (ctx.cancelled()) return null
+      for (let y = origin[1] + 2; y >= origin[1] - 4; y--) {
+        const below = bot.blockAt(new Vec3(x, y, z))
+        const at = bot.blockAt(new Vec3(x, y + 1, z))
+        if (below && below.name !== 'air' && !isReplaceableName(below.name) && !isContainer(below) && at && at.name === 'air') {
+          tried++
+          const placed = await placeChestAt([x, y + 1, z], ctx)
+          if (placed) {
+            brain.buildStaging = { pos: [x, y + 1, z], at: Date.now() }
+            saveBrain()
+            logEvent('autobuild', 'staging chest at ' + [x, y + 1, z].join(','))
+            return brain.buildStaging.pos
           }
-          return false
+          if (tried >= 3) return null
+          break
         }
-        // v10.5 run 113d fix: retry each place. The north edge
-        // (z=160) lost 20 blocks to transient "Server refused to place"
-        // — Segs is still settling from the stand move when the first
-        // place fires. A second try (re-stand, re-equip, 300ms settle)
-        // lands the ones the first attempt missed.
-        // v10.5.1 (item 3): up to 3 attempts (was 2), each with a
-        // fresh lookAt + re-equip + settle, so a transient refusal
-        // does not cost a block.
-        let done = false
-        for (let attempt = 0; attempt < 3 && !done; attempt++) {
-          if (attempt > 0) {
-            const stand2 = standOutside(cell)
-            if (stand2) await moveCapped(stand2)
+      }
+    }
+    return null
+  }
+
+  // ---------- stand points + batching ----------
+  function computeStandPoints (origin, worldW, worldL, topsSet) {
+    const pts = []
+    const seen = new Set()
+    const add = (x, y, z) => {
+      const k = Math.round(x) + ',' + Math.round(y) + ',' + Math.round(z)
+      if (seen.has(k)) return
+      seen.add(k)
+      pts.push(new Vec3(x, y, z))
+    }
+    // Ring around the footprint at distance 1, 2 and 3. The d=1 ring
+    // is what reaches centre-top cells of a small structure from the
+    // ground (run 185: from d=2 the eye distance to a centre cell at
+    // +2 height is 4.7, just past the 4.6 reach; from d=1 it is 3.9).
+    for (const d of [1, 2, 3]) {
+      for (let x = origin[0] - d; x <= origin[0] + worldW - 1 + d; x++) {
+        for (const z of [origin[2] - d, origin[2] + worldL - 1 + d]) {
+          for (let y = origin[1] + 2; y >= origin[1] - 6; y--) {
+            const below = bot.blockAt(new Vec3(x, y, z))
+            const feet = bot.blockAt(new Vec3(x, y + 1, z))
+            const head = bot.blockAt(new Vec3(x, y + 2, z))
+            if (below && below.name !== 'air' && !isReplaceableName(below.name) && feet && feet.name === 'air' && head && head.name === 'air') { add(x + 0.5, y + 1, z + 0.5); break }
           }
-          await settleBeforePlace()
-          // face the cell fresh every attempt — a stale look from the
-          // stand move is what the server refuses on.
-          try { await bot.lookAt(new Vec3(cell.x + 0.5, cell.y + 0.5, cell.z + 0.5)) } catch (e) {}
-          // v10.5.1 (item 3): let the server RECEIVE the look before
-          // the place fires. lookAt resolves when the look is set
-          // locally, but the look packet rides the next per-tick
-          // position packet — firing placeBlock in the same tick means
-          // the server raycasts the OLD look and refuses/misses
-          // (run 113: (-140,72,160) "did not answer" x3 despite a
-          // fresh lookAt each attempt). 200ms is ~4 ticks of margin.
-          await sleepMs(200)
-          // re-find the item FRESH on every equip attempt (a stale
-          // slot from a previous place desyncs the equip), close any
-          // stale window first, settle 300ms, 3 tries.
-          let held = false
-          for (let e = 0; e < 3 && !held; e++) {
-            const fresh = bot.inventory.items().find(i => i.name === b.block)
-            if (!fresh) break
-            try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow) } catch (err) {}
-            try { await bot.equip(fresh, 'hand') } catch (err) {}
-            await sleepMs(300)
-            held = !!(bot.heldItem && bot.heldItem.name === b.block)
+        }
+      }
+      for (let z = origin[2] - d + 1; z <= origin[2] + worldL - 1 + d - 1; z++) {
+        for (const x of [origin[0] - d, origin[0] + worldW - 1 + d]) {
+          for (let y = origin[1] + 2; y >= origin[1] - 6; y--) {
+            const below = bot.blockAt(new Vec3(x, y, z))
+            const feet = bot.blockAt(new Vec3(x, y + 1, z))
+            const head = bot.blockAt(new Vec3(x, y + 2, z))
+            if (below && below.name !== 'air' && !isReplaceableName(below.name) && feet && feet.name === 'air' && head && head.name === 'air') { add(x + 0.5, y + 1, z + 0.5); break }
           }
-          if (!held) {
-            const have = bot.inventory.count(bot.registry.itemsByName[b.block]?.id, null)
-            if (!have) { skipped++; logEvent('autobuild', `skipped ${cell} — out of ${b.block} mid-build`); done = true; break }
-            if (attempt === 2) {
-              skipped++
-              logEvent('autobuild', `place failed at ${cell} (${b.block}): equip did not land (holding ${bot.heldItem ? bot.heldItem.name : 'nothing'}, have ${have}x in inventory)`)
-              done = true
-            }
+        }
+      }
+    }
+    // Tops of solid placed cells (lets Segs stand on the build itself).
+    if (topsSet) {
+      for (const key of topsSet) {
+        const [x, y, z] = key.split(',').map(Number)
+        const above = bot.blockAt(new Vec3(x, y + 1, z))
+        const above2 = bot.blockAt(new Vec3(x, y + 2, z))
+        if (above && above.name === 'air' && above2 && above2.name === 'air') add(x + 0.5, y + 1, z + 0.5)
+      }
+    }
+    // Nearest-first.
+    const cur = bot.entity.position
+    pts.sort((a, b) => a.distanceTo(cur) - b.distanceTo(cur))
+    return pts
+  }
+
+  // Chunk-bucketed remaining-cell index for fast reach queries.
+  function buildChunkIndex (remaining) {
+    const idx = new Map()
+    for (const c of remaining.values()) {
+      const k = (c.wx >> 4) + ',' + (c.wz >> 4)
+      if (!idx.has(k)) idx.set(k, [])
+      idx.get(k).push(c)
+    }
+    return idx
+  }
+  function cellsNear (idx, x, z, radius) {
+    const out = []
+    const cx0 = Math.floor((x - radius) / 16); const cx1 = Math.floor((x + radius) / 16)
+    const cz0 = Math.floor((z - radius) / 16); const cz1 = Math.floor((z + radius) / 16)
+    for (let cx = cx0; cx <= cx1; cx++) {
+      for (let cz = cz0; cz <= cz1; cz++) {
+        const arr = idx.get(cx + ',' + cz)
+        if (arr) out.push(...arr)
+      }
+    }
+    return out
+  }
+
+  function sortBuildCells (cells, eye, feet) {
+    const feetY = Math.floor(feet.y)
+    cells.sort((a, b) => {
+      // Avoid hemming the player in: feet/head-level cells within 1.5
+      // blocks go last (BuildOrder).
+      const hemA = (a.wy === feetY || a.wy === feetY + 1) && Math.abs(a.wx + 0.5 - feet.x) < 1.5 && Math.abs(a.wz + 0.5 - feet.z) < 1.5 ? 1 : 0
+      const hemB = (b.wy === feetY || b.wy === feetY + 1) && Math.abs(b.wx + 0.5 - feet.x) < 1.5 && Math.abs(b.wz + 0.5 - feet.z) < 1.5 ? 1 : 0
+      if (hemA !== hemB) return hemA - hemB
+      if (a.wy !== b.wy) return a.wy - b.wy
+      const tA = buildTier(a.name); const tB = buildTier(b.name)
+      if (tA !== tB) return tA - tB
+      const dA = (a.wx + 0.5 - eye.x) ** 2 + (a.wy + 0.5 - eye.y) ** 2 + (a.wz + 0.5 - eye.z) ** 2
+      const dB = (b.wx + 0.5 - eye.x) ** 2 + (b.wy + 0.5 - eye.y) ** 2 + (b.wz + 0.5 - eye.z) ** 2
+      if (dA !== dB) return dA - dB
+      if (a.wx !== b.wx) return a.wx - b.wx
+      return a.wz - b.wz
+    })
+  }
+
+  // ---------- main build loop ----------
+  async function autobuild (name) {
+    if (globalThis._autobuildRunning) { say('im already building — wait for this one to finish, or say segs stop first'); return }
+    globalThis._autobuildRunning = true
+    const myRun = (globalThis._buildRunId = (globalThis._buildRunId || 0) + 1)
+    const cancelled = () => globalThis._buildRunId !== myRun || !bot || !bot.entity || bot.health <= 0
+    const t0 = Date.now()
+    try {
+      const schem = loadSchematic(name)
+      if (!schem) { say("i dont have a schematic called " + name + " — check the name and try again"); return }
+      // Resolve origin + rotation: alignment scan wins, else marked site.
+      let origin = null
+      let rotation = 0
+      const al = brain.buildAlignment
+      if (al && al.name === schem.name && Array.isArray(al.origin)) { origin = al.origin.slice(); rotation = al.rotation || 0 }
+      else if (brain.buildSite && Array.isArray(brain.buildSite.pos)) { origin = brain.buildSite.pos.slice(); rotation = 0 }
+      if (!origin) {
+        say('i dont know where to build ' + schem.name + ' — stand at the build and say: segs scan the build, or mark a site: segs this is the build site')
+        return
+      }
+      const [worldW, worldH, worldL] = rotatedDims(schem, rotation)
+      // Rotate every cell into world coords + rotated blockstates.
+      const worldCells = []
+      for (const c of schem.cells) {
+        const [rx, rz] = rotateXZ(c.x, c.z, rotation, schem.width, schem.length)
+        const state = rotateState(c.state, rotation)
+        const p = parseBlockState(state)
+        worldCells.push({ x: c.x, y: c.y, z: c.z, wx: origin[0] + rx, wy: origin[1] + c.y, wz: origin[2] + rz, state, name: p.name, props: p.props })
+      }
+      // Skip-list accounting (never placed, always reported).
+      const skippedTypes = {}
+      const placeable = []
+      const autoFillCells = []
+      for (const wc of worldCells) {
+        if (isSkippedBlock(wc.name)) { skippedTypes[wc.name] = (skippedTypes[wc.name] || 0) + 1; continue }
+        const isAutoFill = (wc.props.part === 'head' && wc.name.endsWith('_bed')) || (wc.props.half === 'upper' && (wc.name.endsWith('_door') || isDoublePlant(wc.name)))
+        if (isAutoFill) { autoFillCells.push(wc); continue }
+        placeable.push(wc)
+      }
+      const skippedTotal = Object.values(skippedTypes).reduce((s, n) => s + n, 0)
+      // Initial scan: skip correct cells, report wrong-present ones.
+      const keyOf = (c) => c.wx + ',' + c.wy + ',' + c.wz
+      const remaining = new Map()
+      const topsSet = new Set()
+      let skipped = 0
+      let wrong = 0
+      const wrongSamples = []
+      for (const c of placeable) {
+        const cell = new Vec3(c.wx, c.wy, c.wz)
+        const b = bot.blockAt(cell)
+        if (!b) { remaining.set(keyOf(c), c); continue } // unloaded — try later
+        if (b.name === 'air' || isReplaceableName(b.name)) { remaining.set(keyOf(c), c); continue }
+        const v = verifyCell(cell, c.name, c.props)
+        if (v.ok) {
+          skipped++
+          if (isFullCubeName(c.name)) topsSet.add(keyOf(c))
+          continue
+        }
+        // Present but WRONG: report, leave alone, never break/overwrite.
+        wrong++
+        if (wrongSamples.length < 8) wrongSamples.push(cell + ' has ' + b.name + ', want ' + c.name)
+        logEvent('autobuild', 'wrong block present at ' + cell + ': ' + b.name + ', want ' + c.name + ' — left alone')
+      }
+      const totalPlaceable = placeable.length
+      const ctx = {
+        cancelled,
+        dryReported: new Set(),
+        dryHunted: new Set(),
+        remainingForItem: (itemName) => {
+          let n = 0
+          for (const c of remaining.values()) { if (itemForBlock(c.name) === itemName) n++ }
+          return n
+        }
+      }
+      // Staging chest (outside the footprint).
+      const stagingPos = await ensureStagingChest(origin, worldW, worldL, ctx)
+      if (cancelled()) return
+      // Progress reporting: quartile chat messages for builds > 40 cells.
+      let placed = 0
+      let nomat = 0
+      let nosupport = 0
+      let lastQuartile = -1
+      const reportProgress = (force) => {
+        if (totalPlaceable <= 40 && !force) return
+        const done = placed + skipped
+        const pct = totalPlaceable ? Math.floor(done / totalPlaceable * 100) : 100
+        const q = Math.floor(pct / 25)
+        if (!force && q === lastQuartile) return
+        lastQuartile = q
+        const mins = (Date.now() - t0) / 60000
+        const rate = mins > 0 ? Math.round(placed / mins) : 0
+        brain.buildProgress = { name: schem.name, placed, skipped, total: totalPlaceable, pct, rate, at: Date.now(), running: !force }
+        saveBrain()
+        if (!force) say(schem.name + ': ' + pct + '% — ' + placed + ' placed, ' + remaining.size + ' left, ' + rate + '/min')
+      }
+      say('building ' + schem.name + ' — ' + totalPlaceable + ' blocks to place (' + skipped + ' already done, ' + skippedTotal + ' skipped: cant place in survival), rotation ' + (rotation * 90) + '°' + (stagingPos ? ', staging chest ready' : ', no staging chest'))
+      logEvent('autobuild', 'start ' + schem.name + ' origin ' + origin.join(',') + ' rot ' + rotation + ' total ' + totalPlaceable + ' skipped ' + skipped + ' wrong-present ' + wrong + ' skiplist ' + JSON.stringify(skippedTypes))
+      // Reset the persisted progress NOW — a previous build killed
+      // mid-run would otherwise leave a stale "running now" status.
+      brain.buildProgress = { name: schem.name, placed: 0, skipped, total: totalPlaceable, pct: 0, rate: 0, at: Date.now(), running: true }
+      saveBrain()
+      // Build passes: stand-point batching, up to 3 passes for cells whose
+      // supports appear late. Stands that fail to reach are remembered
+      // (badStands) and skipped for the rest of the build — re-attempting
+      // a pinned stand burned ~4 minutes in run 184.
+      const MAX_PASSES = 3
+      const badStands = new Set()
+      for (let pass = 0; pass < MAX_PASSES && remaining.size > 0; pass++) {
+        if (cancelled()) break
+        const remainingBeforePass = remaining.size
+        const idx = buildChunkIndex(remaining)
+        const stands = computeStandPoints(origin, worldW, worldL, topsSet)
+        for (const stand of stands) {
+          if (cancelled() || remaining.size === 0) break
+          const standKey = posKey(stand)
+          if (badStands.has(standKey)) continue
+          const near = cellsNear(idx, stand.x, stand.z, 6).filter(c => remaining.has(keyOf(c)))
+          if (!near.length) continue
+          const reachable = near.filter(c => {
+            const d = Math.hypot(c.wx + 0.5 - stand.x, c.wy + 0.5 - (stand.y + 1.62), c.wz + 0.5 - stand.z)
+            return d <= 5.0
+          })
+          if (!reachable.length) continue
+          const moved = await moveToStand(stand, origin, worldW, worldL, ctx)
+          if (!moved) {
+            // Only ring stands are blacklisted — tops (inside the
+            // footprint) may become reachable in a later pass as more
+            // cells are placed.
+            const isTop = stand.x >= origin[0] && stand.x < origin[0] + worldW && stand.z >= origin[2] && stand.z < origin[2] + worldL
+            if (!isTop) { badStands.add(standKey); logEvent('autobuild', 'ring stand unreachable, blacklisted: ' + standKey) }
             continue
           }
-          try {
-            await bot.placeBlock(ref, face)
-            await sleepMs(50) // 1 block per tick — human speed
-            const check = bot.blockAt(cell)
-            if (check && check.name === b.block) { placed++; done = true }
-            else if (attempt === 2) { wrong++; logEvent('autobuild', `WRONG block at ${cell}: expected ${b.block}, got ${check ? check.name : '?'}`); done = true }
-          } catch (e) {
-            if (attempt === 2) {
-              skipped++
-              logEvent('autobuild', `place failed at ${cell} (${b.block}): ${e.message}`)
-              done = true
+          // Bulk refill for this stand's batch — skip the trip entirely
+          // when the inventory already covers every need.
+          const needs = new Map()
+          for (const c of reachable) {
+            const it = itemForBlock(c.name)
+            needs.set(it, (needs.get(it) || 0) + 1)
+          }
+          let needsCovered = true
+          for (const [it, n] of needs) { if (haveItemCount(it) < n) { needsCovered = false; break } }
+          if (stagingPos && needs.size && !needsCovered) {
+            const refilled = await bulkRefill(needs, ctx)
+            // ALWAYS return to the stand after a refill trip — the old
+            // code only moved back when something was taken, so a
+            // failed/empty refill left Segs sweeping from the chest
+            // position forever (run 188 ping-pong).
+            await moveToStand(stand, origin, worldW, worldL, ctx)
+            if (cancelled()) break
+          }
+          // Sweep from this stand until no more progress.
+          for (;;) {
+            if (cancelled() || remaining.size === 0) break
+            const eye = eyePos()
+            const here = cellsNear(idx, bot.entity.position.x, bot.entity.position.z, 6)
+              .filter(c => remaining.has(keyOf(c)))
+              .filter(c => {
+                const d = eye.distanceTo(new Vec3(c.wx + 0.5, c.wy + 0.5, c.wz + 0.5))
+                return d <= 4.6
+              })
+            if (!here.length) break
+            sortBuildCells(here, eye, bot.entity.position)
+            let progress = 0
+            for (const c of here) {
+              if (cancelled()) break
+              if (!remaining.has(keyOf(c))) continue
+              const res = await placeBuildCell(c, ctx)
+              if (res === 'placed') { remaining.delete(keyOf(c)); placed++; progress++; if (isFullCubeName(c.name)) topsSet.add(keyOf(c)) }
+              else if (res === 'done') { remaining.delete(keyOf(c)); skipped++; progress++ }
+              else if (res === 'wrong') { remaining.delete(keyOf(c)); wrong++; progress++; logEvent('autobuild', 'WRONG after 3 attempts at ' + c.wx + ',' + c.wy + ',' + c.wz + ' (' + c.name + ' ' + stateToString(c.name, c.props) + ')') }
+              else if (res === 'nomat') { remaining.delete(keyOf(c)); nomat++; progress++ }
+              else if (res === 'cancelled') { break }
+              // 'nosupport' stays in remaining for a later pass/stand.
+              reportProgress(false)
             }
+            if (progress === 0) break
+          }
+        }
+        // Pass gate (run 192): a full pass with zero progress means no
+        // new supports appeared, so later passes cannot help — stop
+        // instead of burning minutes re-trying unreachable stands.
+        // The remainder is reported as unplaced (no support/reach).
+        if (remaining.size === remainingBeforePass && remaining.size > 0) {
+          logEvent('autobuild', 'pass ' + pass + ' made no progress — stopping, ' + remaining.size + ' cells unreachable')
+          break
+        }
+      }
+      // Auto-fill cells: verify they got filled by their base placements.
+      let unfilled = 0
+      for (const c of autoFillCells) {
+        const v = verifyCell(new Vec3(c.wx, c.wy, c.wz), c.name, c.props)
+        if (!v.ok) unfilled++
+      }
+      nosupport = remaining.size
+      const mins = (Date.now() - t0) / 60000
+      const rate = mins > 0 ? Math.round(placed / mins) : 0
+      brain.buildProgress = { name: schem.name, placed, skipped, total: totalPlaceable, pct: totalPlaceable ? Math.floor((placed + skipped) / totalPlaceable * 100) : 100, rate, at: Date.now(), running: false }
+      saveBrain()
+      const skipSummary = Object.entries(skippedTypes).map(([k, n]) => k + ' x' + n).join(', ')
+      if (cancelled()) {
+        say('build paused — ' + schem.name + ': ' + placed + ' placed, ' + remaining.size + ' left. say segs build ' + schem.name + ' here to resume')
+        logEvent('autobuild', 'cancelled ' + schem.name + ' placed ' + placed + ' remaining ' + remaining.size)
+        return
+      }
+      let msg = schem.name + ' done — ' + placed + ' placed, ' + skipped + ' already there, ' + wrong + ' wrong left alone, ' + nomat + ' skipped (no mats), ' + nosupport + ' unplaced (no support/reach), ' + unfilled + ' auto-fill unfilled, ' + skippedTotal + ' skipped (cant place). ' + rate + '/min over ' + Math.max(1, Math.round(mins)) + ' min'
+      if (skipSummary) msg += ' Skipped: ' + skipSummary
+      say(msg)
+      logEvent('autobuild', 'finish ' + schem.name + ' placed ' + placed + ' skipped ' + skipped + ' wrong ' + wrong + ' nomat ' + nomat + ' nosupport ' + nosupport + ' unfilled ' + unfilled + ' rate ' + rate + '/min')
+      if (wrongSamples.length) logEvent('autobuild', 'wrong samples: ' + wrongSamples.join(' | '))
+    } catch (e) {
+      logEvent('autobuild', 'ERROR: ' + (e && e.stack ? e.stack : e))
+      if (brain.buildProgress) { brain.buildProgress.running = false; saveBrain() }
+      say('the build hit an error — check the log, then say segs build ' + name + ' here to resume')
+    } finally {
+      globalThis._autobuildRunning = false
+      try { bot.clearControlStates() } catch (e) {}
+      try { bot.pathfinder.setGoal(null) } catch (e) {}
+    }
+  }
+
+  // ---------- alignment scan (vote-based, BuildPrint AlignmentVote-style) ----------
+  function scoreAlignment (schem, origin, rot, hitMap) {
+    const bottom = schem.cells.filter(c => c.y <= 1 && !isSkippedBlock(c.name))
+    const rest = schem.cells.filter(c => c.y > 1 && !isSkippedBlock(c.name))
+    const sample = []
+    const bStride = Math.max(1, Math.floor(bottom.length / 300))
+    for (let i = 0; i < bottom.length && sample.length < 300; i += bStride) sample.push(bottom[i])
+    const rStride = Math.max(1, Math.floor(rest.length / 100))
+    for (let i = 0; i < rest.length && sample.length < 400; i += rStride) sample.push(rest[i])
+    let matched = 0
+    let wrong = 0
+    for (const c of sample) {
+      const [rx, rz] = rotateXZ(c.x, c.z, rot, schem.width, schem.length)
+      const wx = origin[0] + rx; const wy = origin[1] + c.y; const wz = origin[2] + rz
+      const key = wx + ',' + wy + ',' + wz
+      let wname = hitMap.get(key)
+      if (wname === undefined) {
+        const b = bot.blockAt(new Vec3(wx, wy, wz))
+        if (!b) continue // unloaded — neutral
+        wname = b.name
+      }
+      if (wname === 'air') continue // not built yet — neutral, not wrong
+      if (wname === c.name) matched++
+      else wrong++
+    }
+    return { matched, wrong, ratio: (matched + wrong) ? matched / (matched + wrong) : 0 }
+  }
+
+  async function scanBuild (name) {
+    const schem = loadSchematic(name)
+    if (!schem) { say("i dont have a schematic called " + name); return }
+    say('scanning for ' + schem.name + ' — matching the placed blocks against the bottom layers...')
+    const R = Math.min(160, Math.max(schem.width, schem.length) + 12)
+    let found = []
+    try {
+      found = bot.findBlocks({ matching: (b) => b && b.name !== 'air', maxDistance: R, count: 20000 })
+    } catch (e) { found = [] }
+    const hits = []
+    const hitMap = new Map()
+    for (const p of found) {
+      const b = bot.blockAt(p)
+      if (b && b.name !== 'air') {
+        hits.push({ x: p.x, y: p.y, z: p.z, name: b.name })
+        hitMap.set(p.x + ',' + p.y + ',' + p.z, b.name)
+      }
+    }
+    if (hits.length < 5) {
+      say('i cant see enough placed blocks nearby — stand next to the built part and try again')
+      return
+    }
+    // Anchors: bottom 2 layers, grouped by block id.
+    const anchorsByName = {}
+    for (const c of schem.cells) {
+      if (c.y > 1) continue
+      if (isSkippedBlock(c.name)) continue
+      if (!anchorsByName[c.name]) anchorsByName[c.name] = []
+      anchorsByName[c.name].push(c)
+    }
+    const hitsByName = {}
+    for (const h of hits) {
+      if (!hitsByName[h.name]) hitsByName[h.name] = []
+      hitsByName[h.name].push(h)
+    }
+    // Vote origins per rotation (stride-capped pair sampling).
+    const candidates = []
+    for (let rot = 0; rot < 4; rot++) {
+      const votes = new Map()
+      for (const [nm, anchors] of Object.entries(anchorsByName)) {
+        const hs = hitsByName[nm]
+        if (!hs) continue
+        const stride = Math.max(1, Math.floor(anchors.length * hs.length / 4000) + 1)
+        for (let a = 0; a < anchors.length; a += stride) {
+          const an = anchors[a]
+          const [rx, rz] = rotateXZ(an.x, an.z, rot, schem.width, schem.length)
+          for (const h of hs) {
+            const key = (h.x - rx) + ',' + (h.y - an.y) + ',' + (h.z - rz)
+            votes.set(key, (votes.get(key) || 0) + 1)
           }
         }
       }
+      const top = [...votes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+      for (const [key, v] of top) candidates.push({ origin: key.split(',').map(Number), rotation: rot, votes: v })
     }
-    say(`built ${schem.name || name}: ${placed}/${schem.blocks.length} blocks placed, ${skipped} skipped, ${wrong} wrong`)
-    logEvent('autobuild', `${name}: done — placed ${placed}/${schem.blocks.length}, skipped ${skipped}, wrong ${wrong}`)
-    } finally {
-      globalThis._autobuildRunning = false
+    if (!candidates.length) {
+      say('couldnt find any ' + schem.name + ' blocks nearby — stand closer to the built part and try again')
+      return
     }
+    let best = null
+    for (const cand of candidates) {
+      const sc = scoreAlignment(schem, cand.origin, cand.rotation, hitMap)
+      if (!best || sc.ratio > best.ratio || (sc.ratio === best.ratio && sc.matched > best.matched)) best = { ...cand, ...sc }
+    }
+    if (!best || best.matched < 8 || best.ratio < 0.6) {
+      say('couldnt align ' + schem.name + ' confidently — best match was ' + (best ? Math.round(best.ratio * 100) + '% (' + best.matched + ' blocks)' : 'nothing') + '. stand closer to the built part and try again')
+      logEvent('align', schem.name + ': no confident alignment (best ' + (best ? best.ratio.toFixed(2) + ' matched ' + best.matched : 'none') + ')')
+      return
+    }
+    brain.buildAlignment = { name: schem.name, origin: best.origin, rotation: best.rotation, confidence: best.ratio, matched: best.matched, wrong: best.wrong, at: Date.now() }
+    saveBrain()
+    say('found ' + schem.name + ' at ' + best.origin.join(', ') + ', rotation ' + (best.rotation * 90) + '°, confidence ' + Math.round(best.ratio * 100) + '% (' + best.matched + ' matched, ' + best.wrong + ' mismatched). say: segs build ' + schem.name + ' here')
+    logEvent('align', schem.name + ': origin ' + best.origin.join(',') + ' rot ' + best.rotation + ' conf ' + best.ratio.toFixed(2) + ' matched ' + best.matched + ' wrong ' + best.wrong)
+  }
+
+  // ---------- build status (for the "build status" query) ----------
+  function buildStatusText () {
+    const p = brain.buildProgress
+    const al = brain.buildAlignment
+    const parts = []
+    if (al) parts.push('aligned: ' + al.name + ' at ' + al.origin.join(', ') + ', ' + (al.rotation * 90) + '°, ' + Math.round((al.confidence || 0) * 100) + '%')
+    if (p) parts.push('last build: ' + p.name + ' ' + p.pct + '% (' + p.placed + ' placed, ' + p.skipped + ' skipped, of ' + p.total + '), ' + p.rate + '/min' + (p.running ? ', running now' : ''))
+    if (brain.buildStaging && brain.buildStaging.pos) parts.push('staging chest at ' + brain.buildStaging.pos.join(', '))
+    if (!parts.length) return 'no build yet — say: segs scan the build, or mark a site: segs this is the build site'
+    return parts.join(' — ')
   }
 
   async function doCraft (itemName, count) {
@@ -8141,9 +9511,29 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     // charcoal). If this variant is missing an ingredient, TRY THE NEXT
     // VARIANT instead of giving up — the chest may hold the other one.
     // Only report missing after every variant has failed.
+    // v10.7 run 185 fix: try the variant Segs CAN craft first. The old
+    // order fetched missing ingredients (radius-32 chest hunts!) for
+    // EVERY variant in list order — for 'chest' (one variant per plank
+    // type) a missing birch/spruce variant burned the whole run walking
+    // to distant chests before the oak variant Segs could craft was ever
+    // reached. Score each variant by its total shortfall from the
+    // CURRENT inventory (pure reads, no fetching) and try the
+    // least-missing first; fetching only happens when no variant is
+    // complete. The final missing report uses the BEST variant's list.
+    const scored = allRecipes.map(recipe => {
+      const craftsNeeded = Math.ceil(count / (recipe.result.count || 1))
+      let short = 0
+      for (const d of (recipe.delta || [])) {
+        if (d.count >= 0) continue
+        short += Math.max(0, -d.count * craftsNeeded - bot.inventory.count(d.id, null))
+      }
+      return { recipe, short }
+    })
+    scored.sort((a, b) => a.short - b.short)
     let lastMissing = null, lastSearched = 0
+    let bestShort = Infinity
     let table = null
-    for (const recipe of allRecipes) {
+    for (const { recipe } of scored) {
       const craftsNeeded = Math.ceil(count / (recipe.result.count || 1))
       const missing = []
       for (const d of (recipe.delta || [])) {
@@ -8169,8 +9559,10 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       }
       const stillMissing = missing.filter(m => m.short > 0)
       if (stillMissing.length) {
-        // save the missing list and try the next recipe variant
-        lastMissing = stillMissing; lastSearched = searched
+        // save the BEST (least-missing) list for the final report and
+        // try the next recipe variant
+        const totShort = stillMissing.reduce((s, m) => s + m.short, 0)
+        if (totShort < bestShort) { bestShort = totShort; lastMissing = stillMissing; lastSearched = searched }
         continue
       }
       // v10.5 run 111b fix: do NOT craft with the stale recipesAll
