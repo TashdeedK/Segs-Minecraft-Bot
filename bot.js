@@ -717,6 +717,59 @@ function createBot () {
     } catch (e) {}
   }
   let talkQueue = Promise.resolve()
+
+  // v10.7.1 ROUTE PROBE: does this cleaned request reach a real
+  // handler in handleTalk? The instant ack used to fire on bare
+  // WORDS ('scan' is in ACK_WORK_WORDS), so an unrouted command got
+  // BOTH the ack and the fallback ("segs scan this build", live
+  // 03:18: "doing it now" + "didnt quite get that"). The ack and
+  // the latest-wins bump now fire only when the probe says the
+  // command routes. The probe is CONSERVATIVE: a missed branch
+  // costs only a missing ack (the handler still replies once); a
+  // false positive would reintroduce the double reply. Teaches,
+  // queries, greetings and instant commands never route here —
+  // handleTalk answers those directly, exactly once.
+  function commandRoutes (req) {
+    if (!req) return false
+    // "forget home X" routes (server round-trip) — carve it out
+    // before the ^forget teach exclusion below.
+    if (req.startsWith('forget home ')) return true
+    if (/^(hi|hello|hey|yo|thanks|thank you|thx|bye|good night|good morning)$/.test(req)) return false
+    if (/^(this is|remember|learn|forget|list|status|stats|inventory|help|what|where|how|show|enable|disable|stop)\b/.test(req)) return false
+    if (isQueryMsg(req)) return false
+    // user-defined macros always route (they re-run real commands)
+    try {
+      const macroKey = Object.keys(brain.macros || {}).find(k => req === k || req.startsWith(k + ' '))
+      if (macroKey) return true
+    } catch (e) {}
+    // movement: tp / come / follow / go-to (incl. homes)
+    if (req.includes('tp to me') || req.includes('teleport to me') || req.includes('come to me') || req.includes('come here') || req === 'come' || req === 'tp' || req === 'teleport' || req.includes('come to') || req.includes('tp me') || req.includes('tp here') || req.includes('teleport here') || req.includes('tp 2 me') || req.includes('tp home') || req.includes('teleport home')) return true
+    if (req.includes('follow me') || req.includes('follow') || req.includes('stay with me')) return true
+    if (req.startsWith('go to') || req === 'go farm' || req === 'go home' || req.startsWith('go home ') || /^home \S+/.test(req)) return true
+    // builder: scan / align / pin / build
+    if (req.includes('the build is at')) return true
+    if (req.includes('scan the build') || req.includes('align the build') || req.includes('scan build') || req.includes('align build') || req.includes('scan this build') || req.includes('align this build') || req.includes('scan that build') || req.includes('align that build') || req.includes('build site')) return true
+    if (req.startsWith('build') || (req.includes('build ') && req.includes(' here'))) return true
+    // storage scan (slow work; teaches are excluded above)
+    if (req.includes('scan the storage') || req.includes('scan storage') || req.includes('map the storage') || req.includes('see this storage') || req.includes('see the storage')) return true
+    // work verbs with handler-shaped arguments
+    if (req.startsWith('craft') || req.startsWith('make') || req.startsWith('cook') || req.startsWith('smelt') || req.startsWith('dig') || req.startsWith('mine') || req.startsWith('chop') || req.startsWith('give me') || req.startsWith('drop') || req.startsWith('equip') || req.startsWith('hold') || req.startsWith('wear') || req.startsWith('sethome ') || req.includes('set home ')) return true
+    if (req.includes('farm') || req.includes('harvest')) return true
+    if (req.includes('sleep') || req.includes('go to bed') || req.includes('go bed')) return true
+    if (req.includes('sort') || req.includes('move out') || (req.includes('move') && (req.includes('column') || req.includes('storage')))) return true
+    if (req.includes('get food') || req.includes('find food') || req === 'survive' || req.includes('take care of yourself') || req.includes('sort yourself out') || req.includes('you are hungry') || req.includes('youre hungry')) return true
+    if ((req.includes('grave') || req.includes('your stuff')) && (req.includes('get') || req.includes('go') || req.includes('recover') || req.includes('fetch'))) return true
+    if (req.includes('deathchest') || req.includes('death chest')) return true
+    if ((req.includes('store') && req.includes('item')) || req.includes('deposit') || ((req.includes('keep') || req.includes('put')) && (req.includes('base') || req.includes('room') || req.includes('home')) && (req.includes('item') || req.includes('stuff') || req.includes('these'))) || ((req.includes('keep') || req.includes('store')) && req.includes('chest')) || (req.startsWith('put ') && req.includes('chest'))) return true
+    if ((req.includes('pick') || req.includes('collect') || req.includes('grab')) && (req.includes('item') || req.includes('up') || req.includes('these') || req.includes('them'))) return true
+    if (req.includes('pick up') || req.includes('pickup') || req.includes('collect')) return true
+    if (req.includes('guard me') || req.includes('protect me') || req === 'guard' || req === 'protect' || req.includes('fight')) return true
+    if (req === 'fish' || req.includes('go fishing') || req.includes('start fishing')) return true
+    if (req === 'eat' || req.includes('eat something') || req.includes('eat food') || req.includes('you hungry')) return true
+    if (req.includes('wake up') || req.includes('get up')) return true
+    if (req.includes('check the chest') || req.includes('look in the chest')) return true
+    return false
+  }
   // v10.5.1 COMMAND QUEUE FIX (Tash's whole-log proof: a 60s goto made
   // every later command arrive 27-94s late, in one stale burst, and
   // "stop" arrived after the command it was meant to stop). The old
@@ -858,18 +911,29 @@ function createBot () {
     // something was running, say what is being dropped.
     const lowerCmd = msg.toLowerCase()
     const addressed = lowerCmd.includes('segs')
-    // v10.6: whole-word matching (the old substring check made
-    // "this is wheat chest" a "real command" via 'eat', cancelling
-    // a running goto for a teach). Only movement/work words bump.
-    const wordsQ = cleanQ.split(/\s+/)
-    const isRealCmd = addressed && wordsQ.some(w => ACK_MOVE_WORDS.includes(w) || ACK_WORK_WORDS.includes(w))
+    // v10.7.1: ack/bump only when the command ROUTES (see
+    // commandRoutes). The old word-list check acked unrouted
+    // commands too, so they got ack + fallback (live 03:18). An
+    // unrouted addressed command gets NO ack and NO bump —
+    // handleTalk answers it exactly once, and a running job is
+    // not cancelled by a sentence Segs did not understand. The
+    // probe request is normalized exactly like handleTalk's req.
+    const probeReq = lowerCmd
+      .replace(/\bhey segs\b/g, ' ')
+      .replace(/\bhi segs\b/g, ' ')
+      .replace(/\bsegs\b/g, ' ')
+      .replace(/\bplease\b/g, ' ')
+      .replace(/[?.!,]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    const isRealCmd = addressed && commandRoutes(probeReq)
     if (isOwner(username) && isRealCmd) {
       const prevDesc = currentCmdDesc
       const wasBusy = prevDesc && prevDesc !== 'stop'
       bumpCmd(cleanQ.slice(0, 40))
       if (wasBusy) { say(`dropping ${prevDesc}, doing ${cleanQ.slice(0, 40)}`); lastAckAt = Date.now() }
       else ackCommand(username, msg)
-    } else {
+    } else if (!isOwner(username) || !addressed) {
       ackCommand(username, msg)
     }
     queueTalk(username, msg)
@@ -2738,7 +2802,11 @@ function createBot () {
     if (isOwner(username) && ((req.startsWith('this is') && (req.includes('storage unit') || req.includes('storage system'))) || req === 'this is the storage' || req === 'this is storage' || req.includes('scan the storage') || req.includes('scan storage') || req.includes('learn the storage') || req.includes('map the storage') || req.includes('see this storage') || req.includes('see the storage'))) {
       await scanStorageUnit(); return
     }
-    if (isOwner(username) && req.includes('build site')) {
+    // v10.7.1: "scan/align the build site" must NOT mark the site —
+    // it routes to the alignment scan below. The old bare
+    // includes('build site') swallowed those phrasings and marked
+    // a wrong origin at Segs' feet instead of scanning.
+    if (isOwner(username) && req.includes('build site') && !req.includes('scan') && !req.includes('align')) {
       const here = [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)]
       brain.buildSite = { pos: here, setAt: Date.now() }
       saveBrain()
@@ -3351,13 +3419,31 @@ function createBot () {
       return
     }
 
+    // v10.7.1: "Segs use that" — accept the last alignment guess.
+    if (req === 'use that' || req === 'use that alignment' || req.includes('use that guess')) {
+      acceptAlignmentGuess()
+      return
+    }
+
+    // v10.7.1 PIN-AND-VERIFY: "Segs the build is at <x> <y> <z>
+    // rotated <deg>" (+ optional "mirrored"). Before the scan
+    // handler — the pin text must not fall through to it.
+    if (req.includes('the build is at')) {
+      await pinBuild(req)
+      return
+    }
+
     // v10.7 BUILDER: "Segs scan the build" / "Segs align the build" —
     // vote-based alignment scan against the schematic's bottom layers.
     // Placed before the build handler (and before the generic status
     // handler below, which swallows anything containing 'status').
-    if (req.includes('scan the build') || req.includes('align the build') || req.includes('scan build') || req.includes('align build')) {
-      const m = req.match(/(?:scan|align)(?: the)? build\s+([a-z0-9_-]+)/)
-      const name = m ? m[1] : (brain.buildAlignment ? brain.buildAlignment.name : 'dom2')
+    // v10.7.1: "scan this build" fell through to the fallback live
+    // (ack + "didnt get that") — route this/that/site variants too.
+    if (req.includes('scan the build') || req.includes('align the build') || req.includes('scan build') || req.includes('align build') || req.includes('scan this build') || req.includes('align this build') || req.includes('scan that build') || req.includes('align that build') || req.includes('scan the build site') || req.includes('align the build site') || req.includes('scan build site') || req.includes('align build site') || req.includes('scan this build site') || req.includes('align this build site')) {
+      const m = req.match(/(?:scan|align)(?: the| this| that)? build\s+([a-z0-9_-]+)/)
+      // A trailing word is only a schematic name if that schematic
+      // exists — "scan the build site" must not look for "site".
+      const name = (m && schematicExists(m[1])) ? m[1] : (brain.buildAlignment ? brain.buildAlignment.name : 'dom2')
       await scanBuild(name)
       return
     }
@@ -5458,11 +5544,100 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
   // the headstone sign (the chest sits next to it), and if NOTHING is
   // found, LOG every solid block within 5 of the death spot — the
   // next real-server failure must be diagnosable, not "cant see it".
+  // v10.7.1 GRAVE FINDING (live 2026-11-17 03:27-03:34): Segs died
+  // at (-680,63,5678), reached the spot twice, and reported "NO grave
+  // block" both times while standing next to it. Tash's F3 screenshot
+  // proved the shape: the grave IS a block (ordinary-looking full
+  // cube, dark dirt-like texture) with a HOLOGRAM entity above it
+  // carrying "Segs | 2m34s". The old finder scanned blocks only for
+  // chest-like names, so a dirt-like grave block was invisible, and
+  // the diagnostic cap hid the death spot itself. New order:
+  // hologram-anchored block FIRST, then chest-like, then wall-head
+  // variants, then the headstone sign. NO block name is hardcoded
+  // for the hologram path — the block below the hologram IS the
+  // grave, whatever its name.
+  function entityCustomNameText (e) {
+    try {
+      if (e && typeof e.getCustomName === 'function') {
+        const cm = e.getCustomName()
+        if (cm) {
+          if (typeof cm === 'string') return cm
+          if (typeof cm.toString === 'function') { const s = cm.toString(); if (s) return s }
+          if (typeof cm.toMotd === 'function') return cm.toMotd()
+        }
+      }
+      const raw = e && e.metadata && e.metadata[2]
+      if (typeof raw === 'string') return raw
+      if (raw && typeof raw === 'object') { try { return JSON.stringify(raw) } catch (e2) { return '' } }
+    } catch (e) {}
+    return ''
+  }
+  const HOLOGRAM_ENTITY_NAMES = new Set(['armor_stand', 'text_display', 'item_display', 'block_display', 'interaction'])
+  // Score an entity as a grave hologram: 3 = named (bot name, timer
+  // like "5m12s", or the word grave), 1 = bare marker-entity type,
+  // 0 = not a hologram candidate.
+  function graveHologramScore (e, nameText) {
+    const lower = (nameText || '').toLowerCase()
+    if (lower.includes(BOT_NAME.toLowerCase()) || /(\d+\s*m\s*\d+\s*s|\d+:\d{2})/.test(lower) || lower.includes('grave')) return 3
+    if (HOLOGRAM_ENTITY_NAMES.has(e.name)) return 1
+    return 0
+  }
+  function isSolidGraveBlock (b) {
+    if (!b) return false
+    if (b.boundingBox) return b.boundingBox === 'block'
+    return b.name !== 'air' && b.name !== 'water' && b.name !== 'cave_air' && b.name !== 'void_air'
+  }
+  function findGraveHologram (deathPos) {
+    try {
+      const Vec3 = require('vec3').Vec3
+      const center = new Vec3(deathPos[0] + 0.5, deathPos[1] + 0.5, deathPos[2] + 0.5)
+      let best = null
+      for (const e of Object.values(bot.entities || {})) {
+        if (!e || !e.position || e === bot.entity) continue
+        const d = e.position.distanceTo(center)
+        if (d > 8) continue
+        const nameText = entityCustomNameText(e)
+        const score = graveHologramScore(e, nameText)
+        if (score <= 0) continue
+        if (!best || score > best.score || (score === best.score && d < best.d)) best = { entity: e, nameText, score, d }
+      }
+      return best
+    } catch (e) { return null }
+  }
+  // The grave block sits directly below the hologram. The float
+  // height is unknown (stand feet vs marker height), so scan down
+  // 1..4 from the hologram's feet column, then a 3x3 ring at 1..2
+  // below. First solid block wins.
+  function blockBelowHologram (ent) {
+    try {
+      const Vec3 = require('vec3').Vec3
+      const bx = Math.floor(ent.position.x)
+      const by = Math.floor(ent.position.y)
+      const bz = Math.floor(ent.position.z)
+      for (let dy = 1; dy <= 4; dy++) {
+        const b = bot.blockAt(new Vec3(bx, by - dy, bz))
+        if (isSolidGraveBlock(b)) return { block: b, dy, ring: false }
+      }
+      for (let dy = 1; dy <= 2; dy++) {
+        for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+          if (dx === 0 && dz === 0) continue
+          const b = bot.blockAt(new Vec3(bx + dx, by - dy, bz + dz))
+          if (isSolidGraveBlock(b)) return { block: b, dy, ring: true }
+        }
+      }
+      return null
+    } catch (e) { return null }
+  }
   function findGraveBlock (deathPos) {
     try {
       const Vec3 = require('vec3').Vec3
       const graveNames = new Set(['chest', 'trapped_chest', 'player_head', 'barrel', 'ender_chest'])
-      const isChestLike = b => b && (graveNames.has(b.name) || b.name.endsWith('_shulker_box'))
+      // v10.7.1: wall-head variants — the old Set.has('player_head')
+      // never matched player_wall_head, so a headstone head was
+      // invisible. Any *_head / *_wall_head / *_skull / *_wall_skull
+      // counts (those suffixes are only ever heads/skulls).
+      const isGraveHead = b => b && (b.name.endsWith('_head') || b.name.endsWith('_wall_head') || b.name.endsWith('_skull') || b.name.endsWith('_wall_skull'))
+      const isChestLike = b => b && (graveNames.has(b.name) || b.name.endsWith('_shulker_box') || isGraveHead(b))
       const isSign = b => b && (b.name.endsWith('_sign') || b.name.endsWith('_wall_sign'))
       const cx = deathPos[0], cy = deathPos[1], cz = deathPos[2]
       let best = null, bestD = 1e9
@@ -5484,17 +5659,70 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
           if (isChestLike(n)) { logEvent('grave', 'grave block found next to sign: ' + n.name + ' at ' + n.position); return n }
         }
       }
-      // Diagnostic: every solid block within 5 of the death spot, so
-      // the next failure shows exactly what IS there (chest? dirt?
-      // nothing but water?). Cap at 40 entries.
+      return null
+    } catch (e) { return null }
+  }
+  // Diagnostics for a failed find: the old version capped at 40
+  // entries in dx order, so it only ever showed the westernmost
+  // blocks and NEVER the death spot. Now: nearest-first (the death
+  // spot itself first), cap 60, PLUS every entity within 8 with its
+  // type + custom name + position, PLUS the block below each
+  // hologram candidate. The next live failure must show exactly
+  // what the grave is.
+  function logGraveDiagnostics (deathPos) {
+    try {
+      const Vec3 = require('vec3').Vec3
+      const cx = deathPos[0], cy = deathPos[1], cz = deathPos[2]
+      const center = new Vec3(cx + 0.5, cy + 0.5, cz + 0.5)
       const seen = []
       for (let dx = -5; dx <= 5; dx++) for (let dy = -3; dy <= 3; dy++) for (let dz = -5; dz <= 5; dz++) {
         const b = bot.blockAt(new Vec3(cx + dx, cy + dy, cz + dz))
-        if (b && b.name !== 'air' && b.name !== 'water' && b.name !== 'cave_air') seen.push(b.name + '@' + (cx + dx) + ',' + (cy + dy) + ',' + (cz + dz))
+        if (b && b.name !== 'air' && b.name !== 'water' && b.name !== 'cave_air' && b.name !== 'void_air') {
+          seen.push({ d: new Vec3(cx + dx + 0.5, cy + dy + 0.5, cz + dz + 0.5).distanceTo(center), s: b.name + '@' + (cx + dx) + ',' + (cy + dy) + ',' + (cz + dz) })
+        }
       }
-      logEvent('grave', 'NO grave block near ' + deathPos.join(',') + ' — solid blocks within 5: ' + (seen.slice(0, 40).join(' | ') || 'none (all air/water)'))
-      return null
-    } catch (e) { return null }
+      seen.sort((a, b) => a.d - b.d)
+      logEvent('grave', 'NO grave near ' + deathPos.join(',') + ' — nearest solid blocks: ' + (seen.slice(0, 60).map(x => x.s).join(' | ') || 'none (all air/water)'))
+      const ents = []
+      for (const e of Object.values(bot.entities || {})) {
+        if (!e || !e.position || e === bot.entity) continue
+        const d = e.position.distanceTo(center)
+        if (d > 8) continue
+        const nameText = entityCustomNameText(e)
+        let below = ''
+        if (graveHologramScore(e, nameText) > 0) {
+          const bb = blockBelowHologram(e)
+          below = bb ? ' below=' + bb.block.name + '@' + bb.block.position + ' (dy' + bb.dy + (bb.ring ? ' ring' : '') + ')' : ' below=none'
+        }
+        ents.push((e.name || e.type || '?') + ' "' + nameText + '" @' + e.position.toString() + ' (' + d.toFixed(1) + ')' + below)
+      }
+      logEvent('grave', 'entities within 8: ' + (ents.join(' | ') || 'none'))
+    } catch (e) { logEvent('grave', 'diagnostics failed: ' + e.message) }
+  }
+  // Orchestrated grave find: hologram-anchored block first (the
+  // Youniga shape), then chest-like / wall-head / sign fallbacks.
+  // Returns a BLOCK (whatever its name) or null.
+  function findGrave (deathPos) {
+    const holo = findGraveHologram(deathPos)
+    if (holo) {
+      const bb = blockBelowHologram(holo.entity)
+      // A NAMED hologram (bot name / timer / "grave") IS the grave
+      // marker — trust it at any distance within the scan. A BARE
+      // marker entity (score 1) only anchors when its block is
+      // within 3 of the death spot, or a random decorative stand
+      // would make Segs click the floor forever instead of running
+      // the chest-like fallback.
+      const nearDeath = bb && (Math.abs(bb.block.position.x - deathPos[0]) + Math.abs(bb.block.position.y - deathPos[1]) + Math.abs(bb.block.position.z - deathPos[2]) <= 3)
+      if (bb && (holo.score >= 3 || nearDeath)) {
+        logEvent('grave', 'grave block found via hologram: ' + bb.block.name + ' at ' + bb.block.position + ' (hologram ' + (holo.entity.name || '?') + ' "' + holo.nameText + '" score ' + holo.score + ', block ' + bb.dy + ' below' + (bb.ring ? ', ring' : '') + ')')
+        return bb.block
+      }
+      logEvent('grave', 'hologram found (' + (holo.entity.name || '?') + ' "' + holo.nameText + '") but no usable block below it — falling back to block scan')
+    }
+    const block = findGraveBlock(deathPos)
+    if (block) return block
+    logGraveDiagnostics(deathPos)
+    return null
   }
   // v10.5.1 GRAVE FIX: a failed recovery must NOT mark the grave
   // recovered — the old code did that on "cant reach" and "cant see
@@ -5518,6 +5746,11 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     if (!g) { if (manual) say('i dont have a grave to go back to'); return false }
     const ageMin = (Date.now() - g.at) / 60000
     if (ageMin > 10) { if (manual) say('that grave is gone by now, graves only last 10 minutes'); brain.lastGrave.recovered = true; saveBrain(); return false }
+    // v10.7.1: recompute the timer at EACH message send — the old
+    // code computed ageMin once at function start, so a message
+    // sent after a 90s walk quoted a stale "minutes left".
+    const minsLeft = () => Math.max(0, Math.round(10 - (Date.now() - g.at) / 60000))
+    const ageNow = () => Math.round((Date.now() - g.at) / 60000)
     if (g.recovered && !manual) return false
     if (g.dimension && bot.game && bot.game.dimension && g.dimension !== bot.game.dimension) {
       say(`i died in ${g.dimension.replace('minecraft:', '')} at ${g.pos.join(', ')} — i cant walk there from here`)
@@ -5533,16 +5766,16 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     if (pathMovements) pathMovements.canDig = false
     try {
       say(`i died at ${g.pos.join(', ')} — going back for my stuff`)
-      logEvent('grave', `recovering grave at ${g.pos.join(', ')}, died ${Math.round(ageMin)} min ago, ${Math.max(0, Math.round(10 - ageMin))} min left`)
+      logEvent('grave', `recovering grave at ${g.pos.join(', ')}, died ${ageNow()} min ago, ${minsLeft()} min left`)
       // v10.5.3 (regression-127): the grave may be UNDERWATER — pass
       // allowWater so the A* can route through the river to it (the
       // run-148 water prevention would otherwise refuse and the grave
       // would expire with Segs' stuff in it). Every other goto keeps
       // the prevention.
       const arrived = await gotoPos(new Vec3(g.pos[0], g.pos[1], g.pos[2]), { allowWater: true })
-      if (!arrived) { say(`i cant reach my grave at ${g.pos.join(', ')} — my stuff is there, ${Math.max(0, Math.round(10 - ageMin))} minutes left on it, ill try again in a minute`); scheduleGraveRetry(); return false }
-      const grave = findGraveBlock(g.pos)
-      if (!grave) { say(`im at the spot where i died (${g.pos.join(', ')}) but i cant see my grave — it should be right here, ${Math.max(0, Math.round(10 - ageMin))} minutes left on it, ill try again in a minute`); scheduleGraveRetry(); return false }
+      if (!arrived) { say(`i cant reach my grave at ${g.pos.join(', ')} — my stuff is there, ${minsLeft()} minutes left on it, ill try again in a minute`); scheduleGraveRetry(); return false }
+      const grave = findGrave(g.pos)
+      if (!grave) { say(`im at the spot where i died (${g.pos.join(', ')}) but i cant see my grave — it should be right here, ${minsLeft()} minutes left on it, ill try again in a minute`); scheduleGraveRetry(); return false }
       // Take everything out of the grave. PRIMARY (Tash's way): the
       // plugin's own shortcut — sneak + right-click the grave block
       // claims everything. Do that FIRST, then check the inventory:
@@ -5597,7 +5830,7 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         logEvent('grave', `grave recovered at ${g.pos.join(', ')}, took ${took} items, inventory ${beforeCount} -> ${afterCount}`)
         return true
       }
-      say(`i found my grave at ${grave.position} but i couldnt get my stuff out — ${Math.max(0, Math.round(10 - ageMin))} minutes left on it, ill try again in a minute`)
+      say(`i found my grave at ${grave.position} but i couldnt get my stuff out — ${minsLeft()} minutes left on it, ill try again in a minute`)
       logEvent('grave', `grave take-all failed at ${grave.position}, took 0, retrying in 60s`)
       scheduleGraveRetry()
       return false
@@ -6693,6 +6926,7 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     let measuring = true // measure speed until Segs first catches up
     let teleportedFar = false
     let lastOwnerPos = null
+    let ownerStillAnchor = null, ownerStillAt = 0 // v10.7.1: close-range gate
     try {
     while (following && bot && bot.entity) {
       const ownerEnt = resolveOwnerEntity()
@@ -6714,6 +6948,15 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         logEvent('follow', 'owner teleported ~' + Math.round(ownerEnt.position.distanceTo(lastOwnerPos)) + ' blocks away')
       }
       lastOwnerPos = ownerEnt.position.clone()
+      // v10.7.1 CLOSE-RANGE GATE (live 03:19): Segs declared stuck
+      // and ran step-climb/door assists repeatedly while 2.4 blocks
+      // from a STATIONARY owner. When the owner has not moved >=1
+      // block in 3s and Segs is within 3 blocks, there is nothing
+      // to be stuck on — the stuck detectors below are gated off
+      // entirely (their windows reset instead of firing).
+      if (!ownerStillAnchor || ownerEnt.position.distanceTo(ownerStillAnchor) >= 1.0) { ownerStillAnchor = ownerEnt.position.clone(); ownerStillAt = Date.now() }
+      const ownerStill = Date.now() - ownerStillAt > 3000
+      const stuckGated = dist <= 3 && ownerStill
       if (dist > 2) {
         // re-arm the speed measurement when the owner walks away again
         if (!measuring && dist > 5) { measuring = true; followStartPos = bot.entity.position.clone(); followStartAt = Date.now() }
@@ -6748,6 +6991,7 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
           const np = bot.entity.position
           if (!progPos) { progPos = np.clone(); progAt = Date.now() }
           else if (np.distanceTo(progPos) >= 1.0) { progPos = np.clone(); progAt = Date.now() }
+          else if (stuckGated) { progPos = np.clone(); progAt = Date.now() } // v10.7.1: close-range gate — reset, never escalate
           else if (Date.now() - progAt > 10000) {
             logEvent('follow', `net-progress stuck: under 1 block net in ${((Date.now() - progAt) / 1000).toFixed(0)}s while ${dist.toFixed(1)} from owner — forcing re-path + assist`)
             lastGoalOwnerPos = null
@@ -6787,6 +7031,10 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         // through it), then re-set the follow goal.
         const nowPos = bot.entity.position
         if (lastPos && nowPos.distanceTo(lastPos) < 0.5) {
+          // v10.7.1: close-range gate — while gated, the stuck
+          // clock resets every tick, so the 2s/6s/15s branches
+          // below can never fire and no stale time accumulates.
+          if (stuckGated) { lastMove = Date.now() }
           const stuckMs = Date.now() - lastMove
           if (stuckMs > 2000 && stuckMs < 6000) {
             // v10.5.1 (item 4): separate throttles for the jump pulse
@@ -7969,6 +8217,45 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
   function rotatedDims (schem, rot) {
     return (rot & 1) ? [schem.length, schem.height, schem.width] : [schem.width, schem.height, schem.length]
   }
+
+  // v10.7.1 MIRROR (BuildPrint `flipped`): FootprintTransform.apply
+  // mirrors the Z coordinate BEFORE rotation: mz = length-1-z, and
+  // the state transform is mirror-then-rotate (PlacementTransform.turn:
+  // state.mirror(LEFT_RIGHT).rotate(vRot)). Segs' rotateXZ already
+  // matches BuildPrint's rotations exactly (CW_90 == rot 1, verified
+  // against the decompile), so the mirror is the only missing piece.
+  function mirrorXZ (x, z, W, L) { return [x, L - 1 - z] }
+  function transformXZ (x, z, rot, mirrored, W, L) {
+    if (mirrored) { const m = mirrorXZ(x, z, W, L); x = m[0]; z = m[1] }
+    return rotateXZ(x, z, rot, W, L)
+  }
+  // Mirror a blockstate across the Z axis (the same flip as mirrorXZ):
+  // north<->south facings and connections swap, rotation_16 mirrors
+  // (r -> 16-r), door hinge swaps. Axis/half/face are unchanged by a
+  // horizontal mirror; stair shape is server-computed, carried through.
+  function mirrorState (stateStr) {
+    const { name, props } = parseBlockState(stateStr)
+    const out = { ...props }
+    const flipNS = (f) => f === 'north' ? 'south' : f === 'south' ? 'north' : f
+    for (const k of ['facing', 'horizontal_facing']) if (out[k]) out[k] = flipNS(out[k])
+    if (out.rotation !== undefined) out.rotation = String((16 - parseInt(out.rotation, 10)) % 16)
+    if (out.north !== undefined || out.south !== undefined) { const n = out.north; out.north = out.south; out.south = n }
+    if (out.hinge) out.hinge = out.hinge === 'left' ? 'right' : 'left'
+    return stateToString(name, out)
+  }
+  function transformState (stateStr, rot, mirrored) {
+    return rotateState(mirrored ? mirrorState(stateStr) : stateStr, rot)
+  }
+
+  // v10.7.1 TERRAIN set: natural blocks that can intrude into a
+  // schematic volume (Tash buried dom2's grass/dirt layer 1, so the
+  // ground itself sits inside the footprint). A mismatch where BOTH
+  // the world block and the schematic cell are natural is terrain,
+  // not evidence against the alignment — it is excluded from the
+  // tolerant ratio (see scoreAlignment). A natural world block where
+  // the schematic wants a BUILT block still counts as wrong.
+  const TERRAIN_NAMES = new Set(['grass_block', 'dirt', 'coarse_dirt', 'podzol', 'mycelium', 'mud', 'muddy_mangrove_roots', 'rooted_dirt', 'dirt_path', 'farmland', 'stone', 'deepslate', 'granite', 'diorite', 'andesite', 'tuff', 'calcite', 'gravel', 'sand', 'red_sand', 'clay', 'sandstone', 'red_sandstone', 'snow_block', 'ice', 'packed_ice', 'blue_ice', 'coal_ore', 'iron_ore', 'copper_ore', 'gold_ore', 'redstone_ore', 'lapis_ore', 'diamond_ore', 'emerald_ore', 'deepslate_coal_ore', 'deepslate_iron_ore', 'deepslate_copper_ore', 'deepslate_gold_ore', 'deepslate_redstone_ore', 'deepslate_lapis_ore', 'deepslate_diamond_ore', 'deepslate_emerald_ore', 'netherrack', 'soul_sand', 'soul_soil', 'basalt', 'blackstone', 'end_stone', 'obsidian', 'bedrock', 'moss_block', 'dripstone_block', 'water', 'lava', 'snow', 'powder_snow'])
+  function isTerrainName (name) { return TERRAIN_NAMES.has(name) }
 
   // ---------- schematic loading (v2 compact + v1 legacy) ----------
   function loadSchematic (name) {
@@ -9174,8 +9461,9 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       // Resolve origin + rotation: alignment scan wins, else marked site.
       let origin = null
       let rotation = 0
+      let mirrored = false
       const al = brain.buildAlignment
-      if (al && al.name === schem.name && Array.isArray(al.origin)) { origin = al.origin.slice(); rotation = al.rotation || 0 }
+      if (al && al.name === schem.name && Array.isArray(al.origin)) { origin = al.origin.slice(); rotation = al.rotation || 0; mirrored = !!al.mirrored }
       else if (brain.buildSite && Array.isArray(brain.buildSite.pos)) { origin = brain.buildSite.pos.slice(); rotation = 0 }
       if (!origin) {
         say('i dont know where to build ' + schem.name + ' — stand at the build and say: segs scan the build, or mark a site: segs this is the build site')
@@ -9185,8 +9473,8 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       // Rotate every cell into world coords + rotated blockstates.
       const worldCells = []
       for (const c of schem.cells) {
-        const [rx, rz] = rotateXZ(c.x, c.z, rotation, schem.width, schem.length)
-        const state = rotateState(c.state, rotation)
+        const [rx, rz] = transformXZ(c.x, c.z, rotation, mirrored, schem.width, schem.length)
+        const state = transformState(c.state, rotation, mirrored)
         const p = parseBlockState(state)
         worldCells.push({ x: c.x, y: c.y, z: c.z, wx: origin[0] + rx, wy: origin[1] + c.y, wz: origin[2] + rz, state, name: p.name, props: p.props })
       }
@@ -9382,7 +9670,14 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
   }
 
   // ---------- alignment scan (vote-based, BuildPrint AlignmentVote-style) ----------
-  function scoreAlignment (schem, origin, rot, hitMap) {
+  // v10.7.1: terrain-tolerant scoring. The live scan failed at 0.56
+  // because dom2's buried grass/dirt layer sits under terrain: every
+  // terrain-vs-ground cell counted as WRONG and dragged the TRUE
+  // alignment under the 0.6 bar. Now both ratios are computed: the
+  // strict ratio (old behaviour) and the tolerant ratio (natural-vs-
+  // natural mismatches excluded). The bar uses the tolerant ratio,
+  // and distinctive matches (non-terrain blocks) must carry it.
+  function scoreAlignment (schem, origin, rot, mirrored, hitMap) {
     const bottom = schem.cells.filter(c => c.y <= 1 && !isSkippedBlock(c.name))
     const rest = schem.cells.filter(c => c.y > 1 && !isSkippedBlock(c.name))
     const sample = []
@@ -9392,8 +9687,11 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     for (let i = 0; i < rest.length && sample.length < 400; i += rStride) sample.push(rest[i])
     let matched = 0
     let wrong = 0
+    let wrongTolerant = 0
+    let matchedDistinctive = 0
+    let terrainIgnored = 0
     for (const c of sample) {
-      const [rx, rz] = rotateXZ(c.x, c.z, rot, schem.width, schem.length)
+      const [rx, rz] = transformXZ(c.x, c.z, rot, mirrored, schem.width, schem.length)
       const wx = origin[0] + rx; const wy = origin[1] + c.y; const wz = origin[2] + rz
       const key = wx + ',' + wy + ',' + wz
       let wname = hitMap.get(key)
@@ -9403,16 +9701,66 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         wname = b.name
       }
       if (wname === 'air') continue // not built yet — neutral, not wrong
-      if (wname === c.name) matched++
-      else wrong++
+      if (wname === c.name) {
+        matched++
+        if (!isTerrainName(c.name)) matchedDistinctive++
+      } else {
+        wrong++
+        // Terrain intrusion: both sides natural = the ground itself,
+        // not a contradiction. Excluded from the tolerant ratio.
+        if (isTerrainName(wname) && isTerrainName(c.name)) terrainIgnored++
+        else wrongTolerant++
+      }
     }
-    return { matched, wrong, ratio: (matched + wrong) ? matched / (matched + wrong) : 0 }
+    const ratio = (matched + wrong) ? matched / (matched + wrong) : 0
+    const ratioTolerant = (matched + wrongTolerant) ? matched / (matched + wrongTolerant) : 0
+    return { matched, wrong, wrongTolerant, ratio, ratioTolerant, matchedDistinctive, terrainIgnored }
   }
 
-  async function scanBuild (name) {
-    const schem = loadSchematic(name)
-    if (!schem) { say("i dont have a schematic called " + name); return }
-    say('scanning for ' + schem.name + ' — matching the placed blocks against the bottom layers...')
+  // The confidence bar, shared by the scan and the pin command.
+  // v10.7.1 run 196 phase 2 proved the ratio alone is not enough:
+  // a WRONG origin overlapping the true build's corner scored 85%
+  // (11 matched, 2 mismatched) because the other 53 sampled cells
+  // were air (neutral). A small overlapping corner must never pass
+  // confidently. So the bar also demands a substantial sample:
+  // >=25 non-air sampled cells AND >=8 distinctive matches. The
+  // live dom2 case clears it easily (122 matched, 212 non-air
+  // sampled at 03:19); a half-built small schematic falls back to
+  // the honest best-guess + "segs use that" path.
+  function alignmentPasses (sc) {
+    return sc.matched >= 8 && sc.matchedDistinctive >= 8 && (sc.matched + sc.wrong) >= 25 && sc.ratioTolerant >= 0.6
+  }
+
+  // Candidate selection, shared by scan + pin: a candidate that
+  // PASSES the bar always beats one that does not, however high
+  // the failing candidate's ratio (a small-sample fluke at 85%
+  // must not crowd out the true alignment at 80% with 200 cells).
+  // Within a pool: higher tolerant ratio, then more matched, then
+  // the optional tie-break (the pin prefers the stated rotation).
+  function selectAlignment (cands, tieBreak) {
+    if (!cands.length) return null
+    const passing = cands.filter(alignmentPasses)
+    const pool = passing.length ? passing : cands
+    let best = null
+    for (const c of pool) {
+      if (!best || c.ratioTolerant > best.ratioTolerant || (c.ratioTolerant === best.ratioTolerant && c.matched > best.matched) || (c.ratioTolerant === best.ratioTolerant && c.matched === best.matched && tieBreak && tieBreak(c, best) > 0)) best = c
+    }
+    return best
+  }
+
+  function saveAlignment (schem, origin, rot, mirrored, sc) {
+    brain.buildAlignment = { name: schem.name, origin: origin.slice(), rotation: rot, mirrored: !!mirrored, confidence: sc.ratioTolerant, ratioStrict: sc.ratio, matched: sc.matched, wrong: sc.wrong, wrongTolerant: sc.wrongTolerant, matchedDistinctive: sc.matchedDistinctive, terrainIgnored: sc.terrainIgnored, at: Date.now() }
+    saveBrain()
+    return brain.buildAlignment
+  }
+
+  function alignmentSummary (al) {
+    return al.origin.join(', ') + ', rotation ' + (al.rotation * 90) + '°' + (al.mirrored ? ', mirrored' : '') + ', confidence ' + Math.round((al.confidence || 0) * 100) + '% (' + al.matched + ' matched, ' + al.wrong + ' mismatched' + (al.terrainIgnored ? ', ' + al.terrainIgnored + ' terrain ignored' : '') + ')'
+  }
+
+  // Shared hit-gathering for the scan and the pin command: every
+  // non-air block Segs can see within range of the site.
+  function gatherBuildHits (schem) {
     const R = Math.min(160, Math.max(schem.width, schem.length) + 12)
     let found = []
     try {
@@ -9427,6 +9775,14 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
         hitMap.set(p.x + ',' + p.y + ',' + p.z, b.name)
       }
     }
+    return { hits, hitMap }
+  }
+
+  async function scanBuild (name) {
+    const schem = loadSchematic(name)
+    if (!schem) { say("i dont have a schematic called " + name); return }
+    say('scanning for ' + schem.name + ' — matching the placed blocks against the bottom layers...')
+    const { hits, hitMap } = gatherBuildHits(schem)
     if (hits.length < 5) {
       say('i cant see enough placed blocks nearby — stand next to the built part and try again')
       return
@@ -9444,44 +9800,136 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
       if (!hitsByName[h.name]) hitsByName[h.name] = []
       hitsByName[h.name].push(h)
     }
-    // Vote origins per rotation (stride-capped pair sampling).
+    // Vote origins per transform — ALL 8 (4 rotations x mirror),
+    // like BuildPrint's AlignmentVote.ALL_ORIENTATIONS. v10.7 only
+    // tried 4 rotations, so a mirrored placement could never win.
     const candidates = []
-    for (let rot = 0; rot < 4; rot++) {
-      const votes = new Map()
-      for (const [nm, anchors] of Object.entries(anchorsByName)) {
-        const hs = hitsByName[nm]
-        if (!hs) continue
-        const stride = Math.max(1, Math.floor(anchors.length * hs.length / 4000) + 1)
-        for (let a = 0; a < anchors.length; a += stride) {
-          const an = anchors[a]
-          const [rx, rz] = rotateXZ(an.x, an.z, rot, schem.width, schem.length)
-          for (const h of hs) {
-            const key = (h.x - rx) + ',' + (h.y - an.y) + ',' + (h.z - rz)
-            votes.set(key, (votes.get(key) || 0) + 1)
+    for (const mirrored of [false, true]) {
+      for (let rot = 0; rot < 4; rot++) {
+        const votes = new Map()
+        for (const [nm, anchors] of Object.entries(anchorsByName)) {
+          const hs = hitsByName[nm]
+          if (!hs) continue
+          const stride = Math.max(1, Math.floor(anchors.length * hs.length / 4000) + 1)
+          for (let a = 0; a < anchors.length; a += stride) {
+            const an = anchors[a]
+            const [rx, rz] = transformXZ(an.x, an.z, rot, mirrored, schem.width, schem.length)
+            for (const h of hs) {
+              const key = (h.x - rx) + ',' + (h.y - an.y) + ',' + (h.z - rz)
+              votes.set(key, (votes.get(key) || 0) + 1)
+            }
           }
         }
+        const top = [...votes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+        for (const [key, v] of top) candidates.push({ origin: key.split(',').map(Number), rotation: rot, mirrored, votes: v })
       }
-      const top = [...votes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
-      for (const [key, v] of top) candidates.push({ origin: key.split(',').map(Number), rotation: rot, votes: v })
     }
     if (!candidates.length) {
       say('couldnt find any ' + schem.name + ' blocks nearby — stand closer to the built part and try again')
       return
     }
-    let best = null
+    const scored = []
     for (const cand of candidates) {
-      const sc = scoreAlignment(schem, cand.origin, cand.rotation, hitMap)
-      if (!best || sc.ratio > best.ratio || (sc.ratio === best.ratio && sc.matched > best.matched)) best = { ...cand, ...sc }
+      const sc = scoreAlignment(schem, cand.origin, cand.rotation, cand.mirrored, hitMap)
+      scored.push({ ...cand, ...sc })
     }
-    if (!best || best.matched < 8 || best.ratio < 0.6) {
-      say('couldnt align ' + schem.name + ' confidently — best match was ' + (best ? Math.round(best.ratio * 100) + '% (' + best.matched + ' blocks)' : 'nothing') + '. stand closer to the built part and try again')
-      logEvent('align', schem.name + ': no confident alignment (best ' + (best ? best.ratio.toFixed(2) + ' matched ' + best.matched : 'none') + ')')
+    const best = selectAlignment(scored, null)
+    if (!best || !alignmentPasses(best)) {
+      // v10.7.1 diagnosability: the old failure line logged only the
+      // ratio — the best candidate's origin/rotation/votes were lost,
+      // so a miss could not be diagnosed. Log everything, keep the
+      // best guess, and offer it to Tash in chat.
+      if (best) {
+        brain.lastAlignmentGuess = { name: schem.name, origin: best.origin, rotation: best.rotation, mirrored: best.mirrored, votes: best.votes, ratioTolerant: best.ratioTolerant, ratioStrict: best.ratio, matched: best.matched, wrong: best.wrong, wrongTolerant: best.wrongTolerant, matchedDistinctive: best.matchedDistinctive, terrainIgnored: best.terrainIgnored, at: Date.now() }
+        saveBrain()
+        logEvent('align', schem.name + ': no confident alignment — best origin ' + best.origin.join(',') + ' rot ' + best.rotation + ' mirrored ' + best.mirrored + ' votes ' + best.votes + ' matched ' + best.matched + ' distinctive ' + best.matchedDistinctive + ' wrong ' + best.wrong + ' wrongTolerant ' + best.wrongTolerant + ' terrainIgnored ' + best.terrainIgnored + ' ratioTolerant ' + best.ratioTolerant.toFixed(2) + ' ratioStrict ' + best.ratio.toFixed(2))
+        say('couldnt align ' + schem.name + ' confidently — best guess is ' + best.origin.join(', ') + ', rotation ' + (best.rotation * 90) + '°' + (best.mirrored ? ', mirrored' : '') + ' at ' + Math.round(best.ratioTolerant * 100) + '% (' + best.matched + ' matched, ' + best.wrongTolerant + ' mismatched). say: segs use that, to accept it')
+      } else {
+        logEvent('align', schem.name + ': no candidates scored')
+        say('couldnt align ' + schem.name + ' — no match at all. stand closer to the built part and try again')
+      }
       return
     }
-    brain.buildAlignment = { name: schem.name, origin: best.origin, rotation: best.rotation, confidence: best.ratio, matched: best.matched, wrong: best.wrong, at: Date.now() }
+    const al = saveAlignment(schem, best.origin, best.rotation, best.mirrored, best)
+    say('found ' + schem.name + ' at ' + alignmentSummary(al) + '. say: segs build ' + schem.name + ' here')
+    logEvent('align', schem.name + ': origin ' + best.origin.join(',') + ' rot ' + best.rotation + ' mirrored ' + best.mirrored + ' votes ' + best.votes + ' conf ' + best.ratioTolerant.toFixed(2) + ' strict ' + best.ratio.toFixed(2) + ' matched ' + best.matched + ' distinctive ' + best.matchedDistinctive + ' wrong ' + best.wrong + ' terrainIgnored ' + best.terrainIgnored)
+  }
+
+  // v10.7.1 PIN-AND-VERIFY: "Segs the build is at <x> <y> <z>
+  // rotated <0|90|180|270>" (+ optional "mirrored"). Tash gives the
+  // BuildPrint panel origin; Segs tries every transform at that
+  // origin (plus Y offsets -2..+1, because the panel Y and the
+  // footing can differ by a layer) and reports which one the world
+  // actually matches. The pin is verified, never trusted blindly.
+  async function pinBuild (req) {
+    const m = req.match(/the build is at (-?\d+) (-?\d+) (-?\d+)/)
+    if (!m) { say('say it like: segs the build is at -696 62 5612 rotated 90'); return }
+    const given = [Number(m[1]), Number(m[2]), Number(m[3])]
+    // The stated rotation/mirror are EXPECTATIONS, not constraints:
+    // the pin VERIFIES all 8 transforms and lets the world decide
+    // (if BuildPrint's "90°" meant a different rot value, trusting
+    // the word would save a wrong alignment confidently). On an
+    // exact score tie, the stated values win.
+    const rotM = req.match(/(?:rotated?|rotation)\s+(\d+)/)
+    const givenRot = rotM ? ((Math.round(Number(rotM[1]) / 90)) % 4 + 4) % 4 : null
+    const givenMirror = /\bnot mirrored\b|\bno mirror\b/.test(req) ? false : (/\bmirrored\b/.test(req) ? true : null)
+    const name = brain.buildAlignment ? brain.buildAlignment.name : 'dom2'
+    const schem = loadSchematic(name)
+    if (!schem) { say("i dont have a schematic called " + name); return }
+    say('pinning ' + schem.name + ' at ' + given.join(', ') + ' — verifying every rotation and mirror against the placed blocks...')
+    const { hits, hitMap } = gatherBuildHits(schem)
+    if (hits.length < 5) {
+      say('i cant see enough placed blocks nearby — stand next to the built part and try again')
+      return
+    }
+    const pinPref = (cand) => (givenRot !== null && cand.rotation === givenRot ? 4 : 0) + (givenMirror !== null && cand.mirrored === givenMirror ? 2 : 0) + (cand.dy === 0 ? 1 : 0)
+    const pinTie = (a, b) => (pinPref(a) - pinPref(b)) || ((!a.mirrored && b.mirrored) ? 1 : (!b.mirrored && a.mirrored) ? -1 : 0)
+    const scored = []
+    for (const dy of [-2, -1, 0, 1]) {
+      const origin = [given[0], given[1] + dy, given[2]]
+      for (const mirrored of [false, true]) {
+        for (let rot = 0; rot < 4; rot++) {
+          const sc = scoreAlignment(schem, origin, rot, mirrored, hitMap)
+          scored.push({ origin, rotation: rot, mirrored, dy, ...sc })
+        }
+      }
+    }
+    const best = selectAlignment(scored, pinTie)
+    if (!best) { say('couldnt score any transform at that pin — stand closer and try again'); return }
+    const mismatch = (givenRot !== null && best.rotation !== givenRot ? ' you said ' + (givenRot * 90) + '° but the blocks match ' + (best.rotation * 90) + '° best.' : '') + (givenMirror !== null && best.mirrored !== givenMirror ? ' you said ' + (givenMirror ? 'mirrored' : 'not mirrored') + ' but the blocks match ' + (best.mirrored ? 'mirrored' : 'not mirrored') + ' best.' : '')
+    const stats = 'origin ' + best.origin.join(', ') + ' (Y offset ' + (best.dy >= 0 ? '+' : '') + best.dy + '), rotation ' + (best.rotation * 90) + '°' + (best.mirrored ? ', mirrored' : ', not mirrored') + ', ' + best.matched + ' matched (' + best.matchedDistinctive + ' distinctive), ' + best.wrong + ' mismatched (' + best.wrongTolerant + ' after terrain, ' + best.terrainIgnored + ' terrain ignored), tolerant ' + Math.round(best.ratioTolerant * 100) + '%, strict ' + Math.round(best.ratio * 100) + '%' + mismatch
+    logEvent('align', schem.name + ' pin ' + given.join(',') + ': best ' + stats)
+    if (alignmentPasses(best)) {
+      const al = saveAlignment(schem, best.origin, best.rotation, best.mirrored, best)
+      say('pinned ' + schem.name + ' — best match: ' + stats + '. saved: ' + alignmentSummary(al) + '. say: segs build ' + schem.name + ' here')
+    } else {
+      brain.lastAlignmentGuess = { name: schem.name, origin: best.origin, rotation: best.rotation, mirrored: best.mirrored, votes: 0, ratioTolerant: best.ratioTolerant, ratioStrict: best.ratio, matched: best.matched, wrong: best.wrong, wrongTolerant: best.wrongTolerant, matchedDistinctive: best.matchedDistinctive, terrainIgnored: best.terrainIgnored, at: Date.now() }
+      saveBrain()
+      say('pinned ' + schem.name + ' but no transform cleared the bar — best was: ' + stats + '. say: segs use that, to accept it anyway, or check the origin and rotation')
+    }
+  }
+
+  // v10.7.1: accept the last best-guess alignment (from a failed scan
+  // or a failed pin). The guess is only ever offered, never silently
+  // used — Tash confirms it with this command.
+  function acceptAlignmentGuess () {
+    const g = brain.lastAlignmentGuess
+    if (!g || !Array.isArray(g.origin)) { say('i have no alignment guess to accept — scan or pin the build first'); return }
+    const schem = loadSchematic(g.name)
+    if (!schem) { say("i dont have a schematic called " + g.name + " any more"); return }
+    const al = saveAlignment(schem, g.origin, g.rotation, g.mirrored, { ratioTolerant: g.ratioTolerant, ratio: g.ratioStrict, matched: g.matched, wrong: g.wrong, wrongTolerant: g.wrongTolerant, matchedDistinctive: g.matchedDistinctive, terrainIgnored: g.terrainIgnored })
+    brain.lastAlignmentGuess = null
     saveBrain()
-    say('found ' + schem.name + ' at ' + best.origin.join(', ') + ', rotation ' + (best.rotation * 90) + '°, confidence ' + Math.round(best.ratio * 100) + '% (' + best.matched + ' matched, ' + best.wrong + ' mismatched). say: segs build ' + schem.name + ' here')
-    logEvent('align', schem.name + ': origin ' + best.origin.join(',') + ' rot ' + best.rotation + ' conf ' + best.ratio.toFixed(2) + ' matched ' + best.matched + ' wrong ' + best.wrong)
+    say('accepted: ' + schem.name + ' at ' + alignmentSummary(al) + '. say: segs build ' + schem.name + ' here')
+    logEvent('align', schem.name + ': guess accepted by owner — origin ' + g.origin.join(',') + ' rot ' + g.rotation + ' mirrored ' + g.mirrored)
+  }
+
+  function schematicExists (name) {
+    try {
+      const safe = String(name || '').replace(/[^a-z0-9_-]/gi, '')
+      if (!safe) return false
+      return fs.existsSync(require('path').join(__dirname, 'schematics', safe + '.json'))
+    } catch (e) { return false }
   }
 
   // ---------- build status (for the "build status" query) ----------
@@ -9489,7 +9937,7 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     const p = brain.buildProgress
     const al = brain.buildAlignment
     const parts = []
-    if (al) parts.push('aligned: ' + al.name + ' at ' + al.origin.join(', ') + ', ' + (al.rotation * 90) + '°, ' + Math.round((al.confidence || 0) * 100) + '%')
+    if (al) parts.push('aligned: ' + al.name + ' at ' + al.origin.join(', ') + ', ' + (al.rotation * 90) + '°' + (al.mirrored ? ', mirrored' : '') + ', ' + Math.round((al.confidence || 0) * 100) + '%')
     if (p) parts.push('last build: ' + p.name + ' ' + p.pct + '% (' + p.placed + ' placed, ' + p.skipped + ' skipped, of ' + p.total + '), ' + p.rate + '/min' + (p.running ? ', running now' : ''))
     if (brain.buildStaging && brain.buildStaging.pos) parts.push('staging chest at ' + brain.buildStaging.pos.join(', '))
     if (!parts.length) return 'no build yet — say: segs scan the build, or mark a site: segs this is the build site'

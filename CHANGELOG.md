@@ -1,4 +1,4 @@
-# Segs — CHANGELOG (v10 → v10.7)
+# Segs — CHANGELOG (v10 → v10.7.1)
 
 > **How to read this file.** One section per version, newest last in the file's
 > history but listed in release order below. Every claim comes from
@@ -902,3 +902,161 @@ committed — only the converted JSON text lives in the repo.
   by full body reads. Real-server proof still needed: the real
   121x55x69 dom2 alignment against Tash's 4%, real latency, the
   real SimpleGraves grave block type (unchanged unknown).
+
+---
+
+## v10.7.1 — 2026-11-17 — package 10.7.1 — LIVE alignment + grave failure fix round
+
+Fix round for the live failures of 2026-11-17 03:18–03:37 (Youniga,
+v10.7): the alignment scan that could not find Tash's dom2 build
+(best 0.56/122, under the 0.6 bar), the ack+fallback double reply,
+the close-range follow stuck loop, and the grave recovery that
+stood on the grave and reported "cant see my grave". No new fork
+patches. No solver changes (the placement solver is byte-identical
+to v10.7 — proven by diff).
+
+### Changed
+
+- Alignment scan: tries all 8 transforms (4 rotations x mirror,
+  like BuildPrint's AlignmentVote.ALL_ORIENTATIONS) instead of 4
+  rotations. Terrain-tolerant scoring: a mismatch where BOTH the
+  world block and the schematic cell are natural terrain
+  (explicit TERRAIN_NAMES set: grass_block, dirt, stone,
+  deepslate, gravel, sand, ores, water, lava, etc.) is excluded
+  from the tolerant ratio; both strict and tolerant ratios are
+  reported. Distinctive-block matches (non-terrain) gate the
+  decision. Shared bar (alignmentPasses): matched>=8 AND
+  distinctive>=8 AND non-air sampled>=25 AND tolerant>=0.6 —
+  the sample floors were added after run 196 phase 2 (first
+  attempt) proved the ratio alone admits false-confident
+  alignments (85% on a 13-cell overlap at a wrong origin).
+  Passing-first selection (selectAlignment): a passing candidate
+  always beats a failing one. On failure the scan LOGS the best
+  candidate's full stats (origin/rotation/mirror/votes/matched/
+  wrong/ratios), stores it as brain.lastAlignmentGuess, and
+  chats the best guess + "say: segs use that".
+- PIN-AND-VERIFY command: "Segs the build is at <x> <y> <z>
+  rotated <deg>" (+ optional "mirrored"). Scores ALL 32
+  candidates (8 transforms x Y offsets -2..+1) — the stated
+  rotation/mirror are expectations, not constraints; exact ties
+  prefer the stated values. Reports full stats and notes when
+  the best differs from the stated rotation/mirror. Saves if
+  it passes; else stores the guess + honest report.
+  Convention cross-check against the BuildPrint decompile
+  (FootprintTransform.apply, Placement.Rotation.degrees,
+  PlacementTransform.worldPos, AlignmentVote, SchematicGhostCells):
+  BuildPrint "90°" = CW_90 = Segs rot 1, mirror flips Z before
+  rotation, origin = min footprint corner — NO remap needed.
+  Locked target: given (-696, 62, 5612) it must select rot 90°,
+  no mirror, Y offset 0 (proven in sim against test-align, run
+  196; the REAL pin still needs Tash's live test).
+- "Segs use that" accepts the last best-guess alignment (from a
+  failed scan or pin). The guess is only ever offered, never
+  silently used.
+- Autobuild threads the saved mirror flag via
+  transformXZ/transformState (mirror-then-rotate, Z-flip
+  semantics: north↔south, rotation_16 → (16−r)%16, hinge flip,
+  axis/half unchanged); build status shows ', mirrored'.
+- Routing + ack: "scan this build", "align this build", "scan/
+  align the build site" (+ that/site variants) route to
+  scanBuild. Route probe commandRoutes gates the instant ack +
+  latest-wins bump: unrouted commands get exactly ONE reply
+  (the fallback), routed commands get ack + result. Site-marker
+  fix: the bare includes('build site') marker swallowed
+  "scan/align the build site" and marked a wrong origin — it
+  now excludes scan/align phrasings.
+- Close-range follow gate: no stuck declaration / assist loop
+  within 3 blocks of an owner who has not moved ≥1 block in 3s
+  (net-progress window + stuck clock reset every tick while
+  gated). Proactive door assist ungated (fires only when a door
+  is actually ahead).
+- Grave finding rewritten (Tash's F3 screenshot proved the
+  shape: an ordinary-looking BLOCK + a hologram entity above it
+  carrying "Segs | 2m34s"; owner-only, so bot recovery is the
+  only path): findGrave tries (1) the hologram-anchored block
+  FIRST — entities within 8 whose custom name (via
+  getCustomName, metadata[2]) contains the bot name, a timer
+  pattern, or 'grave', or a bare marker-entity type; the grave
+  block is the solid block 1..4 below the hologram (3x3 ring
+  fallback); NO block name is hardcoded; (2) chest-like blocks
+  + wall-head variants (any *_head/*_wall_head/*_skull/
+  *_wall_skull) + headstone-sign fallback; (3) diagnostics:
+  solid blocks within 5 SORTED BY DISTANCE nearest-first (death
+  spot first), cap 60, PLUS all entities within 8 with type +
+  custom name + position + the block below each hologram
+  candidate. Recovery sneaks + right-clicks the found BLOCK
+  (same take-all-then-verify pattern). The "minutes left" timer
+  is recomputed at EACH message send (was computed once, ~90s
+  stale). No entity activation: the ground truth is block +
+  hologram.
+- New test fixture schematics/test-buried.json (6×3×6: buried
+  grass/dirt layer + distinctive footing).
+
+### Tested (simulation only, Paper 26.3 build 244, port 25569)
+
+- Run 194 (buried-layer alignment): PASS — true origin/rot
+  found at tolerant 94% (32 matched, 34 terrain ignored) while
+  strict was 0.47, below the old bar: the exact live failure
+  mode, fixed.
+- Run 195 (mirrored placement): PASS (2 attempts) — scan found
+  mirrored + rot 1 at 100% (60/60); build 6/6, 0 wrong;
+  independent verifier (mirror=1 rot=1) ok=66 bad=0, including
+  stair facings under the mirrored transform.
+- Run 196 (pin-and-verify): PASS (2 attempts) — pin at the true
+  origin selected rot 90°/no mirror/Y+0 at 100% from all 32
+  candidates; pin at a wrong origin failed honestly (85% on 13
+  cells rejected by the strengthened bar) with the "you said
+  90° but the blocks match 180° best" note; "segs use that"
+  accepted the stored guess.
+- Run 197 (messy site): PASS — 13 wrong + 4 terrain-intrusion +
+  6 air-cell extras: confident alignment at the TRUE origin/
+  rot, 77% (43 matched, 17 wrong, 4 terrain ignored).
+- Run 198 (routing/ack): PASS — "scan this build" and "scan the
+  build site" both ran the scan with no fallback; "scan the
+  moon" got exactly one fallback reply and NO ack; "follow me"
+  still acked + replied.
+- Run 199 (close-range follow): PASS — zero stuck/assist/
+  rubber-band lines over 37s at 2.5 blocks from a stationary
+  owner.
+- Run 201 (grave: hologram + chest): PASS — "grave block found
+  via hologram: chest (armor_stand 'Segs | 5m12s' score 3,
+  block 2 below)", 18/18 items recovered, decoy chest untouched.
+- Run 202 (grave: hologram + dirt): PASS — dirt found via the
+  hologram, clicked, honest failure + 60s retry (2 attempts,
+  never marked recovered), fresh 10→9 min timer, 0 digs. The
+  plugin-GUI recovery itself is unprovable in vanilla sim.
+- Run 203 (grave: wall head): PASS — player_wall_head found (0
+  from death spot), clicked, honest failure + retry.
+- Run 204 (grave: chest regression, script 127): PASS — 18/18
+  items, chest empty, 0 dug.
+- Run 205 (grave diagnostics): PASS — nearest-first list starts
+  at the death spot; entities line shows type + name + position
+  + below=none; hologram-with-no-block falls back cleanly.
+- Regression spot-check: 185 PASS (100% scan, 6/6 build);
+  187/188/189 PASS (staging create/draw/dry); 180 PASS (exact
+  drop counts); 137 PASS (deficit-0, hungry legs inconclusive
+  by design as before); 138 PASS (verified 19→20 eats, 0
+  drops); 57 PASS (door opened, 2.0 behind, 0 dug); 172 PASS
+  (serpentine, 38 wheat = reported, 0 skips); 177 PASS
+  (one-reply, typo understood); 182 PASS (home alias, all
+  phases). Run 184 PARTIAL (66/67 + 1 trapdoor facing wrong,
+  both attempts, verifier ok=67 bad=1): PRE-EXISTING solver
+  sensitivity, NOT a v10.7.1 regression — the solver is
+  byte-identical (diff-proven) and v10.7's own run 184 needed
+  5 attempts for 68/68. Needs a solver fix in a future round.
+- HONEST LIMITS: everything simulation-only. Still needs
+  Tash's live test: the pin at the REAL (-696,62,5612) rot 90°
+  no mirror; the real messy-site alignment (11% + 1,797 wrong
+  + 1,524 extra); the SimpleGraves plugin-GUI recovery through
+  the dirt-like grave block (next live death). The grave
+  block's EXACT name is still TBD (F3 Targeted Block line
+  pending) — the fix hardcodes no block name. No entity
+  activation (ground truth is block + hologram). Small
+  half-built schematics fall back to best-guess + "use that"
+  under the sample floors. Mirror + standing-sign rotation_16
+  untested. Pin Y search assumes panel Y within 2 of footing.
+  Stand cycling on walled footprints is slow (3/min run 195).
+  No scaffolding (stage 2); water = 1 bucket/cell; staging
+  reuse not per-site; run-111 hunt pollution unchanged; water
+  climb-out flaky; creeper consumed:NO flake unknown; stats
+  mid-word split wart persists.
