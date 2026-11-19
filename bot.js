@@ -1,4 +1,8 @@
 // Segs - free Mineflayer bot, v10.5 - "100% at all cost" round:
+//   v10.7.2: /tpa auto-accept rewrite — accent-stripped matching +
+//   5s delayed accept + "segs accept" manual command (live 2026-11-19:
+//   auto-accept NEVER fired — old matcher needed ASCII 'teleport' on a
+//   French server). See TEST-REPORT-26.3.md runs 206+.
 //   pathfinding sweep (climb assist, lava detour, water climb-out),
 //   fast follow (no re-path spam), instant ack, craft/cook/smelt from
 //   nearby chests, view distance 7, Autobuild schematic tool v1.
@@ -891,6 +895,20 @@ function createBot () {
       if (stopReq.includes('start jumping') || stopReq.includes('jump again')) {
         jumpHoldUntil = 0
         say('ok, jumping again when i need to')
+        aiRecordChat(username, msg)
+        return
+      }
+      // v10.7.2: "segs accept" — Tash's manual fallback when the
+      // auto-accept missed the request (live 2026-11-19: he typed it
+      // and Segs answered nothing — no such command existed). Same
+      // 5s-from-request rule as the auto path; with no recent request
+      // it accepts at once. requestTpaAccept already says the accept
+      // line when it sends, so only speak for the other two outcomes.
+      if (stopReq === 'accept' || stopReq === 'accept tpa' || stopReq === 'accept the tpa' || stopReq === 'accept my tpa' || stopReq === 'tpaccept') {
+        bumpCmd('accept tpa')
+        const res = requestTpaAccept('manual')
+        if (res === 'scheduled') say('on it — accepting your tpa in a few seconds')
+        else if (res === 'already') say('already accepted it')
         aiRecordChat(username, msg)
         return
       }
@@ -5890,22 +5908,85 @@ let waterClimbLogAt = 0 // last water debug log (every 2s while swimming)
     logEvent('home', `/home ${name} did not teleport (no such home, or the warmup never started)`)
     return false
   }
-  // Auto-accept a /tpa request from the owner. The exact message depends on
-  // the server's TPA plugin, so match flexibly: it must mention teleport +
-  // accept + the owner's name. Only the owner, never anyone else.
-  // (v7 fix: the same request arrives via BOTH the 'chat' and 'messagestr'
-  // events, so without a cooldown Segs accepted twice and said so twice.)
+  // Auto-accept a /tpa request from the owner — v10.7.2 REWRITE (live
+  // 2026-11-19: Tash's /tpa to Segs was NEVER auto-accepted, zero
+  // "auto-accepted" lines in any live log). Root cause: the old matcher
+  // required ASCII 'teleport', but this server speaks FRENCH — the
+  // request text says 'téléporter'/'téléportation' (é ≠ e), so the
+  // match failed silently, and the raw request text was never logged.
+  // New rules, all from Tash 2026-11-19: (1) ONLY the owner's request,
+  // never anyone else's; (2) accept ONLY AFTER 5 SECONDS from the
+  // request arriving (it must be registered server-side first); (3) the
+  // in-game Accept/Decline buttons can't be clicked by a bot, so
+  // /tpaccept is the only route. Matching is accent-stripped
+  // (téléportation → teleportation) and request-word based, so a French
+  // Essentials-style request, an English one, or a button-style
+  // "[Accepter] [Refuser]" line all match. Exclusions stop false
+  // positives: home warmup ("Téléportation dans : 3" — no owner name),
+  // expiry/deny messages, and accept CONFIRMATIONS ("X accepted your
+  // teleport request" — that is AFTER the fact, not a request). The raw
+  // request text is logged (tpa-request) so the next diagnosis has the
+  // exact server wording instead of a guess.
+  // (v7 note kept: the same request arrives via BOTH the 'chat' and
+  // 'messagestr' events, so one pending accept + a 10s cooldown keep
+  // the double delivery to a single /tpaccept.)
   let lastTpaAccept = 0
+  let lastTpaRequestAt = 0
+  let pendingTpaAccept = null // { timer } — one scheduled accept at most
+  function normTpaText (s) {
+    return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+  }
+  function requestTpaAccept (source) {
+    // Returns 'sent' | 'scheduled' | 'already'. Never sends /tpaccept
+    // sooner than 5s after the owner's request arrived (Tash's rule);
+    // with no recent request (manual "segs accept") it sends at once.
+    const now = Date.now()
+    if (now - lastTpaAccept < 10000) return 'already'
+    if (pendingTpaAccept) return 'scheduled'
+    const waitMs = lastTpaRequestAt ? Math.max(0, 5000 - (now - lastTpaRequestAt)) : 0
+    if (waitMs <= 0) {
+      lastTpaAccept = now
+      serverCmd(`/tpaccept ${config.owner}`)
+      say('accepted your tpa, coming to you')
+      logEvent('tpa', 'accepted /tpa from ' + config.owner + ' (' + source + ')')
+      return 'sent'
+    }
+    logEvent('tpa', 'tpa request from owner — accepting in ' + Math.ceil(waitMs / 1000) + 's (' + source + ')')
+    pendingTpaAccept = {
+      timer: setTimeout(() => {
+        pendingTpaAccept = null
+        if (Date.now() - lastTpaAccept < 10000) return
+        lastTpaAccept = Date.now()
+        serverCmd(`/tpaccept ${config.owner}`)
+        say('accepted your tpa, coming to you')
+        logEvent('tpa', 'auto-accepted /tpa from ' + config.owner + ' (5s delay, ' + source + ')')
+      }, waitMs)
+    }
+    return 'scheduled'
+  }
   function maybeAcceptTpa (text) {
-    const lower = (text || '').toLowerCase()
-    if (!lower.includes('teleport')) return false
-    if (!lower.includes('tpaccept') && !lower.includes('accept')) return false
+    // v10.7.2 fix (sim run 207): the 'messagestr' event carries the
+    // chat SENDER as a "<Name> " prefix, so "<OrewaSegs> Nanashiii__
+    // has requested to teleport to you" matched the owner check via
+    // the PREFIX, not the requester — Segs accepted a stranger's
+    // request. Strip one leading "<Name> " prefix first, so the
+    // owner check reads the REQUESTER, never the speaker. A genuine
+    // system message has no prefix (strip is a no-op); the 'chat'
+    // event's message never has one either.
+    const stripped = (text || '').replace(/^<[^>]{1,32}>\s*/, '')
+    const lower = normTpaText(stripped)
+    if (!lower.includes('teleport') && !lower.includes('tpa')) return false
     if (!lower.includes(OWNER)) return false
-    if (Date.now() - lastTpaAccept < 10000) return true // already accepted, swallow the duplicate
-    lastTpaAccept = Date.now()
-    serverCmd(`/tpaccept ${config.owner}`)
-    say('accepted your tpa, coming to you')
-    logEvent('tpa', 'auto-accepted /tpa from ' + config.owner)
+    // Not a request: expiry, denial, an accept CONFIRMATION, or a
+    // server error about the command itself ("Unknown or incomplete
+    // command" echoes /tpaccept + the owner name — sim run 206
+    // proved that text matches the request pattern otherwise).
+    if (/expir|denied|refused|a refuse|cancel|accepted|a accepte|unknown|incomplete/.test(lower)) return false
+    // Must read like a request: accept language, or request language.
+    if (!/accept|tpaccept|request|demande|souhaite|wants|demand/.test(lower)) return false
+    lastTpaRequestAt = Date.now()
+    logEvent('tpa-request', (text || '').slice(0, 160))
+    requestTpaAccept('request')
     return true
   }
 

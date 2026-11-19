@@ -1060,3 +1060,36 @@ to v10.7 — proven by diff).
   reuse not per-site; run-111 hunt pollution unchanged; water
   climb-out flaky; creeper consumed:NO flake unknown; stats
   mid-word split wart persists.
+
+## v10.7.2 — /tpa auto-accept rewrite (2026-11-19, live hotfix at Tash's request)
+- DIAGNOSIS: the auto-accept NEVER fired in any live session — zero
+  "auto-accepted" lines in the live log across Nov 14/17/19. Root cause:
+  the matcher required ASCII 'teleport', but Youniga speaks FRENCH — the
+  TPA request text says 'téléporter'/'téléportation' (é ≠ e).
+- maybeAcceptTpa rewritten: accent-stripped matching (NFD), request-word
+  based (accept/tpaccept/request/demande/souhaite/wants/demand), owner-only
+  (the REQUESTER, not the speaker — see below), 5s delayed accept from
+  the request (Tash's rule), raw request text logged as tpa-request.
+- Exclusions: expiry, denial, accept confirmations, and server command
+  errors ("Unknown or incomplete command" echoes /tpaccept + owner).
+- TWO BUGS FOUND BY SIM TESTING, both fixed before deploy: (1) run 206
+  — the sim Paper "Unknown command" error for /tpaccept matched the
+  request pattern (exclusion added); (2) run 207 — the 'messagestr'
+  event carries the chat sender as a "<Name> " prefix, so a stranger's
+  request said by the owner matched the owner check via the PREFIX and
+  Segs accepted it (prefix stripped before matching; re-run 207 PASS).
+- NEW manual command: "segs accept" (owner only) — immediate /tpaccept
+  with no recent request, otherwise honours the 5s-from-request rule
+  ("on it — accepting your tpa in a few seconds", no double-send).
+- Sim runs 206–208 PASS (Paper 26.3 sim): 206 — French/English/button
+  requests, one /tpaccept each at exactly 5s; 207 — double delivery one
+  accept, stranger/warmup/confirmation/expiry zero accepts; 208 — manual
+  accept immediate, request+manual one accept at 5s.
+- KNOWN LIMITS: a second genuine request inside the 10s accept cooldown
+  is swallowed (logged as tpa-request, no timer) — re-send after 10s.
+  The sim has no TPA plugin, so /tpaccept itself errors "Unknown
+  command" there; the proof is the [server-cmd] line + 5s timing. Live
+  proof (real Youniga request text + real teleport) still needs Tash.
+  The confirmation/expiry fallback chatter ("i didnt quite get that")
+  is a pre-existing sim-only artifact (owner-bot speaks system texts as
+  chat); on live those arrive as system messages with no fallback path.

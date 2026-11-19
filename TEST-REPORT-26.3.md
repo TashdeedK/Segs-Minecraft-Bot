@@ -2226,3 +2226,58 @@ Each run used a fresh test brain, except the 187→188→189 staging chain (brai
 - **Trapdoor predictor**: 1 cell wrong in run 184 (both attempts, pre-existing, solver untouched by v10.7.1 — see the regression section). Needs a solver fix in a future round.
 - **Stand cycling on walled footprints is slow** (run 195: 3/min; run 184: 16–19/min vs 40/min sustained in run 190). The build converges (3 passes) but burns time on unreachable interior-top stands. A stand-picker fix (prefer reachable ring stands, blacklist unreachable tops sooner) belongs to stage 2 / movement work.
 - Standing limits carried from v10.7: NO scaffolding (rows above ground reach honestly reported unplaced, stage 2); water = 1 bucket/cell, no scooping refill; staging-chest reuse not scoped per site; piston facing via look-opposite probe; WallSign/WallBanner/TripWireHook loop bodies verified by header + wall-sign cell only; end-rod chaining implemented, hanging-sign stacking / chest sneak-pairing / dripleaf-stem inheritance noted not implemented; general-hunt pollution (run 111) unchanged. Standing limits carried from v10.6: water climb-out flaky; creeper bow consumed:NO flake mechanism unknown; cornered sword-fight path exercised once; horde zero-hits unmet; stale-grave swim can drown Segs; survive contradictions / hp 20→16 uninvestigated; stats-reply mid-word split wart (seen again in runs 191/204/57/172); grave-retry re-announces "i died at ..." (pre-existing wording wart, seen in run 202).
+
+## v10.7.2 — /tpa auto-accept rewrite (runs 206–208, Paper 26.3 sim, 2026-11-19)
+- RUN 206 PASS: TPA AUTO-ACCEPT, three wordings. French Essentials
+  ("OrewaSegs a demandé à se téléporter vers vous. Pour accepter la
+  demande, tapez /tpaccept."), English Essentials, and button-style
+  ("OrewaSegs souhaite se téléporter à vous [Accepter] [Refuser]") —
+  each produced exactly ONE '[server-cmd] /tpaccept OrewaSegs' at
+  exactly 5s after the request line (9:13:25→9:13:30, 9:13:42→9:13:47,
+  9:14:00→9:14:05) plus the in-game 'accepted your tpa' reply. The
+  double delivery (chat + messagestr) logged tpa-request twice but
+  scheduled once. NOTE: the sim Paper has no TPA plugin, so /tpaccept
+  errors "Unknown or incomplete command" — the error text itself
+  matched the request pattern and was logged as tpa-request (bug 1).
+- RUN 207, attempt 1: FAIL (2 /tpaccepts, expected 1). The stranger
+  line ("Nanashiii__ has requested to teleport to you...") was ACCEPTED
+  at 9:15:43 — the messagestr text "<OrewaSegs> Nanashiii__ ..." matched
+  the owner check via the "<OrewaSegs>" SENDER prefix (bug 2). Double
+  delivery (1 accept), warmup, confirmation, expiry: zero accepts.
+  FIX: strip one leading "<Name> " prefix before matching; "Unknown or
+  incomplete command" added to the exclusions.
+- RUN 207, attempt 2 (fixed bot): PASS. Exactly ONE /tpaccept total
+  (9:19:03, 5s after the French double request). Stranger: only the
+  generic chat log line, NO tpa-request, NO schedule, NO accept.
+  Warmup ("Téléportation dans : 3"), confirmation ("OrewaSegs accepted
+  your teleport request."), expiry: zero accepts. The confirmation /
+  expiry lines drew the pre-existing "i didnt quite get that" fallback
+  in the owner log — sim-only artifact (see CHANGELOG); on live those
+  are system messages with no fallback path.
+- RUN 208 PASS: MANUAL "segs accept". With no request seen: /tpaccept
+  sent immediately (15:20:45.583 → reply 15:20:45.594, 11ms). French
+  request at 15:21:03 + "segs accept" at 15:21:05: 'on it — accepting
+  your tpa in a few seconds', exactly ONE /tpaccept at 15:21:08 (5s
+  after the request). Total for the run: exactly 2 /tpaccepts.
+- LIVE PROOF STILL NEEDED (Tash): a real /tpa Segs on Youniga — the
+  exact server request wording (now logged as tpa-request on first
+  sight), the 5s accept, and the actual teleport to Tash.
+
+## LIVE PROOF — Youniga, 2026-11-19 23:38 + 23:49 (v10.7.2, run from segs-live)
+- Tash tested TWICE, both PASS. Real Youniga request text (captured
+  verbatim for the first time by the new tpa-request log):
+  "OrewaSegs vous a demandé de vous téléporter. Tapez /tpaccept pour
+  accepter." — different from all three sim wordings, matched on
+  first sight.
+- 23:38:52 request -> Tash typed "segs accept" 23:38:56 -> ONE
+  /tpaccept 23:38:57 (exactly 5s) -> confirmation "Vous avez accepté
+  la demande de téléportation de OrewaSegs." 23:38:58 (logged, NOT
+  re-matched — exclusion proven live, no second accept).
+- 23:49:16 request -> "segs accept" 23:49:18 -> ONE /tpaccept
+  23:49:21 (exactly 5s) -> same confirmation. The manual command
+  during a pending timer did NOT double-send (run-208 scenario, live).
+- The teleport itself is server-side on /tpaccept and was not
+  independently logged; Tash's two successful tests are the proof.
+- BOT WENT OFFLINE 23:51:37: a runtime/VM restart killed the live
+  process (log mtime 23:51:37, no node process after). Restart needs
+  Tash's password paste again (per-session rule) — pending his paste.
